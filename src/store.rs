@@ -43,6 +43,7 @@ impl Kind {
             Kind::Ovpn => "OVPN",
         }
     }
+    #[allow(dead_code)]
     pub fn padded_tag(self) -> &'static str {
         match self {
             Kind::Vless => "VLESS ",

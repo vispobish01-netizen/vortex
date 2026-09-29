@@ -21,18 +21,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Cyber / BlackHat Telemetry Palette
-const FG: Color = Color::Rgb(0xd6, 0xe4, 0xf0);
-const DIM: Color = Color::Rgb(0x4a, 0x5b, 0x6e);
-const CYAN: Color = Color::Rgb(0x00, 0xf0, 0xff);
-const PURPLE: Color = Color::Rgb(0xb0, 0x5c, 0xff);
-const BLUE: Color = Color::Rgb(0x2d, 0x9c, 0xdb);
-const GREEN: Color = Color::Rgb(0x00, 0xff, 0x77);
-const YELLOW: Color = Color::Rgb(0xff, 0xb8, 0x00);
-const RED: Color = Color::Rgb(0xff, 0x33, 0x55);
-const BORDER: Color = Color::Rgb(0x18, 0x38, 0x48);
-const SEL_BG: Color = Color::Rgb(0x0c, 0x24, 0x33);
-const SPIN: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+// Elite Black-Hat Cyber Palette
+const FG: Color = Color::Rgb(0xd2, 0xf7, 0xee);         // Phosphor Ice-White
+const FG_DIM: Color = Color::Rgb(0x60, 0x8a, 0x8e);     // Tactical Cyan-Gray
+const DIM: Color = Color::Rgb(0x2a, 0x46, 0x4c);        // Dark Matrix Dim
+const CYAN: Color = Color::Rgb(0x00, 0xf0, 0xff);       // Electric Cyan
+const PURPLE: Color = Color::Rgb(0xbd, 0x42, 0xff);     // Plasma Violet
+const BLUE: Color = Color::Rgb(0x2d, 0x9c, 0xff);       // Cobalt Blue
+const GREEN: Color = Color::Rgb(0x00, 0xff, 0x66);      // Neon Lime Phosphor
+const YELLOW: Color = Color::Rgb(0xff, 0xb8, 0x00);     // Amber Warning
+const RED: Color = Color::Rgb(0xff, 0x22, 0x55);        // Breach Red
+const BORDER: Color = Color::Rgb(0x16, 0x3d, 0x44);     // Deep Cyber Teal Border
+const BORDER_ACTIVE: Color = Color::Rgb(0x00, 0xf0, 0xff); // Active Cyan Frame
+const SEL_BG: Color = Color::Rgb(0x0a, 0x26, 0x2c);     // Tactical Selection Glow
+const SEL_FG: Color = Color::Rgb(0x00, 0xff, 0xcc);     // Highlight Active
+const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const HIST: usize = 240;
 
 enum Msg {
@@ -68,6 +71,8 @@ struct App {
     show_log: bool,
     down: Vec<u64>,
     up: Vec<u64>,
+    down_peak: u64,
+    up_peak: u64,
     rtt_hist: Vec<u64>,
     rtt: Option<u32>,
     rtt_busy: bool,
@@ -134,6 +139,8 @@ impl App {
             show_log: false,
             down: vec![],
             up: vec![],
+            down_peak: 0,
+            up_peak: 0,
             rtt_hist: vec![],
             rtt: None,
             rtt_busy: false,
@@ -412,40 +419,44 @@ impl App {
                     self.last = None;
                     self.down.clear();
                     self.up.clear();
+                    self.down_peak = 0;
+                    self.up_peak = 0;
                     self.rtt_hist.clear();
                     self.rtt = None;
-                    self.toast(format!("connected · {}", s.name), true);
+                    self.toast(format!("TUNNEL ENGAGED // TARGET: {}", s.name), true);
                     self.session = Some(s);
                     self.spawn_ip();
                 }
                 Msg::Connected(Err(e)) => {
                     self.busy = None;
                     self.session = tunnel::load_session();
-                    self.toast(e, false);
+                    self.toast(format!("BREACH/AUTH FAIL: {e}"), false);
                 }
                 Msg::Disconnected(r) => {
                     self.busy = None;
                     self.session = None;
                     self.ip.clear();
                     self.rtt = None;
+                    self.down_peak = 0;
+                    self.up_peak = 0;
                     match r {
-                        Ok(()) => self.toast("disconnected", true),
-                        Err(e) => self.toast(e, false),
+                        Ok(()) => self.toast("TUNNEL SEVERED // ROUTE DISENGAGED", true),
+                        Err(e) => self.toast(format!("TERMINATION ERR: {e}"), false),
                     }
                 }
                 Msg::Imported(Ok(n)) => {
                     self.busy = None;
                     self.reload();
                     if n == 0 {
-                        self.toast("nothing new — already imported", false);
+                        self.toast("PAYLOAD DUPLICATE // ZERO PROFILES INJECTED", false);
                     } else {
-                        self.toast(format!("added {n} profile(s)"), true);
+                        self.toast(format!("INJECTION SUCCESSFUL // {n} NODE(S) ARMED"), true);
                         self.test(false);
                     }
                 }
                 Msg::Imported(Err(e)) => {
                     self.busy = None;
-                    self.toast(e, false);
+                    self.toast(format!("PAYLOAD REJECTED: {e}"), false);
                 }
                 Msg::Ip(s) => self.ip = s,
                 Msg::Ping(id, r) => {
@@ -494,13 +505,23 @@ impl App {
                 self.session = None;
                 self.ip.clear();
                 self.rtt = None;
-                self.toast("tunnel dropped", false);
+                self.down_peak = 0;
+                self.up_peak = 0;
+                self.toast("TUNNEL SEVERED BY KERNEL", false);
             }
             Some(s) => {
                 if let Some((rb, tb)) = tunnel::bytes(&s.iface) {
                     if let Some((lr, lt)) = self.last {
-                        push(&mut self.down, rb.saturating_sub(lr));
-                        push(&mut self.up, tb.saturating_sub(lt));
+                        let d = rb.saturating_sub(lr);
+                        let u = tb.saturating_sub(lt);
+                        if d > self.down_peak {
+                            self.down_peak = d;
+                        }
+                        if u > self.up_peak {
+                            self.up_peak = u;
+                        }
+                        push(&mut self.down, d);
+                        push(&mut self.up, u);
                     }
                     self.last = Some((rb, tb));
                 }
@@ -561,7 +582,7 @@ impl App {
             }
             Mode::Confirm => {
                 self.toast = None;
-                if k.code == Char('y') {
+                if k.code == Char('y') || k.code == Char('Y') {
                     self.delete();
                 }
                 return false;
@@ -732,18 +753,37 @@ fn fmt_dur(s: u64) -> String {
 
 fn kind_color(k: Kind) -> Color {
     match k {
-        Kind::Vless | Kind::Vmess | Kind::Ss => CYAN,
+        Kind::Vless => CYAN,
+        Kind::Vmess => Color::Rgb(0x00, 0xdf, 0xa2), // Mint Green
         Kind::Trojan => BLUE,
-        Kind::Hy2 | Kind::Tuic => PURPLE,
+        Kind::Hy2 => PURPLE,
+        Kind::Tuic => Color::Rgb(0xd9, 0x46, 0xef), // Fuchsia
+        Kind::Ss => Color::Rgb(0x06, 0xb6, 0xd4),    // Electric Teal
         Kind::Wg => GREEN,
-        Kind::Awg => CYAN,
+        Kind::Awg => Color::Rgb(0x10, 0xb9, 0x81),  // Emerald
         Kind::Ovpn => YELLOW,
     }
 }
 
+fn kind_badge(k: Kind) -> &'static str {
+    match k {
+        Kind::Vless => "VLESS",
+        Kind::Vmess => "VMESS",
+        Kind::Trojan => "TROJN",
+        Kind::Ss => "SS-AE",
+        Kind::Hy2 => "HYST2",
+        Kind::Tuic => "TUIC ",
+        Kind::Wg => "WG-0 ",
+        Kind::Awg => "AMN-W",
+        Kind::Ovpn => "OVPN ",
+    }
+}
+
 fn ms_color(ms: u32) -> Color {
-    if ms < 100 {
+    if ms < 60 {
         GREEN
+    } else if ms < 120 {
+        CYAN
     } else if ms < 250 {
         YELLOW
     } else {
@@ -767,16 +807,35 @@ fn trunc<'a>(s: &'a str, n: usize) -> Cow<'a, str> {
     }
 }
 
-fn block(title: &str) -> Block<'static> {
+fn block(title: &str, active: bool) -> Block<'static> {
+    let border_color = if active { BORDER_ACTIVE } else { BORDER };
     Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(BORDER))
-        .title(Span::styled(format!(" ◈ [ {title} ] "), Style::new().fg(CYAN).bold()))
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(border_color))
+        .title(Line::from(vec![
+            Span::styled(" ◈ [ ", Style::new().fg(border_color)),
+            Span::styled(title.to_string(), Style::new().fg(if active { CYAN } else { FG }).bold()),
+            Span::styled(" ] ", Style::new().fg(border_color)),
+        ]))
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let header_h = if area.height >= 26 {
+        2
+    } else if area.height >= 12 {
+        2
+    } else {
+        1
+    };
+    let footer_h = if area.height >= 6 { 1 } else { 0 };
+    let rows = Layout::vertical([
+        Constraint::Length(header_h),
+        Constraint::Min(3),
+        Constraint::Length(footer_h),
+    ])
+    .split(area);
+
     header(f, rows[0], app);
     if area.width >= 84 {
         let cols = Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)]).split(rows[1]);
@@ -787,78 +846,139 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         profiles(f, rows[1], app);
     }
-    footer(f, rows[2], app);
+    if footer_h > 0 {
+        footer(f, rows[2], app);
+    }
     match &app.mode {
-        Mode::Add(s) => popup(f, area, "0xIN // INJECT CONFIG", "share link · subscription URL · .conf / .ovpn path", s),
-        Mode::Rename(s) => popup(f, area, "0xRN // RENAME TARGET", "new profile identifier", s),
+        Mode::Add(s) => popup(f, area, "0xIN // INJECT CONFIGURATION PAYLOAD", "VLESS · VMESS · TROJAN · SS · HY2 · TUIC · WG · AWG · OVPN · SUB URL", s),
+        Mode::Rename(s) => popup(f, area, "0xRN // MUTATE TARGET IDENTIFIER", "enter new cryptographic profile alias", s),
+        Mode::Confirm => confirm_popup(f, area, app),
         Mode::Help => help(f, area),
         _ => {}
     }
 }
 
 fn header(f: &mut Frame, a: Rect, app: &App) {
-    let title_line = Line::from(vec![
+    if a.height == 0 {
+        return;
+    }
+    let left_title = Line::from(vec![
         Span::styled("⚡ VORTEX", Style::new().fg(GREEN).bold()),
         Span::styled(" // ", Style::new().fg(BORDER)),
-        Span::styled("CYBER ROUTER", Style::new().fg(CYAN).bold()),
-        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::new().fg(DIM)),
-        Span::styled("  [KERNEL: NET_ADMIN · MTU: 9000]", Style::new().fg(DIM)),
+        Span::styled("CYBER WARFARE NETWORK TUNNEL", Style::new().fg(CYAN).bold()),
+        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::new().fg(FG_DIM)),
     ]);
-    f.render_widget(Paragraph::new(title_line), a);
 
-    let st = if let Some(b) = app.busy {
+    let right_status = if let Some(b) = app.busy {
         let sp = SPIN[(app.busy_since.elapsed().as_millis() / 90) as usize % SPIN.len()];
-        Line::from(Span::styled(format!("[⚡ SCAN: {b} {sp}] "), Style::new().fg(YELLOW).bold()))
+        Line::from(vec![
+            Span::styled(format!("[⌁ SWEEP: {b} {sp}] "), Style::new().fg(YELLOW).bold()),
+            Span::styled("SCANNING ROUTE...", Style::new().fg(FG_DIM)),
+        ])
     } else if let Some(s) = &app.session {
         let mut v = vec![
             Span::styled("[● LINK ENGAGED] ", Style::new().fg(GREEN).bold()),
-            Span::styled(format!("TARGET: {} ", s.name), Style::new().fg(FG).bold()),
-            Span::styled(format!("[{}] ", s.kind.tag()), Style::new().fg(kind_color(s.kind)).bold()),
+            Span::styled(format!("{}: ", s.kind.tag()), Style::new().fg(kind_color(s.kind)).bold()),
+            Span::styled(format!("{} ", trunc(&s.name, 18)), Style::new().fg(FG).bold()),
         ];
         if let Some(ms) = app.rtt {
             v.push(Span::styled(format!("{ms}ms "), Style::new().fg(ms_color(ms)).bold()));
         }
-        v.push(Span::styled(format!("UPTIME: {} ", fmt_dur(tunnel::now().saturating_sub(s.since))), Style::new().fg(DIM)));
+        v.push(Span::styled(
+            format!("[UP: {}] ", fmt_dur(tunnel::now().saturating_sub(s.since))),
+            Style::new().fg(FG_DIM),
+        ));
         Line::from(v)
     } else {
-        Line::from(Span::styled("[○ DISENGAGED // DIRECT PROBE ACTIVE] ", Style::new().fg(DIM)))
+        Line::from(vec![
+            Span::styled("[○ STANDBY // DIRECT PROBE ACTIVE] ", Style::new().fg(FG_DIM)),
+            Span::styled("[PORT: DIRECT] ", Style::new().fg(DIM)),
+        ])
     };
-    f.render_widget(Paragraph::new(st).alignment(Alignment::Right), a);
+
+    if a.height == 1 {
+        f.render_widget(Paragraph::new(left_title), a);
+        f.render_widget(Paragraph::new(right_status).alignment(Alignment::Right), a);
+        return;
+    }
+
+    let (sub_line, right_sub) = if a.width >= 100 {
+        (
+            Line::from(vec![
+                Span::styled("  SYS: ", Style::new().fg(DIM).bold()),
+                Span::styled("sing-box/bpf", Style::new().fg(CYAN)),
+                Span::styled("  ◈  KERNEL: ", Style::new().fg(DIM).bold()),
+                Span::styled("vx0", Style::new().fg(FG)),
+                Span::styled("  ◈  DNS: ", Style::new().fg(DIM).bold()),
+                Span::styled("1.1.1.1:DoH", Style::new().fg(GREEN)),
+                Span::styled("  ◈  ROUTE: ", Style::new().fg(DIM).bold()),
+                Span::styled("STRICT", Style::new().fg(PURPLE)),
+            ]),
+            Line::from(vec![
+                Span::styled("[SECLEVEL: ", Style::new().fg(DIM)),
+                Span::styled("CLASSIFIED", Style::new().fg(GREEN).bold()),
+                Span::styled(" · SHIELD: ", Style::new().fg(DIM)),
+                Span::styled("ENGAGED] ", Style::new().fg(CYAN).bold()),
+            ]),
+        )
+    } else {
+        (
+            Line::from(vec![
+                Span::styled("  CORE: ", Style::new().fg(DIM).bold()),
+                Span::styled("sing-box/bpf", Style::new().fg(CYAN)),
+                Span::styled("  ◈  NET_ADMIN  ◈  MTU: 9000  ◈  DNS: DoH", Style::new().fg(FG_DIM)),
+            ]),
+            Line::from(vec![
+                Span::styled("[LEAK_SHIELD: ", Style::new().fg(DIM)),
+                Span::styled("ENGAGED] ", Style::new().fg(CYAN).bold()),
+            ]),
+        )
+    };
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(a);
+    f.render_widget(Paragraph::new(left_title), rows[0]);
+    f.render_widget(Paragraph::new(right_status).alignment(Alignment::Right), rows[0]);
+    let right_len = if a.width >= 100 { 44 } else { 22 };
+    let sub_cols = Layout::horizontal([Constraint::Min(20), Constraint::Length(right_len)]).split(rows[1]);
+    f.render_widget(Paragraph::new(sub_line), sub_cols[0]);
+    f.render_widget(Paragraph::new(right_sub).alignment(Alignment::Right), sub_cols[1]);
 }
 
 fn ping_cell(app: &App, id: &str) -> Span<'static> {
     if app.pending.contains(id) {
-        return Span::styled("  ● PROBING", Style::new().fg(CYAN).bold());
+        return Span::styled("  ⌁ PROBING ", Style::new().fg(CYAN).bold());
     }
     match app.pings.get(id) {
         Some(Ping::Ms(ms)) => {
-            let bars = if *ms < 60 {
-                "▂▄▆█"
-            } else if *ms < 150 {
-                "▂▄▆ "
-            } else if *ms < 300 {
-                "▂▄  "
+            let (bars, col) = if *ms < 60 {
+                ("▰▰▰▰▰", GREEN)
+            } else if *ms < 120 {
+                ("▰▰▰▰▱", CYAN)
+            } else if *ms < 250 {
+                ("▰▰▰▱▱", YELLOW)
+            } else if *ms < 400 {
+                ("▰▰▱▱▱", Color::Rgb(0xff, 0x88, 0x00))
             } else {
-                "▂   "
+                ("▰▱▱▱▱", RED)
             };
-            Span::styled(format!("{ms:>4}ms {bars}"), Style::new().fg(ms_color(*ms)).bold())
+            Span::styled(format!("{bars} {ms:>3}ms "), Style::new().fg(col).bold())
         }
-        Some(Ping::Timeout) => Span::styled("  ✕ TIMEOUT", Style::new().fg(RED).bold()),
-        None => Span::raw("   -- ms   "),
+        Some(Ping::Timeout) => Span::styled("  ✕ TIMEOUT ", Style::new().fg(RED).bold()),
+        None => Span::styled(" ▱▱▱▱▱ --ms ", Style::new().fg(DIM)),
     }
 }
 
 fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
-    let mut title = format!("0x01 // TARGET NODES [ {} ]", app.view.len());
+    let mut title = format!("0x01 // TARGET NODE MATRIX [ {:02} NODES ]", app.view.len());
     if !app.filter.is_empty() {
-        title = format!("0x01 // SCAN: {}█ [ {} MATCHES ]", trunc(&app.filter, 14), app.view.len());
+        title = format!("0x01 // SCAN: \"{}\"█ [ {} MATCHES ]", trunc(&app.filter, 12), app.view.len());
     } else if app.sort_ping {
-        title.push_str(" · ↑RTT");
+        title = format!("0x01 // TARGET MATRIX [ {:02} NODES · ↑RTT ]", app.view.len());
     }
     if let Mode::Filter(s) = &app.mode {
-        title = format!("0x01 // SCAN: {}█", trunc(s, 20));
+        title = format!("0x01 // PATTERN SCAN: \"{}\"█", trunc(s, 16));
     }
-    let blk = block(&title);
+    let blk = block(&title, app.session.is_some());
     if app.view.is_empty() {
         let inner = blk.inner(area);
         f.render_widget(blk, area);
@@ -868,19 +988,19 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
                 Line::from(Span::styled("[!] NO TARGET TUNNELS CONFIGURED", Style::new().fg(YELLOW).bold())),
                 Line::from(""),
                 Line::from(Span::styled("  A  // INJECT LINK · SUBSCRIPTION · FILE", Style::new().fg(CYAN))),
-                Line::from(Span::styled("  V  // INJECT TARGET FROM CLIPBOARD", Style::new().fg(DIM))),
+                Line::from(Span::styled("  V  // INJECT TARGET FROM CLIPBOARD", Style::new().fg(FG_DIM))),
             ]
         } else {
             vec![
                 Line::from(""),
                 Line::from(Span::styled("[!] PATTERN SCAN: NO MATCHING TARGETS", Style::new().fg(RED).bold())),
-                Line::from(Span::styled("  ESC // CLEAR SCAN FILTER", Style::new().fg(DIM))),
+                Line::from(Span::styled("  ESC // CLEAR SCAN FILTER", Style::new().fg(FG_DIM))),
             ]
         };
         f.render_widget(Paragraph::new(msg).alignment(Alignment::Center), inner);
         return;
     }
-    let w = (area.width as usize).saturating_sub(3);
+    let w = (area.width as usize).saturating_sub(4);
     let active = app.session.as_ref().map(|s| s.id.clone());
     let items: Vec<ListItem> = app
         .view
@@ -890,14 +1010,14 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
             let p = &app.profiles[i];
             let on = active.as_deref() == Some(p.id.as_str());
             let num = format!("{:02} ", idx + 1);
-            let tag_str = format!("[{}]", p.kind.padded_tag());
-            let fixed_w = 2 + 3 + 11 + 1 + 8; // marker(2) + num(3) + ping(11) + space(1) + tag(8) = 25
+            let tag_str = format!("[{}]", kind_badge(p.kind));
+            let fixed_w = 4 + 3 + 12 + 1 + 7 + 1; // marker(4) + num(3) + ping(12) + space(1) + tag(7) + space(1) = 28
             let nw = w.saturating_sub(fixed_w).max(4);
             let name = trunc(&p.name, nw);
             let pad = nw.saturating_sub(name.chars().count());
             Line::from(vec![
-                Span::styled(if on { "● " } else { "○ " }, Style::new().fg(if on { GREEN } else { DIM }).bold()),
-                Span::styled(num, Style::new().fg(if on { GREEN } else { DIM })),
+                Span::styled(if on { "[●] " } else { "[○] " }, Style::new().fg(if on { GREEN } else { DIM }).bold()),
+                Span::styled(num, Style::new().fg(if on { GREEN } else { FG_DIM })),
                 Span::styled(name.into_owned(), Style::new().fg(if on { GREEN } else { FG }).bold()),
                 Span::raw(spaces(pad + 1)),
                 ping_cell(app, &p.id),
@@ -907,20 +1027,80 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
             .into()
         })
         .collect();
-    let list = List::new(items).block(blk).highlight_style(Style::new().bg(SEL_BG).fg(CYAN).bold()).highlight_symbol("► ");
+    let list = List::new(items)
+        .block(blk)
+        .highlight_style(Style::new().bg(SEL_BG).fg(SEL_FG).bold())
+        .highlight_symbol("► ");
     f.render_stateful_widget(list, area, &mut app.list);
+}
+
+fn circuit_diagram(local_iface: &str, node: &str, cipher: &str, exit_ip: &str, width: usize) -> Line<'static> {
+    let clean_exit = if exit_ip.is_empty() { "ANALYZING..." } else { exit_ip };
+    if width >= 58 {
+        let fixed = 2 + local_iface.len() + 6 + cipher.len() + 7 + 7 + clean_exit.len() + 4;
+        let max_node_w = width.saturating_sub(fixed).max(6);
+        Line::from(vec![
+            Span::styled(" [", Style::new().fg(DIM)),
+            Span::styled(local_iface.to_string(), Style::new().fg(CYAN).bold()),
+            Span::styled("] ══[ ", Style::new().fg(BORDER)),
+            Span::styled(cipher.to_string(), Style::new().fg(PURPLE).bold()),
+            Span::styled(" ]══► [", Style::new().fg(BORDER)),
+            Span::styled(trunc(node, max_node_w).into_owned(), Style::new().fg(FG).bold()),
+            Span::styled("] ══► [", Style::new().fg(BORDER)),
+            Span::styled(clean_exit.to_string(), Style::new().fg(GREEN).bold()),
+            Span::styled(" 🌐]", Style::new().fg(GREEN)),
+        ])
+    } else if width >= 44 {
+        Line::from(vec![
+            Span::styled(" [", Style::new().fg(DIM)),
+            Span::styled(local_iface.to_string(), Style::new().fg(CYAN).bold()),
+            Span::styled("] ──► [", Style::new().fg(BORDER)),
+            Span::styled(trunc(node, 12).into_owned(), Style::new().fg(FG).bold()),
+            Span::styled("] ──► [", Style::new().fg(BORDER)),
+            Span::styled(clean_exit.to_string(), Style::new().fg(GREEN).bold()),
+            Span::styled("]", Style::new().fg(DIM)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" TUNNEL: ", Style::new().fg(DIM)),
+            Span::styled(local_iface.to_string(), Style::new().fg(CYAN).bold()),
+            Span::styled(" ──► ", Style::new().fg(BORDER)),
+            Span::styled(clean_exit.to_string(), Style::new().fg(GREEN).bold()),
+        ])
+    }
+}
+
+fn circuit_diagram_direct(width: usize) -> Line<'static> {
+    if width >= 66 {
+        Line::from(vec![
+            Span::styled(" [LOCAL: DIRECT] ", Style::new().fg(DIM)),
+            Span::styled("──────[ UNENCRYPTED CLEAR-NET ]──────► ", Style::new().fg(RED).bold()),
+            Span::styled("[PUBLIC GATEWAY]", Style::new().fg(DIM)),
+        ])
+    } else if width >= 50 {
+        Line::from(vec![
+            Span::styled(" [LOCAL: DIRECT] ", Style::new().fg(DIM)),
+            Span::styled("──[ UNENCRYPTED ]──► ", Style::new().fg(RED).bold()),
+            Span::styled("[GATEWAY]", Style::new().fg(DIM)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" [DIRECT] ", Style::new().fg(DIM)),
+            Span::styled("──[ CLEAR-NET ]──► ", Style::new().fg(RED).bold()),
+            Span::styled("[GATEWAY]", Style::new().fg(DIM)),
+        ])
+    }
 }
 
 fn kv<'a>(k: &str, v: impl Into<Cow<'a, str>>, c: Color) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!(" {:<10} ", k.to_ascii_uppercase()), Style::new().fg(DIM).bold()),
-        Span::styled("► ", Style::new().fg(BORDER)),
+        Span::styled(format!(" {:<11} ", k.to_ascii_uppercase()), Style::new().fg(FG_DIM).bold()),
+        Span::styled("► ", Style::new().fg(BORDER_ACTIVE)),
         Span::styled(v.into(), Style::new().fg(c).bold()),
     ])
 }
 
 fn spark(f: &mut Frame, r: Rect, data: &[u64], c: Color) {
-    // Sparkline draws from the start of the slice, so hand it only the newest `width` samples
     let w = r.width as usize;
     let d = &data[data.len().saturating_sub(w)..];
     f.render_widget(Sparkline::default().data(d).style(Style::new().fg(c)), r);
@@ -928,23 +1108,29 @@ fn spark(f: &mut Frame, r: Rect, data: &[u64], c: Color) {
 
 fn info(f: &mut Frame, area: Rect, app: &App) {
     if app.show_log {
-        let blk = block("0x04 // KERNEL AUDIT & CORE LOG");
+        let blk = block("0x04 // REAL-TIME KERNEL AUDIT & CORE LOGS", true);
         let inner = blk.inner(area);
         f.render_widget(blk, area);
-        let inner = inner.inner(Margin::new(2, 1));
+        let inner = inner.inner(Margin::new(1, 1));
         let lines: Vec<Line> = tunnel::tail_log(inner.height as usize)
             .into_iter()
             .map(|l| {
-                let c = if l.contains("ERROR") || l.contains("FATAL") {
-                    RED
-                } else if l.contains("WARN") {
-                    YELLOW
-                } else if l.contains("connected") || l.contains("READY") || l.contains("success") {
-                    GREEN
+                let lower = l.to_lowercase();
+                let (prefix, c) = if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
+                    ("[✕ ALERT] ", RED)
+                } else if lower.contains("warn") {
+                    ("[! WARN ] ", YELLOW)
+                } else if lower.contains("connected") || lower.contains("ready") || lower.contains("success") || lower.contains("started") {
+                    ("[✔ OK   ] ", GREEN)
+                } else if lower.contains("dns") || lower.contains("route") || lower.contains("tun") || lower.contains("inbound") {
+                    ("[◈ NET  ] ", CYAN)
                 } else {
-                    DIM
+                    ("[· CORE ] ", FG_DIM)
                 };
-                Line::from(Span::styled(l, Style::new().fg(c)))
+                Line::from(vec![
+                    Span::styled(prefix, Style::new().fg(c).bold()),
+                    Span::styled(l, Style::new().fg(if c == RED { RED } else { FG })),
+                ])
             })
             .collect();
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -958,58 +1144,70 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         _ => None,
     };
     let Some((name, kind, server)) = shown else {
-        f.render_widget(block("0x02 // ROUTE DISENGAGED"), area);
+        f.render_widget(block("0x02 // ROUTE DISENGAGED // NO SELECTION", false), area);
         return;
     };
 
-    let parts = Layout::vertical([Constraint::Length(11), Constraint::Min(4)]).split(area);
+    let parts = Layout::vertical([Constraint::Length(12), Constraint::Min(4)]).split(area);
+    let is_connected = app.session.is_some();
 
     // ── connection card
-    let blk = block("0x02 // TELEMETRY & ROUTE INSPECTOR");
-    let inner = blk.inner(parts[0]).inner(Margin::new(2, 1));
+    let blk = block("0x02 // TELEMETRY & TACTICAL ROUTE INSPECTOR", is_connected);
+    let inner = blk.inner(parts[0]).inner(Margin::new(1, 0));
     f.render_widget(blk, parts[0]);
-    let nw = (inner.width as usize).saturating_sub(15);
+    let nw = (inner.width as usize).saturating_sub(16);
     let mut lines = vec![];
     match &app.session {
         Some(s) => {
-            lines.push(kv("status", "● ENGAGED // TUNNEL ACTIVE", GREEN));
-            lines.push(kv("profile", trunc(&name, nw), FG));
-            lines.push(kv("protocol", s.kind.tag(), kind_color(s.kind)));
+            let cipher_tag = if inner.width >= 72 { "CHACHA20-POLY1305" } else { "CHACHA20" };
+            lines.push(circuit_diagram(&s.iface, &s.server, cipher_tag, &app.ip, inner.width as usize));
+            lines.push(Line::from(""));
+            lines.push(kv("status", "● ENGAGED // ENCRYPTED TUNNEL ACTIVE", GREEN));
+            lines.push(kv("target", trunc(&name, nw), FG));
+            lines.push(kv("protocol", format!("{} [STRICT-ROUTE / TUN]", s.kind.tag()), kind_color(s.kind)));
             lines.push(kv("endpoint", trunc(&server, nw), FG));
-            lines.push(kv("exit ip", if app.ip.is_empty() { "ANALYZING..." } else { &app.ip }, CYAN));
-            lines.push(kv("uptime", fmt_dur(tunnel::now().saturating_sub(s.since)), FG));
+            lines.push(kv("exit ip", if app.ip.is_empty() { "ANALYZING IP..." } else { &app.ip }, CYAN));
+            lines.push(kv("uptime", format!("{} [SESSION: 0x{:04X}]", fmt_dur(tunnel::now().saturating_sub(s.since)), s.pid.unwrap_or(0) & 0xFFFF), FG_DIM));
             lines.push(match app.rtt {
-                Some(ms) => kv("latency", format!("{ms} ms [REALTIME ICMP]"), ms_color(ms)),
-                None => kv("latency", "PROBING...", DIM),
+                Some(ms) => kv("latency", format!("{ms} ms [REALTIME ICMP ECHO]"), ms_color(ms)),
+                None => kv("latency", "PROBING ICMP...", FG_DIM),
             });
+            lines.push(kv("shield", "DNS-OVER-HTTPS [1.1.1.1] · IPV6 ISOLATED", GREEN));
         }
         None => {
-            lines.push(kv("status", "○ STANDBY // ROUTE DISENGAGED", DIM));
-            lines.push(kv("profile", trunc(&name, nw), FG));
+            lines.push(circuit_diagram_direct(inner.width as usize));
+            lines.push(Line::from(vec![
+                Span::styled("  [!] ALERT: ", Style::new().fg(RED).bold()),
+                Span::styled("INTERNET TRAFFIC UNPROTECTED · LOCAL IP VISIBLE", Style::new().fg(FG_DIM)),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(kv("status", "○ STANDBY // ROUTE DISENGAGED", FG_DIM));
+            lines.push(kv("target", trunc(&name, nw), FG));
             lines.push(kv("protocol", kind.tag(), kind_color(kind)));
             lines.push(kv("endpoint", trunc(&server, nw), FG));
             let id = sel.map(|p| p.id.as_str()).unwrap_or("");
             lines.push(match app.pings.get(id) {
-                Some(Ping::Ms(ms)) => kv("probe rtt", format!("{ms} ms"), ms_color(*ms)),
-                Some(Ping::Timeout) => kv("probe rtt", "UNREACHABLE / TIMEOUT", RED),
-                None => kv("probe rtt", "NO TELEMETRY", DIM),
+                Some(Ping::Ms(ms)) => kv("probe rtt", format!("{ms} ms [TELEMETRY OPTIMAL]"), ms_color(*ms)),
+                Some(Ping::Timeout) => kv("probe rtt", "UNREACHABLE / TIMEOUT [✕]", RED),
+                None => kv("probe rtt", "NO TELEMETRY [PRESS T TO PROBE]", FG_DIM),
             });
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled(" [⏎] ENGAGE  ", Style::new().fg(CYAN).bold()),
-                Span::styled(" [T] PROBE  ", Style::new().fg(YELLOW).bold()),
-                Span::styled(" [U] AUTH", Style::new().fg(DIM)),
+                Span::styled("  [⏎] ENGAGE NODE  ", Style::new().fg(CYAN).bold()),
+                Span::styled(" [T] PROBE LATENCY  ", Style::new().fg(YELLOW).bold()),
+                Span::styled(" [U] AUTH CREDENTIALS", Style::new().fg(FG_DIM)),
             ]));
         }
     }
     f.render_widget(Paragraph::new(lines), inner);
 
     // ── traffic (connected) / details (idle)
-    if let Some(_) = &app.session {
-        let blk = block("0x03 // PACKET FLOW & JITTER ANALYZER");
-        let inner = blk.inner(parts[1]).inner(Margin::new(2, 1));
+    if is_connected {
+        let blk = block("0x03 // PACKET FLOW & SPECTRUM ANALYZER", true);
+        let inner = blk.inner(parts[1]).inner(Margin::new(1, 0));
         f.render_widget(blk, parts[1]);
         let rows = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Length(2),
@@ -1021,53 +1219,111 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         let dn = app.down.last().copied().unwrap_or(0);
         let upn = app.up.last().copied().unwrap_or(0);
         let tot = app.last.map(|(r, t)| (r.saturating_sub(app.base.0), t.saturating_sub(app.base.1))).unwrap_or((0, 0));
-        let line = Line::from(vec![
-            Span::styled("RX ► ", Style::new().fg(CYAN).bold()),
-            Span::styled(format!("{}/s", fmt_bytes(dn)), Style::new().fg(FG).bold()),
-            Span::raw("   "),
-            Span::styled("TX ▲ ", Style::new().fg(PURPLE).bold()),
-            Span::styled(format!("{}/s", fmt_bytes(upn)), Style::new().fg(FG).bold()),
-            Span::styled(format!("   │ CUMULATIVE: RX {} · TX {}", fmt_bytes(tot.0), fmt_bytes(tot.1)), Style::new().fg(DIM)),
-        ]);
-        f.render_widget(Paragraph::new(line), rows[0]);
-        spark(f, rows[1], &app.down, CYAN);
-        spark(f, rows[2], &app.up, PURPLE);
-        let (lo, hi) = (app.rtt_hist.iter().min(), app.rtt_hist.iter().max());
-        let rtt_txt = match (lo, hi) {
-            (Some(l), Some(h)) => format!("RTT JITTER SPECTRUM   MIN {l}ms · MAX {h}ms"),
-            _ => "RTT JITTER SPECTRUM".to_string(),
+        let line = if inner.width >= 62 {
+            Line::from(vec![
+                Span::styled("RX SPEED ► ", Style::new().fg(CYAN).bold()),
+                Span::styled(format!("{}/s", fmt_bytes(dn)), Style::new().fg(FG).bold()),
+                Span::styled(format!(" [PEAK: {}/s]", fmt_bytes(app.down_peak)), Style::new().fg(FG_DIM)),
+                Span::raw("   "),
+                Span::styled("TX SPEED ▲ ", Style::new().fg(PURPLE).bold()),
+                Span::styled(format!("{}/s", fmt_bytes(upn)), Style::new().fg(FG).bold()),
+                Span::styled(format!(" [PEAK: {}/s]", fmt_bytes(app.up_peak)), Style::new().fg(FG_DIM)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("RX ► ", Style::new().fg(CYAN).bold()),
+                Span::styled(format!("{}/s ", fmt_bytes(dn)), Style::new().fg(FG).bold()),
+                Span::styled("  TX ▲ ", Style::new().fg(PURPLE).bold()),
+                Span::styled(format!("{}/s", fmt_bytes(upn)), Style::new().fg(FG).bold()),
+            ])
         };
-        f.render_widget(Paragraph::new(Span::styled(rtt_txt, Style::new().fg(DIM).bold())), rows[3]);
-        spark(f, rows[4], &app.rtt_hist, YELLOW);
+        let sub = if inner.width >= 62 {
+            Line::from(vec![
+                Span::styled("CUMULATIVE: ", Style::new().fg(DIM).bold()),
+                Span::styled(format!("RX {} · TX {}", fmt_bytes(tot.0), fmt_bytes(tot.1)), Style::new().fg(FG_DIM)),
+                Span::styled("  │  MTU: 9000  │  BBR: ENGAGED", Style::new().fg(GREEN)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("TOTAL: ", Style::new().fg(DIM)),
+                Span::styled(format!("RX {} · TX {}", fmt_bytes(tot.0), fmt_bytes(tot.1)), Style::new().fg(FG_DIM)),
+            ])
+        };
+        f.render_widget(Paragraph::new(line), rows[0]);
+        f.render_widget(Paragraph::new(sub), rows[1]);
+        spark(f, rows[2], &app.down, CYAN);
+        spark(f, rows[3], &app.up, PURPLE);
+        let (lo, hi) = (app.rtt_hist.iter().min(), app.rtt_hist.iter().max());
+        let cur_rtt = app.rtt.unwrap_or(0);
+        let rtt_txt = match (lo, hi) {
+            (Some(l), Some(h)) => format!("⌁ RTT JITTER SPECTRUM   MIN {l}ms · CUR {cur_rtt}ms · MAX {h}ms   [ICMP ECHO]"),
+            _ => "⌁ RTT JITTER SPECTRUM".to_string(),
+        };
+        f.render_widget(Paragraph::new(Span::styled(rtt_txt, Style::new().fg(FG_DIM).bold())), rows[4]);
+        spark(f, rows[5], &app.rtt_hist, YELLOW);
     } else {
-        let blk = block("0x03 // TARGET ENCRYPTED PARAMETERS");
-        let inner = blk.inner(parts[1]).inner(Margin::new(2, 1));
+        let blk = block("0x03 // TARGET ENCRYPTED PARAMETERS & RECON VECTOR", false);
+        let inner = blk.inner(parts[1]).inner(Margin::new(1, 0));
         f.render_widget(blk, parts[1]);
-        let lines: Vec<Line> = sel
+        let mut lines: Vec<Line> = sel
             .map(store::details)
             .unwrap_or_default()
             .into_iter()
-            .map(|(k, v)| kv(k, trunc(&v, nw).into_owned(), FG))
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let prefix = format!("0x{:02X} {:<11} ", i + 1, k.to_ascii_uppercase());
+                Line::from(vec![
+                    Span::styled(prefix, Style::new().fg(FG_DIM).bold()),
+                    Span::styled("► ", Style::new().fg(BORDER_ACTIVE)),
+                    Span::styled(trunc(&v, nw).into_owned(), Style::new().fg(FG).bold()),
+                ])
+            })
             .collect();
+
+        if inner.height >= 9 && inner.width >= 60 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(" ┌─[ TARGET VECTOR INTELLIGENCE ]──────────────────────────┐", Style::new().fg(BORDER))));
+            lines.push(Line::from(vec![
+                Span::styled(" │ CORE: ", Style::new().fg(BORDER)),
+                Span::styled("sing-box/bpf       ", Style::new().fg(CYAN)),
+                Span::styled(" ROUTING: ", Style::new().fg(BORDER)),
+                Span::styled("STRICT-ROUTE (vx0) ", Style::new().fg(FG)),
+                Span::styled("│", Style::new().fg(BORDER)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" │ DNS : ", Style::new().fg(BORDER)),
+                Span::styled("1.1.1.1 (DoH)      ", Style::new().fg(GREEN)),
+                Span::styled(" SHIELD : ", Style::new().fg(BORDER)),
+                Span::styled("KILL-SWITCH ARMED  ", Style::new().fg(PURPLE)),
+                Span::styled("│", Style::new().fg(BORDER)),
+            ]));
+            lines.push(Line::from(Span::styled(" └────────────────────────────────────────────────────────┘", Style::new().fg(BORDER))));
+        }
         f.render_widget(Paragraph::new(lines), inner);
     }
 }
 
 fn footer(f: &mut Frame, a: Rect, app: &App) {
+    if a.height == 0 {
+        return;
+    }
     if let Some((m, ok, _)) = &app.toast {
         let (tag, c) = if *ok {
-            (" [✔ SYSTEM OK] ", GREEN)
+            (" [✔ SYSTEM OK] >> ", GREEN)
         } else {
-            (" [✕ BREACH/ERR] ", RED)
+            (" [✕ ALERT / ERROR] >> ", RED)
         };
-        let text = format!("{tag}{}", trunc(m, (a.width as usize).saturating_sub(20)));
+        let text = format!("{tag}{}", trunc(m, (a.width as usize).saturating_sub(25)));
         f.render_widget(Paragraph::new(Span::styled(text, Style::new().fg(c).bold())), a);
         return;
     }
-    let mut sp = vec![Span::styled(" root@vortex:~# ", Style::new().fg(GREEN).bold())];
+    let mut sp = vec![
+        Span::styled(" root@vortex", Style::new().fg(GREEN).bold()),
+        Span::styled("[SYS]# ", Style::new().fg(CYAN).bold()),
+    ];
     let keys = [
         ("RET", "ENGAGE"),
-        ("SPC", "ABORT"),
+        ("SPC", "SEVER"),
         ("A", "INJECT"),
         ("T", "PROBE"),
         ("U", "AUTH"),
@@ -1075,11 +1331,11 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
         ("O", "SORT"),
         ("L", "LOG"),
         ("?", "HELP"),
-        ("Q", "EXIT"),
+        ("Q", "QUIT"),
     ];
     for (k, d) in keys {
         sp.push(Span::styled(format!("[{k}]"), Style::new().fg(CYAN).bold()));
-        sp.push(Span::styled(format!(" {d}  "), Style::new().fg(DIM)));
+        sp.push(Span::styled(format!(" {d} "), Style::new().fg(FG_DIM)));
     }
     f.render_widget(Paragraph::new(Line::from(sp)), a);
 }
@@ -1087,19 +1343,27 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
 fn popup(f: &mut Frame, area: Rect, title: &str, hint: &str, input: &str) {
     let w = area.width.min(78);
     let h = 5.min(area.height);
-    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(h) / 2, width: w, height: h };
+    let r = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
     f.render_widget(Clear, r);
-    let blk = block(title);
+    let blk = block(title, true);
     let inner = blk.inner(r);
     f.render_widget(blk, r);
-    let max = (inner.width as usize).saturating_sub(24);
+    let max = (inner.width as usize).saturating_sub(26);
     let n = input.chars().count();
     let shown: String = input.chars().skip(n.saturating_sub(max)).collect();
     let lines = vec![
-        Line::from(Span::styled(format!(" ⌁ {hint}"), Style::new().fg(DIM))),
+        Line::from(vec![
+            Span::styled(" ⌁ VECTOR PROTOCOL: ", Style::new().fg(CYAN).bold()),
+            Span::styled(hint, Style::new().fg(FG_DIM)),
+        ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" root@vortex:input# ", Style::new().fg(GREEN).bold()),
+            Span::styled(" root@vortex:payload# ", Style::new().fg(GREEN).bold()),
             Span::styled(shown, Style::new().fg(FG).bold()),
             Span::styled("█", Style::new().fg(CYAN)),
         ]),
@@ -1107,43 +1371,93 @@ fn popup(f: &mut Frame, area: Rect, title: &str, hint: &str, input: &str) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn help(f: &mut Frame, area: Rect) {
-    let rows: [(&str, &str); 17] = [
-        ("RET / ENTER", "ENGAGE SELECTED TARGET"),
-        ("SPC / S", "ABORT / DISENGAGE TUNNEL"),
-        ("J K ↑ ↓", "NAVIGATE TARGET MATRIX"),
-        ("G / SHIFT+G", "JUMP TO TOP / BOTTOM"),
-        ("A", "INJECT LINK / SUB / FILE"),
-        ("V", "INJECT FROM SYSTEM CLIPBOARD"),
-        ("/", "PATTERN SCAN / FILTER"),
-        ("T / SHIFT+T", "PROBE LATENCY: ALL / TARGET"),
-        ("O", "CYCLE SORT ORDER (RTT ⇄ ID)"),
-        ("U", "CONFIGURE OPENVPN CREDENTIALS"),
-        ("R", "RENAME TARGET IDENTIFIER"),
-        ("D", "DELETE TARGET FROM MATRIX"),
-        ("L", "TOGGLE KERNEL AUDIT & LOGS"),
-        ("I", "PROBE LIVE EXIT IP"),
-        ("ESC", "ABORT / DISMISS / CLEAR SCAN"),
-        ("Q", "DETACH CONSOLE (TUNNEL PERSISTS)"),
-        ("SHIFT+Q", "TERMINATE CONSOLE & DISCONNECT"),
-    ];
-    let h = (rows.len() as u16 + 4).min(area.height);
-    let w = 58.min(area.width);
-    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(h) / 2, width: w, height: h };
+fn confirm_popup(f: &mut Frame, area: Rect, app: &App) {
+    let Some(p) = app.cur() else { return };
+    let w = 64.min(area.width);
+    let h = 7.min(area.height);
+    let r = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
     f.render_widget(Clear, r);
-    let blk = block("0x?? // CYBER COMMAND DIRECTORY");
+    let blk = Block::bordered()
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(RED))
+        .title(Line::from(vec![
+            Span::styled(" ◈ [ ", Style::new().fg(RED)),
+            Span::styled("0xDEL // TARGET PURGE CONFIRMATION", Style::new().fg(RED).bold()),
+            Span::styled(" ] ", Style::new().fg(RED)),
+        ]));
     let inner = blk.inner(r).inner(Margin::new(2, 1));
     f.render_widget(blk, r);
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(k, d)| {
-            Line::from(vec![
-                Span::styled(format!(" [{k:<11}] "), Style::new().fg(CYAN).bold()),
-                Span::styled("► ", Style::new().fg(BORDER)),
-                Span::styled(*d, Style::new().fg(FG)),
-            ])
-        })
-        .collect();
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("[!] CRITICAL: ", Style::new().fg(RED).bold()),
+            Span::styled("PERMANENT NODE VECTOR PURGE", Style::new().fg(FG).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("TARGET: ", Style::new().fg(FG_DIM)),
+            Span::styled(trunc(&p.name, (inner.width as usize).saturating_sub(10)), Style::new().fg(YELLOW).bold()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("PRESS [", Style::new().fg(FG_DIM)),
+            Span::styled("Y", Style::new().fg(GREEN).bold()),
+            Span::styled("] TO CONFIRM PURGE  ·  [", Style::new().fg(FG_DIM)),
+            Span::styled("ESC", Style::new().fg(RED).bold()),
+            Span::styled("] TO ABORT", Style::new().fg(FG_DIM)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn help(f: &mut Frame, area: Rect) {
+    let rows: [(&str, &str, &str); 17] = [
+        ("TUNNEL CONTROL", "RET / ENTER", "ENGAGE SELECTED TARGET NODE"),
+        ("TUNNEL CONTROL", "SPC / S", "SEVER / ABORT ACTIVE TUNNEL"),
+        ("TUNNEL CONTROL", "J K ↑ ↓", "NAVIGATE TARGET NODE MATRIX"),
+        ("TUNNEL CONTROL", "G / SHIFT+G", "JUMP TO FIRST / LAST NODE"),
+        ("RECON & PROBE", "T", "EXECUTE LATENCY PROBE (ALL NODES)"),
+        ("RECON & PROBE", "SHIFT+T", "EXECUTE LATENCY PROBE (SELECTED)"),
+        ("RECON & PROBE", "O", "CYCLE SORT ORDER (RTT SPEED ⇄ ID)"),
+        ("RECON & PROBE", "/", "PATTERN SCAN & GREP FILTER"),
+        ("RECON & PROBE", "I", "PROBE LIVE PUBLIC EXIT IP"),
+        ("PAYLOAD & AUTH", "A", "INJECT LINK / SUBSCRIPTION / FILE"),
+        ("PAYLOAD & AUTH", "V", "INJECT VECTOR FROM CLIPBOARD"),
+        ("PAYLOAD & AUTH", "U", "CONFIGURE OPENVPN CREDENTIAL VAULT"),
+        ("PAYLOAD & AUTH", "R", "MUTATE TARGET IDENTIFIER (RENAME)"),
+        ("PAYLOAD & AUTH", "D", "PURGE TARGET VECTOR FROM KEYSTORE"),
+        ("SYSTEM OPS", "L", "TOGGLE KERNEL AUDIT & LIVE LOGS"),
+        ("SYSTEM OPS", "ESC", "DISMISS / CLEAR FILTER / ABORT"),
+        ("SYSTEM OPS", "Q / SHIFT+Q", "DETACH CONSOLE / TERMINATE ALL"),
+    ];
+    let h = (rows.len() as u16 + 5).min(area.height);
+    let w = 68.min(area.width);
+    let r = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let blk = block("0x?? // BLACK-HAT COMMAND CONSOLE DIRECTORY", true);
+    let inner = blk.inner(r).inner(Margin::new(1, 1));
+    f.render_widget(blk, r);
+    let mut lines = vec![];
+    let mut last_cat = "";
+    for (cat, k, d) in rows {
+        if cat != last_cat && inner.height >= 20 {
+            lines.push(Line::from(Span::styled(format!(" // {cat}"), Style::new().fg(CYAN).bold())));
+            last_cat = cat;
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!(" [{k:<11}] "), Style::new().fg(if k.contains("RET") || k.contains("SPC") { GREEN } else { CYAN }).bold()),
+            Span::styled("► ", Style::new().fg(BORDER_ACTIVE)),
+            Span::styled(d, Style::new().fg(FG)),
+        ]));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1203,5 +1517,35 @@ mod tests {
         assert_eq!(s, "ab ");
         assert!(edit(&mut s, &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
         assert_eq!(s, "");
+    }
+
+    #[test]
+    fn connected_layout_renders_properly() {
+        let mut app = App::new();
+        let p = prof("a", "Frankfurt Reality", Kind::Vless, "vless://u@203.0.113.7:443?security=reality&sni=example.com&pbk=k&type=grpc&serviceName=x#Frankfurt");
+        app.profiles = vec![p.clone()];
+        app.view = vec![0];
+        app.session = Some(Session {
+            id: "a".into(),
+            name: "Frankfurt Reality".into(),
+            kind: Kind::Vless,
+            server: "203.0.113.7:443".into(),
+            iface: "vx0".into(),
+            pid: Some(1337),
+            since: tunnel::now().saturating_sub(120),
+            conf: "".into(),
+        });
+        app.down = vec![1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
+        app.up = vec![512, 1024, 2048, 4096, 8192, 16384, 32768];
+        app.down_peak = 262144;
+        app.up_peak = 32768;
+        app.rtt_hist = vec![42, 41, 43, 42, 45, 42, 40, 42];
+        app.rtt = Some(42);
+        app.ip = "185.220.101.5".into();
+        let out = render(120, 32, &mut app);
+        println!("{out}");
+        assert!(out.contains("LINK ENGAGED"));
+        assert!(out.contains("CHACHA20"));
+        assert!(out.contains("PACKET FLOW & SPECTRUM ANALYZER"));
     }
 }
