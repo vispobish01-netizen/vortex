@@ -1,0 +1,20 @@
+[package]
+name = "vortex-core"
+version = "0.2.0"
+edition = "2021"
+description = "Core library for Vortex — VPN/proxy models, IPC protocol, probing, routing, and tunnel management"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+anyhow = "1"
+url = "2"
+percent-encoding = "2"
+base64 = "0.22"
+toml = "0.8"
+libc = "0.2"
+qrcode = { version = "0.14.1", default-features = false }
+flate2 = "1"

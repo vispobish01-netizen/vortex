@@ -29,7 +29,10 @@ pub struct Session {
 }
 
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn sess_path() -> String {
@@ -68,7 +71,11 @@ fn need(bin: &str, pkg: &str) -> Result<()> {
 fn proc_alive(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
-        .and_then(|s| s.rsplit(')').next().and_then(|r| r.trim_start().chars().next()))
+        .and_then(|s| {
+            s.rsplit(')')
+                .next()
+                .and_then(|r| r.trim_start().chars().next())
+        })
         .map(|c| c != 'Z')
         .unwrap_or(false)
 }
@@ -102,11 +109,7 @@ pub fn tail_log(n: usize) -> Vec<String> {
         return Vec::new();
     }
     let lines: Vec<&str> = buf.lines().collect();
-    let start = if offset > 0 && lines.len() > 1 {
-        1
-    } else {
-        0
-    };
+    let start = if offset > 0 && lines.len() > 1 { 1 } else { 0 };
     let valid_lines = &lines[start..];
     valid_lines[valid_lines.len().saturating_sub(n)..]
         .iter()
@@ -141,7 +144,11 @@ pub fn load_session() -> Option<Session> {
 
 pub fn bytes(iface: &str) -> Option<(u64, u64)> {
     let r = |f: &str| -> Option<u64> {
-        fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{f}")).ok()?.trim().parse().ok()
+        fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{f}"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     };
     Some((r("rx_bytes")?, r("tx_bytes")?))
 }
@@ -154,33 +161,33 @@ pub fn public_ip() -> String {
         .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
         .and_then(|v| {
             let ip = v["ip"].as_str()?;
-            Some(format!("{ip}  {}", v["country"].as_str().unwrap_or("")).trim().to_string())
+            Some(
+                format!("{ip}  {}", v["country"].as_str().unwrap_or(""))
+                    .trim()
+                    .to_string(),
+            )
         })
         .unwrap_or_else(|| "unreachable".into())
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ActiveFlow {
-    pub id: String,
-    pub network: String,
-    pub host: String,
-    pub destination: String,
-    pub source: String,
-    pub process: String,
-    pub upload: u64,
-    pub download: u64,
-}
+pub use crate::model::ActiveFlow;
 
 pub fn active_flows() -> Vec<ActiveFlow> {
     // 1. Try sing-box clash_api controller at 127.0.0.1:9090/connections
-    if let Ok(o) = Command::new("curl").args(["-s", "--max-time", "1", "http://127.0.0.1:9090/connections"]).output() {
+    if let Ok(o) = Command::new("curl")
+        .args(["-s", "--max-time", "1", "http://127.0.0.1:9090/connections"])
+        .output()
+    {
         if o.status.success() {
             if let Ok(val) = serde_json::from_slice::<Value>(&o.stdout) {
                 if let Some(conns) = val["connections"].as_array() {
                     let mut flows = vec![];
                     for c in conns {
                         let id = c["id"].as_str().unwrap_or("").to_string();
-                        let net = c["metadata"]["network"].as_str().unwrap_or("tcp").to_string();
+                        let net = c["metadata"]["network"]
+                            .as_str()
+                            .unwrap_or("tcp")
+                            .to_string();
                         let host = c["metadata"]["host"].as_str().unwrap_or("").to_string();
                         let dst_ip = c["metadata"]["destinationIP"].as_str().unwrap_or("");
                         let dst_p = c["metadata"]["destinationPort"].as_str().unwrap_or("");
@@ -194,7 +201,11 @@ pub fn active_flows() -> Vec<ActiveFlow> {
                         let source = format!("{src_ip}:{src_p}");
                         let proc_path = c["metadata"]["processPath"].as_str().unwrap_or("");
                         let process = if !proc_path.is_empty() {
-                            proc_path.rsplit('/').next().unwrap_or(proc_path).to_string()
+                            proc_path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(proc_path)
+                                .to_string()
                         } else {
                             "system".to_string()
                         };
@@ -222,7 +233,10 @@ pub fn active_flows() -> Vec<ActiveFlow> {
 
     // 2. Fallback: Parse active established connections via `ss -ntp state established`
     let mut flows = vec![];
-    if let Ok(o) = Command::new("ss").args(["-ntp", "state", "established"]).output() {
+    if let Ok(o) = Command::new("ss")
+        .args(["-ntp", "state", "established"])
+        .output()
+    {
         if o.status.success() {
             let text = String::from_utf8_lossy(&o.stdout);
             for l in text.lines().skip(1) {
@@ -267,13 +281,18 @@ pub fn ovpn_needs_auth(p: &Profile) -> bool {
     p.kind == Kind::Ovpn
         && (p.data.lines().any(|l| {
             let t = l.trim();
-            t == "auth-user-pass" || t.starts_with("auth-user-pass ") || t.starts_with("auth-user-pass\t")
+            t == "auth-user-pass"
+                || t.starts_with("auth-user-pass ")
+                || t.starts_with("auth-user-pass\t")
         }) || p.data.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----")
             || p.data.contains("Proc-Type: 4,ENCRYPTED"))
 }
 
 pub fn prompt_ovpn_credentials(default_user: Option<&str>) -> Result<Credentials> {
-    let mut tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    let mut tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?;
     writeln!(tty, "\n[vortex] OpenVPN Credentials Required")?;
     if let Some(du) = default_user.filter(|s| !s.is_empty()) {
         write!(tty, "Username [{du}]: ")?;
@@ -292,10 +311,14 @@ pub fn prompt_ovpn_credentials(default_user: Option<&str>) -> Result<Credentials
     }
     write!(tty, "Password: ")?;
     tty.flush()?;
-    let _ = Command::new("stty").args(["-F", "/dev/tty", "-echo"]).status();
+    let _ = Command::new("stty")
+        .args(["-F", "/dev/tty", "-echo"])
+        .status();
     let mut pass = String::new();
     reader.read_line(&mut pass)?;
-    let _ = Command::new("stty").args(["-F", "/dev/tty", "echo"]).status();
+    let _ = Command::new("stty")
+        .args(["-F", "/dev/tty", "echo"])
+        .status();
     writeln!(tty)?;
     let pass = pass.trim_end().to_string();
     if user.is_empty() || pass.is_empty() {
@@ -333,10 +356,16 @@ pub fn connect_with_credentials(p: &Profile, credentials: Option<(&str, &str)>) 
 }
 
 pub fn disconnect() -> Result<()> {
-    let Some(s) = read_session() else { return Ok(()) };
+    let Some(s) = read_session() else {
+        return Ok(());
+    };
     match s.kind {
         Kind::Wg | Kind::Awg => {
-            let quick = if s.kind == Kind::Awg { "awg-quick" } else { "wg-quick" };
+            let quick = if s.kind == Kind::Awg {
+                "awg-quick"
+            } else {
+                "wg-quick"
+            };
             let _ = Command::new(quick).args(["down", &s.conf]).output();
         }
         _ => {
@@ -399,29 +428,7 @@ fn session(p: &Profile, iface: &str, pid: Option<u32>, conf: &str) -> Session {
 pub const PROXY_PORT: u16 = 1080;
 pub const ROUTING_FILE: &str = "/etc/vortex/routing.json";
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RoutingConfig {
-    #[serde(default = "default_true")]
-    pub bypass_lan: bool,
-    #[serde(default)]
-    pub direct_domains: Vec<String>,
-    #[serde(default)]
-    pub blocked_domains: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for RoutingConfig {
-    fn default() -> Self {
-        RoutingConfig {
-            bypass_lan: true,
-            direct_domains: vec!["local".into(), "lan".into(), "home.arpa".into()],
-            blocked_domains: vec![],
-        }
-    }
-}
+pub use crate::model::RoutingConfig;
 
 pub fn load_routing() -> RoutingConfig {
     fs::read_to_string(ROUTING_FILE)
@@ -505,10 +512,15 @@ fn up_singbox(p: &Profile) -> Result<Session> {
     });
     let path = format!("{RUN}/singbox.json");
     write_secret(&path, &serde_json::to_string_pretty(&cfg)?)?;
-    let chk = Command::new("sing-box").args(["check", "-c", &path]).output()?;
+    let chk = Command::new("sing-box")
+        .args(["check", "-c", &path])
+        .output()?;
     if !chk.status.success() {
         let e = String::from_utf8_lossy(&chk.stderr);
-        bail!("sing-box rejected the config: {}", e.trim().lines().last().unwrap_or("unknown error"));
+        bail!(
+            "sing-box rejected the config: {}",
+            e.trim().lines().last().unwrap_or("unknown error")
+        );
     }
     let log = fs::File::create(&logp)?;
     let pid = spawn_detached(Command::new("sing-box").args(["run", "-c", &path]), log)?;
@@ -517,8 +529,12 @@ fn up_singbox(p: &Profile) -> Result<Session> {
             bail!("sing-box exited: {}", last_lines(3));
         }
         if iface_exists(TUN_IF) {
-            let route_ok = Command::new("ip").args(["route", "show", "dev", TUN_IF]).output()
-                .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            let route_ok = Command::new("ip")
+                .args(["route", "show", "dev", TUN_IF])
+                .output()
+                .map(|o| {
+                    o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+                })
                 .unwrap_or(false);
             if route_ok {
                 return Ok(session(p, TUN_IF, Some(pid), &path));
@@ -534,8 +550,19 @@ fn up_singbox(p: &Profile) -> Result<Session> {
 
 fn up_wg(p: &Profile) -> Result<Session> {
     let awg = p.kind == Kind::Awg;
-    let (quick, iface) = if awg { ("awg-quick", "vxawg0") } else { ("wg-quick", "vxwg0") };
-    need(quick, if awg { "amneziawg-tools (AUR)" } else { "wireguard-tools" })?;
+    let (quick, iface) = if awg {
+        ("awg-quick", "vxawg0")
+    } else {
+        ("wg-quick", "vxwg0")
+    };
+    need(
+        quick,
+        if awg {
+            "amneziawg-tools (AUR)"
+        } else {
+            "wireguard-tools"
+        },
+    )?;
     let mut conf = p.data.clone();
     let mut dns: Option<String> = None;
     if !have("resolvconf") {
@@ -558,14 +585,26 @@ fn up_wg(p: &Profile) -> Result<Session> {
     if !out.status.success() {
         let _ = fs::remove_file(&path);
         let e = String::from_utf8_lossy(&out.stderr);
-        bail!("{quick} failed: {}", e.trim().lines().last().unwrap_or("unknown error"));
+        bail!(
+            "{quick} failed: {}",
+            e.trim().lines().last().unwrap_or("unknown error")
+        );
     }
     if let Some(d) = dns {
-        let servers: Vec<&str> =
-            d.split(',').map(str::trim).filter(|x| x.parse::<IpAddr>().is_ok()).collect();
+        let servers: Vec<&str> = d
+            .split(',')
+            .map(str::trim)
+            .filter(|x| x.parse::<IpAddr>().is_ok())
+            .collect();
         if !servers.is_empty() && have("resolvectl") {
-            let _ = Command::new("resolvectl").arg("dns").arg(iface).args(&servers).output();
-            let _ = Command::new("resolvectl").args(["domain", iface, "~."]).output();
+            let _ = Command::new("resolvectl")
+                .arg("dns")
+                .arg(iface)
+                .args(&servers)
+                .output();
+            let _ = Command::new("resolvectl")
+                .args(["domain", iface, "~."])
+                .output();
         }
     }
     Ok(session(p, iface, None, &path))
@@ -576,7 +615,10 @@ fn up_wg(p: &Profile) -> Result<Session> {
 fn up_ovpn(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
     need("openvpn", "openvpn")?;
     let needs_auth = ovpn_needs_auth(p);
-    let saved_creds = p.auth.as_ref().map(|a| (a.username.as_str(), a.password.as_str()));
+    let saved_creds = p
+        .auth
+        .as_ref()
+        .map(|a| (a.username.as_str(), a.password.as_str()));
     let effective_creds = credentials.or(saved_creds);
     if needs_auth && effective_creds.is_none() {
         bail!("OpenVPN profile '{}' requires username and password (run `vortex auth {}` or connect with credentials)", p.name, p.name);
@@ -590,7 +632,10 @@ fn up_ovpn(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
     let mut conf_content = String::new();
     for l in p.data.lines() {
         let t = l.trim();
-        if t == "auth-user-pass" || t.starts_with("auth-user-pass ") || t.starts_with("auth-user-pass\t") {
+        if t == "auth-user-pass"
+            || t.starts_with("auth-user-pass ")
+            || t.starts_with("auth-user-pass\t")
+        {
             continue;
         }
         conf_content.push_str(l);
@@ -605,16 +650,30 @@ fn up_ovpn(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
     let _ = fs::remove_file(&logp);
     let before = ifaces();
     let mut cmd = Command::new("openvpn");
-    cmd.args(["--config", &conf, "--daemon", "vortex-ovpn", "--writepid", &pidf, "--log", &logp]);
+    cmd.args([
+        "--config",
+        &conf,
+        "--daemon",
+        "vortex-ovpn",
+        "--writepid",
+        &pidf,
+        "--log",
+        &logp,
+    ]);
     if effective_creds.is_some() {
         cmd.args(["--auth-user-pass", &authf]);
     }
     let out = cmd.output()?;
     if !out.status.success() {
         let _ = fs::remove_file(&authf);
-        bail!("openvpn failed to start: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "openvpn failed to start: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    let pid: Option<u32> = fs::read_to_string(&pidf).ok().and_then(|s| s.trim().parse().ok());
+    let pid: Option<u32> = fs::read_to_string(&pidf)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
     for _ in 0..100 {
         let log = fs::read_to_string(&logp).unwrap_or_default();
         if log.contains("Initialization Sequence Completed") {
@@ -623,15 +682,23 @@ fn up_ovpn(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
                 .find(|i| !before.contains(i) && (i.starts_with("tun") || i.starts_with("tap")))
                 .unwrap_or_else(|| "tun0".into());
             if !iface_exists(&iface) {
-                if let Some(pid) = pid { kill(pid); }
+                if let Some(pid) = pid {
+                    kill(pid);
+                }
                 let _ = fs::remove_file(&authf);
                 bail!("OpenVPN initialized but tunnel interface was not found");
             }
-            let route_ok = Command::new("ip").args(["route", "show", "dev", &iface]).output()
-                .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            let route_ok = Command::new("ip")
+                .args(["route", "show", "dev", &iface])
+                .output()
+                .map(|o| {
+                    o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+                })
                 .unwrap_or(false);
             if !route_ok {
-                if let Some(pid) = pid { kill(pid); }
+                if let Some(pid) = pid {
+                    kill(pid);
+                }
                 let _ = fs::remove_file(&authf);
                 bail!("OpenVPN connected but no route was installed on {iface}");
             }

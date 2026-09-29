@@ -32,7 +32,10 @@ pub fn split_host_port(server: &str, default: u16) -> Option<(String, u16)> {
     }
     if let Some(rest) = s.strip_prefix('[') {
         let (h, tail) = rest.split_once(']')?;
-        let port = tail.strip_prefix(':').and_then(parse_port).unwrap_or(default);
+        let port = tail
+            .strip_prefix(':')
+            .and_then(parse_port)
+            .unwrap_or(default);
         return Some((h.to_string(), port));
     }
     if s.matches(':').count() == 1 {
@@ -90,7 +93,15 @@ fn icmp_ms(host: &str) -> Option<u32> {
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     let line = s.lines().find(|l| l.contains("min/avg/max"))?;
-    let avg: f64 = line.split('=').nth(1)?.trim().split('/').nth(1)?.trim().parse().ok()?;
+    let avg: f64 = line
+        .split('=')
+        .nth(1)?
+        .trim()
+        .split('/')
+        .nth(1)?
+        .trim()
+        .parse()
+        .ok()?;
     Some(avg.round().max(1.0) as u32)
 }
 
@@ -177,10 +188,22 @@ mod tests {
 
     #[test]
     fn host_port() {
-        assert_eq!(split_host_port("1.2.3.4:5555", 443), Some(("1.2.3.4".into(), 5555)));
-        assert_eq!(split_host_port("[::1]:8443", 443), Some(("::1".into(), 8443)));
-        assert_eq!(split_host_port("a.b:20000-30000", 443), Some(("a.b".into(), 20000)));
-        assert_eq!(split_host_port("example.com", 51820), Some(("example.com".into(), 51820)));
+        assert_eq!(
+            split_host_port("1.2.3.4:5555", 443),
+            Some(("1.2.3.4".into(), 5555))
+        );
+        assert_eq!(
+            split_host_port("[::1]:8443", 443),
+            Some(("::1".into(), 8443))
+        );
+        assert_eq!(
+            split_host_port("a.b:20000-30000", 443),
+            Some(("a.b".into(), 20000))
+        );
+        assert_eq!(
+            split_host_port("example.com", 51820),
+            Some(("example.com".into(), 51820))
+        );
         assert_eq!(split_host_port("", 443), None);
     }
 }

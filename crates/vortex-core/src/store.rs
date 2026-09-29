@@ -1,6 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose as b, Engine};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -16,89 +15,7 @@ pub const ROOT: &str = "/etc/vortex";
 pub const STORE: &str = "/etc/vortex/profiles";
 pub const SUBS_FILE: &str = "/etc/vortex/subscriptions.json";
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    Vless,
-    Vmess,
-    Trojan,
-    Ss,
-    Hy2,
-    Tuic,
-    Wg,
-    Awg,
-    Ovpn,
-}
-
-impl Kind {
-    pub fn tag(self) -> &'static str {
-        match self {
-            Kind::Vless => "VLESS",
-            Kind::Vmess => "VMESS",
-            Kind::Trojan => "TROJAN",
-            Kind::Ss => "SS",
-            Kind::Hy2 => "HY2",
-            Kind::Tuic => "TUIC",
-            Kind::Wg => "WG",
-            Kind::Awg => "AWG",
-            Kind::Ovpn => "OVPN",
-        }
-    }
-    #[allow(dead_code)]
-    pub fn padded_tag(self) -> &'static str {
-        match self {
-            Kind::Vless => "VLESS ",
-            Kind::Vmess => "VMESS ",
-            Kind::Trojan => "TROJAN",
-            Kind::Ss => "SS    ",
-            Kind::Hy2 => "HY2   ",
-            Kind::Tuic => "TUIC  ",
-            Kind::Wg => "WG    ",
-            Kind::Awg => "AWG   ",
-            Kind::Ovpn => "OVPN  ",
-        }
-    }
-    /// Protocols that run inside the sing-box core (link based).
-    pub fn is_singbox(self) -> bool {
-        !matches!(self, Kind::Wg | Kind::Awg | Kind::Ovpn)
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Auth {
-    pub username: String,
-    pub password: String,
-    #[serde(default = "default_true")]
-    pub save: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct Subscription {
-    pub id: String,
-    pub name: String,
-    pub url: String,
-    pub count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated: Option<u64>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Profile {
-    pub id: String,
-    pub name: String,
-    pub kind: Kind,
-    pub server: String,
-    /// share link (sing-box kinds) or the raw config text (wg / awg / ovpn)
-    pub data: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<Auth>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sub_id: Option<String>,
-}
+pub use crate::model::{Auth, Kind, Profile, Subscription};
 
 // ───────────────────────── storage ─────────────────────────
 
@@ -134,7 +51,12 @@ pub fn load_all() -> Vec<Profile> {
         .filter_map(|e| fs::read_to_string(e.path()).ok())
         .filter_map(|s| serde_json::from_str(&s).ok())
         .collect();
-    v.sort_by(|a, b| a.name.bytes().map(|c| c.to_ascii_lowercase()).cmp(b.name.bytes().map(|c| c.to_ascii_lowercase())));
+    v.sort_by(|a, b| {
+        a.name
+            .bytes()
+            .map(|c| c.to_ascii_lowercase())
+            .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase()))
+    });
     v
 }
 
@@ -153,9 +75,19 @@ pub fn remove(id: &str) -> Result<()> {
 fn slug(s: &str) -> String {
     let o: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
-    let mut o = o.split('-').filter(|x| !x.is_empty()).collect::<Vec<_>>().join("-");
+    let mut o = o
+        .split('-')
+        .filter(|x| !x.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
     if o.is_empty() {
         o = "profile".into();
     }
@@ -184,8 +116,16 @@ pub fn save_subs(subs: &[Subscription]) -> Result<()> {
 
 pub fn sub_name_from_url(url_str: &str) -> (String, String) {
     let parsed = Url::parse(url_str).ok();
-    let fragment = parsed.as_ref().and_then(|u| u.fragment()).map(pdec).filter(|s| !s.trim().is_empty());
-    let host = parsed.as_ref().and_then(|u| u.host_str()).map(String::from).unwrap_or_else(|| "subscription".into());
+    let fragment = parsed
+        .as_ref()
+        .and_then(|u| u.fragment())
+        .map(pdec)
+        .filter(|s| !s.trim().is_empty());
+    let host = parsed
+        .as_ref()
+        .and_then(|u| u.host_str())
+        .map(String::from)
+        .unwrap_or_else(|| "subscription".into());
     let name = fragment.unwrap_or_else(|| host.clone());
     let mut base_id = slug(&name);
     if base_id.is_empty() {
@@ -257,6 +197,7 @@ pub fn add_sub(url: &str, name_hint: Option<&str>) -> Result<(Subscription, usiz
         url: url.to_string(),
         count,
         updated: Some(now_ts),
+        error: None,
     };
 
     if let Some(pos) = existing_pos {
@@ -270,7 +211,8 @@ pub fn add_sub(url: &str, name_hint: Option<&str>) -> Result<(Subscription, usiz
 
 pub fn update_sub(id_or_url: &str) -> Result<(Subscription, usize)> {
     let subs = load_subs();
-    let sub = subs.iter()
+    let sub = subs
+        .iter()
         .find(|s| s.id == id_or_url || s.url == id_or_url)
         .cloned()
         .ok_or_else(|| anyhow!("subscription '{id_or_url}' not found"))?;
@@ -317,7 +259,8 @@ pub fn update_all_subs() -> Result<Vec<(String, Result<usize>)>> {
 
 pub fn remove_sub(id_or_url: &str, purge_nodes: bool) -> Result<usize> {
     let mut subs = load_subs();
-    let pos = subs.iter()
+    let pos = subs
+        .iter()
         .position(|s| s.id == id_or_url || s.url == id_or_url)
         .ok_or_else(|| anyhow!("subscription '{id_or_url}' not found"))?;
     let sub = subs.remove(pos);
@@ -344,8 +287,8 @@ pub fn remove_sub(id_or_url: &str, purge_nodes: bool) -> Result<usize> {
 // ───────────────────────── QR & export ─────────────────────────
 
 pub fn generate_qr(data: &str) -> Result<String> {
-    use qrcode::QrCode;
     use qrcode::render::unicode;
+    use qrcode::QrCode;
     let code = QrCode::new(data.as_bytes()).map_err(|e| anyhow!("QR generation failed: {e}"))?;
     Ok(code.render::<unicode::Dense1x2>().quiet_zone(false).build())
 }
@@ -361,7 +304,11 @@ pub fn export_to_file(p: &Profile) -> Result<PathBuf> {
 
     let content = if p.kind.is_singbox() {
         if let Ok((_, ob, _, _)) = outbound(&p.data) {
-            format!("{}\n\n// sing-box outbound configuration:\n{}\n", p.data, serde_json::to_string_pretty(&ob)?)
+            format!(
+                "{}\n\n// sing-box outbound configuration:\n{}\n",
+                p.data,
+                serde_json::to_string_pretty(&ob)?
+            )
         } else {
             p.data.clone()
         }
@@ -417,8 +364,15 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
 }
 
 fn is_image_path(p: &Path) -> bool {
-    let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
-    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "pbm" | "pgm" | "ppm" | "tiff")
+    let ext = p
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "pbm" | "pgm" | "ppm" | "tiff"
+    )
 }
 
 pub fn scan_qr_file(path: &Path) -> Result<String> {
@@ -441,14 +395,20 @@ pub fn scan_clipboard_qr() -> Result<String> {
     let get_img = || -> Option<Vec<u8>> {
         if let Ok(u) = std::env::var("SUDO_USER") {
             if !u.is_empty() && u != "root" {
-                if let Ok(o) = Command::new("sudo").args(["-u", &u, "wl-paste", "--type", "image/png"]).output() {
+                if let Ok(o) = Command::new("sudo")
+                    .args(["-u", &u, "wl-paste", "--type", "image/png"])
+                    .output()
+                {
                     if o.status.success() && !o.stdout.is_empty() {
                         return Some(o.stdout);
                     }
                 }
             }
         }
-        if let Ok(o) = Command::new("wl-paste").args(["--type", "image/png"]).output() {
+        if let Ok(o) = Command::new("wl-paste")
+            .args(["--type", "image/png"])
+            .output()
+        {
             if o.status.success() && !o.stdout.is_empty() {
                 return Some(o.stdout);
             }
@@ -561,8 +521,7 @@ fn parse_raw_config(text: &str) -> Result<Vec<Profile>> {
             kind: if awg { Kind::Awg } else { Kind::Wg },
             server,
             data: text.to_string(),
-            auth: None,
-            sub_id: None,
+            ..Default::default()
         }]);
     }
     if text.lines().any(|l| l.trim_start().starts_with("remote ")) {
@@ -572,8 +531,7 @@ fn parse_raw_config(text: &str) -> Result<Vec<Profile>> {
             kind: Kind::Ovpn,
             server: ovpn_server(text),
             data: text.to_string(),
-            auth: None,
-            sub_id: None,
+            ..Default::default()
         }]);
     }
     bail!("unrecognized raw config")
@@ -582,7 +540,9 @@ fn parse_raw_config(text: &str) -> Result<Vec<Profile>> {
 // ───────────────────────── helpers ─────────────────────────
 
 fn pdec(s: &str) -> String {
-    percent_encoding::percent_decode_str(s).decode_utf8_lossy().to_string()
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .to_string()
 }
 
 fn b64(s: &str) -> Result<Vec<u8>> {
@@ -597,7 +557,9 @@ fn b64(s: &str) -> Result<Vec<u8>> {
 }
 
 fn q_of(u: &Url) -> HashMap<String, String> {
-    u.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    u.query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn host_port(u: &Url) -> Result<(String, u16)> {
@@ -618,7 +580,8 @@ fn frag(u: &Url, h: &str, p: u16) -> String {
 }
 
 fn truthy(q: &HashMap<String, String>, keys: &[&str]) -> bool {
-    keys.iter().any(|k| q.get(*k).map(|v| v == "1" || v == "true").unwrap_or(false))
+    keys.iter()
+        .any(|k| q.get(*k).map(|v| v == "1" || v == "true").unwrap_or(false))
 }
 
 fn tls_block(q: &HashMap<String, String>, default_on: bool) -> Option<Value> {
@@ -631,7 +594,11 @@ fn tls_block(q: &HashMap<String, String>, default_on: bool) -> Option<Value> {
         return None;
     }
     let mut t = json!({"enabled": true});
-    if let Some(s) = q.get("sni").or_else(|| q.get("peer")).filter(|s| !s.is_empty()) {
+    if let Some(s) = q
+        .get("sni")
+        .or_else(|| q.get("peer"))
+        .filter(|s| !s.is_empty())
+    {
         t["server_name"] = json!(s);
     }
     if let Some(a) = q.get("alpn").filter(|s| !s.is_empty()) {
@@ -662,7 +629,13 @@ fn transport(q: &HashMap<String, String>) -> Result<Option<Value>> {
     let ty = q.get("type").map(String::as_str).unwrap_or("tcp");
     let path = q.get("path").cloned().unwrap_or_default();
     let host = q.get("host").filter(|s| !s.is_empty()).cloned();
-    let norm = |p: &str| if p.is_empty() { "/".to_string() } else { p.to_string() };
+    let norm = |p: &str| {
+        if p.is_empty() {
+            "/".to_string()
+        } else {
+            p.to_string()
+        }
+    };
     Ok(match ty {
         "" | "tcp" | "none" => None,
         "ws" => {
@@ -747,7 +720,11 @@ fn vmess(l: &str) -> Result<Parsed> {
             };
             let h = s("add");
             let port: u16 = s("port").parse().context("vmess: bad port")?;
-            let scy = if s("scy").is_empty() { "auto".to_string() } else { s("scy") };
+            let scy = if s("scy").is_empty() {
+                "auto".to_string()
+            } else {
+                s("scy")
+            };
             let mut o = json!({
                 "type":"vmess","tag":"proxy","server":h,"server_port":port,
                 "uuid":s("id"),"security":scy,"alter_id":s("aid").parse::<u32>().unwrap_or(0),
@@ -760,7 +737,14 @@ fn vmess(l: &str) -> Result<Parsed> {
             if net == "grpc" {
                 q.insert("serviceName".into(), s("path"));
             }
-            q.insert("security".into(), if s("tls") == "tls" { "tls".into() } else { "none".into() });
+            q.insert(
+                "security".into(),
+                if s("tls") == "tls" {
+                    "tls".into()
+                } else {
+                    "none".into()
+                },
+            );
             q.insert("sni".into(), s("sni"));
             q.insert("alpn".into(), s("alpn"));
             q.insert("fp".into(), s("fp"));
@@ -770,7 +754,11 @@ fn vmess(l: &str) -> Result<Parsed> {
             if let Some(t) = transport(&q)? {
                 o["transport"] = t;
             }
-            let name = if s("ps").is_empty() { format!("{h}:{port}") } else { s("ps") };
+            let name = if s("ps").is_empty() {
+                format!("{h}:{port}")
+            } else {
+                s("ps")
+            };
             return Ok((o, name, format!("{h}:{port}")));
         }
     }
@@ -796,15 +784,23 @@ fn shadowsocks(l: &str) -> Result<Parsed> {
     let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
     let rest = rest.trim_end_matches('/');
     let (userinfo, hostport) = if let Some((ui, hp)) = rest.rsplit_once('@') {
-        let ui = if ui.contains(':') { pdec(ui) } else { String::from_utf8(b64(&pdec(ui))?)? };
+        let ui = if ui.contains(':') {
+            pdec(ui)
+        } else {
+            String::from_utf8(b64(&pdec(ui))?)?
+        };
         (ui, hp.to_string())
     } else {
         let d = String::from_utf8(b64(rest)?)?;
         let (ui, hp) = d.rsplit_once('@').ok_or_else(|| anyhow!("bad ss link"))?;
         (ui.to_string(), hp.to_string())
     };
-    let (method, pass) = userinfo.split_once(':').ok_or_else(|| anyhow!("bad ss credentials"))?;
-    let (h, p) = hostport.rsplit_once(':').ok_or_else(|| anyhow!("bad ss host"))?;
+    let (method, pass) = userinfo
+        .split_once(':')
+        .ok_or_else(|| anyhow!("bad ss credentials"))?;
+    let (h, p) = hostport
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("bad ss host"))?;
     let h = h.trim_matches(|c| c == '[' || c == ']');
     let port: u16 = p.trim_end_matches('/').parse().context("bad ss port")?;
     let mut o = json!({"type":"shadowsocks","tag":"proxy","server":h,"server_port":port,"method":method,"password":pass});
@@ -845,10 +841,14 @@ fn hy2(l: &str) -> Result<Parsed> {
     }
     let mut o = json!({"type":"hysteria2","tag":"proxy","server":h,"server_port":port,"password":pass,"tls":tls});
     if let Some(t) = q.get("obfs").filter(|s| !s.is_empty() && *s != "none") {
-        o["obfs"] = json!({"type": t, "password": q.get("obfs-password").cloned().unwrap_or_default()});
+        o["obfs"] =
+            json!({"type": t, "password": q.get("obfs-password").cloned().unwrap_or_default()});
     }
     if let Some(m) = q.get("mport").filter(|s| !s.is_empty()) {
-        o["server_ports"] = json!(m.split(',').map(|x| x.replace('-', ":")).collect::<Vec<_>>());
+        o["server_ports"] = json!(m
+            .split(',')
+            .map(|x| x.replace('-', ":"))
+            .collect::<Vec<_>>());
         if let Some(m) = o.as_object_mut() {
             m.remove("server_port");
         }
@@ -860,8 +860,14 @@ fn tuic(l: &str) -> Result<Parsed> {
     let u = Url::parse(l).context("invalid link")?;
     let (h, p) = host_port(&u)?;
     let q = q_of(&u);
-    let cc = q.get("congestion_control").cloned().unwrap_or_else(|| "bbr".into());
-    let um = q.get("udp_relay_mode").cloned().unwrap_or_else(|| "native".into());
+    let cc = q
+        .get("congestion_control")
+        .cloned()
+        .unwrap_or_else(|| "bbr".into());
+    let um = q
+        .get("udp_relay_mode")
+        .cloned()
+        .unwrap_or_else(|| "native".into());
     let mut o = json!({
         "type":"tuic","tag":"proxy","server":h,"server_port":p,
         "uuid":pdec(u.username()),"password":pdec(u.password().unwrap_or("")),
@@ -894,9 +900,15 @@ fn parse_link(l: &str) -> Result<Vec<Profile>> {
         return amnezia(l);
     }
     let (k, _, name, server) = outbound(l)?;
-    Ok(vec![Profile { id: String::new(), name, kind: k, server, data: l.to_string(), auth: None, sub_id: None }])
+    Ok(vec![Profile {
+        id: String::new(),
+        name,
+        kind: k,
+        server,
+        data: l.to_string(),
+        ..Default::default()
+    }])
 }
-
 
 // ───────────────────────── profile helpers ─────────────────────────
 
@@ -905,13 +917,19 @@ pub fn rename(id: &str, name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("name cannot be empty");
     }
-    let mut p = load_all().into_iter().find(|p| p.id == id).ok_or_else(|| anyhow!("profile not found"))?;
+    let mut p = load_all()
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| anyhow!("profile not found"))?;
     p.name = name.to_string();
     save(&p)
 }
 
 pub fn set_auth(id: &str, username: String, password: String) -> Result<()> {
-    let mut p = load_all().into_iter().find(|p| p.id == id).ok_or_else(|| anyhow!("profile not found"))?;
+    let mut p = load_all()
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| anyhow!("profile not found"))?;
     p.auth = Some(Auth {
         username,
         password,
@@ -921,7 +939,10 @@ pub fn set_auth(id: &str, username: String, password: String) -> Result<()> {
 }
 
 pub fn clear_auth(id: &str) -> Result<()> {
-    let mut p = load_all().into_iter().find(|p| p.id == id).ok_or_else(|| anyhow!("profile not found"))?;
+    let mut p = load_all()
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| anyhow!("profile not found"))?;
     p.auth = None;
     save(&p)
 }
@@ -931,7 +952,10 @@ pub fn set_last(id: &str) {
 }
 
 pub fn last() -> Option<String> {
-    fs::read_to_string(format!("{ROOT}/last")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    fs::read_to_string(format!("{ROOT}/last"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Human-readable facts about a profile (transport, security, endpoint…) for the details pane.
@@ -940,7 +964,10 @@ pub fn details(p: &Profile) -> Vec<(&'static str, String)> {
     if p.kind.is_singbox() {
         if let Ok((_, ob, _, _)) = outbound(&p.data) {
             let s = |x: &Value| x.as_str().map(String::from);
-            v.push(("transport", s(&ob["transport"]["type"]).unwrap_or_else(|| "tcp".into())));
+            v.push((
+                "transport",
+                s(&ob["transport"]["type"]).unwrap_or_else(|| "tcp".into()),
+            ));
             let sec = if ob["tls"]["reality"]["enabled"].as_bool() == Some(true) {
                 "reality"
             } else if ob["tls"]["enabled"].as_bool() == Some(true) {
@@ -1022,19 +1049,29 @@ fn import_sub(url: &str) -> Result<Vec<Profile>> {
     Ok(v)
 }
 
-const AWG_KEYS: [&str; 12] = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1"];
+const AWG_KEYS: [&str; 12] = [
+    "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1",
+];
 
 fn kv_find(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|l| {
         let (k, v) = l.split_once('=')?;
-        k.trim().eq_ignore_ascii_case(key).then(|| v.trim().to_string())
+        k.trim()
+            .eq_ignore_ascii_case(key)
+            .then(|| v.trim().to_string())
     })
 }
 
 fn ovpn_server(text: &str) -> String {
     text.lines()
         .find(|l| l.trim_start().starts_with("remote "))
-        .map(|l| l.split_whitespace().skip(1).take(2).collect::<Vec<_>>().join(":"))
+        .map(|l| {
+            l.split_whitespace()
+                .skip(1)
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(":")
+        })
         .unwrap_or_default()
 }
 
@@ -1069,7 +1106,11 @@ fn inline_ovpn(text: &str, dir: &Path) -> String {
 fn import_file(s: &str) -> Result<Profile> {
     let p = expand(s);
     let text = fs::read_to_string(&p).with_context(|| format!("cannot read {}", p.display()))?;
-    let name = p.file_stem().and_then(|x| x.to_str()).unwrap_or("profile").to_string();
+    let name = p
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or("profile")
+        .to_string();
     if text.contains("[Interface]") {
         let awg = AWG_KEYS.iter().any(|k| kv_find(&text, k).is_some());
         return Ok(Profile {
@@ -1078,14 +1119,20 @@ fn import_file(s: &str) -> Result<Profile> {
             kind: if awg { Kind::Awg } else { Kind::Wg },
             server: kv_find(&text, "Endpoint").unwrap_or_default(),
             data: text,
-            auth: None,
-            sub_id: None,
+            ..Default::default()
         });
     }
     if text.lines().any(|l| l.trim_start().starts_with("remote ")) {
         let dir = p.parent().unwrap_or(Path::new("."));
         let data = inline_ovpn(&text, dir);
-        return Ok(Profile { id: String::new(), name, kind: Kind::Ovpn, server: ovpn_server(&data), data, auth: None, sub_id: None });
+        return Ok(Profile {
+            id: String::new(),
+            name,
+            kind: Kind::Ovpn,
+            server: ovpn_server(&data),
+            data,
+            ..Default::default()
+        });
     }
     bail!("unrecognized file (expected WireGuard, AmneziaWG or OpenVPN config)")
 }
@@ -1097,9 +1144,15 @@ fn amnezia(l: &str) -> Result<Vec<Profile>> {
         bail!("bad Amnezia link");
     }
     let mut js = String::new();
-    flate2::read::ZlibDecoder::new(&raw[4..]).read_to_string(&mut js).context("bad Amnezia payload")?;
+    flate2::read::ZlibDecoder::new(&raw[4..])
+        .read_to_string(&mut js)
+        .context("bad Amnezia payload")?;
     let v: Value = serde_json::from_str(&js)?;
-    let desc = v["description"].as_str().filter(|s| !s.is_empty()).unwrap_or("amnezia").to_string();
+    let desc = v["description"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("amnezia")
+        .to_string();
     let mut out = vec![];
     for c in v["containers"].as_array().into_iter().flatten() {
         let cname = c["container"].as_str().unwrap_or("");
@@ -1116,17 +1169,22 @@ fn amnezia(l: &str) -> Result<Vec<Profile>> {
         let cfg = serde_json::from_str::<Value>(lc)
             .ok()
             .and_then(|j| j["config"].as_str().map(String::from))
-            .or_else(|| Some(lc.to_string()).filter(|s| s.contains("[Interface]") || s.contains("remote ")));
+            .or_else(|| {
+                Some(lc.to_string()).filter(|s| s.contains("[Interface]") || s.contains("remote "))
+            });
         if let Some(cfg) = cfg {
-            let server = if kind == Kind::Ovpn { ovpn_server(&cfg) } else { kv_find(&cfg, "Endpoint").unwrap_or_default() };
+            let server = if kind == Kind::Ovpn {
+                ovpn_server(&cfg)
+            } else {
+                kv_find(&cfg, "Endpoint").unwrap_or_default()
+            };
             out.push(Profile {
                 id: String::new(),
                 name: format!("{desc} · {}", kind.tag()),
                 kind,
                 server,
                 data: cfg,
-                auth: None,
-                sub_id: None,
+                ..Default::default()
             });
         }
     }
@@ -1198,7 +1256,8 @@ mod tests {
     fn trojan_and_tuic() {
         let (_, o, _, _) = outbound("trojan://pw@h.io:443?sni=h.io#T").unwrap();
         assert_eq!(o["tls"]["enabled"], true);
-        let (k, o, _, _) = outbound("tuic://uid:pw@h.io:443?congestion_control=bbr&alpn=h3#U").unwrap();
+        let (k, o, _, _) =
+            outbound("tuic://uid:pw@h.io:443?congestion_control=bbr&alpn=h3#U").unwrap();
         assert_eq!(k, Kind::Tuic);
         assert_eq!(o["tls"]["alpn"][0], "h3");
     }
@@ -1225,18 +1284,34 @@ mod tests {
         fs::write(&a, "[Interface]\nPrivateKey = x\n[Peer]\nEndpoint = h:1\n").unwrap();
         assert_eq!(import_file(a.to_str().unwrap()).unwrap().kind, Kind::Wg);
         let b2 = dir.join("vx_awg.conf");
-        fs::write(&b2, "[Interface]\nPrivateKey = x\nJc = 5\nS1 = 3\n[Peer]\nEndpoint = h:1\n").unwrap();
+        fs::write(
+            &b2,
+            "[Interface]\nPrivateKey = x\nJc = 5\nS1 = 3\n[Peer]\nEndpoint = h:1\n",
+        )
+        .unwrap();
         assert_eq!(import_file(b2.to_str().unwrap()).unwrap().kind, Kind::Awg);
     }
 
     #[test]
     fn test_padded_tags() {
         let kinds = [
-            Kind::Vless, Kind::Vmess, Kind::Trojan, Kind::Ss,
-            Kind::Hy2, Kind::Tuic, Kind::Wg, Kind::Awg, Kind::Ovpn,
+            Kind::Vless,
+            Kind::Vmess,
+            Kind::Trojan,
+            Kind::Ss,
+            Kind::Hy2,
+            Kind::Tuic,
+            Kind::Wg,
+            Kind::Awg,
+            Kind::Ovpn,
         ];
         for k in kinds {
-            assert_eq!(k.padded_tag().len(), 6, "padded_tag for {:?} must be exactly 6 bytes", k);
+            assert_eq!(
+                k.padded_tag().len(),
+                6,
+                "padded_tag for {:?} must be exactly 6 bytes",
+                k
+            );
         }
     }
 
@@ -1284,6 +1359,7 @@ mod tests {
             url: "https://example.com/sub".into(),
             count: 42,
             updated: Some(1720000000),
+            error: None,
         };
         let js = serde_json::to_string(&sub).unwrap();
         let sub2: Subscription = serde_json::from_str(&js).unwrap();
@@ -1317,8 +1393,7 @@ mod tests {
             kind: Kind::Wg,
             server: "1.2.3.4:51820".into(),
             data: "[Interface]\nPrivateKey = x\n[Peer]\nEndpoint = 1.2.3.4:51820\n".into(),
-            auth: None,
-            sub_id: None,
+            ..Default::default()
         };
         let export_path = dir.join(format!("vortex-{}.conf", p.id));
         fs::write(&export_path, &p.data).unwrap();

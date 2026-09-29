@@ -231,48 +231,192 @@ pub struct KeyHelp {
 
 pub const HELP_ENTRIES: &[KeyHelp] = &[
     // Navigation
-    KeyHelp { category: "NAVIGATION", key: "j / ↓", description: "Next node in matrix", action: Action::NextNode },
-    KeyHelp { category: "NAVIGATION", key: "k / ↑", description: "Previous node in matrix", action: Action::PrevNode },
-    KeyHelp { category: "NAVIGATION", key: "g / Home", description: "Jump to first node", action: Action::FirstNode },
-    KeyHelp { category: "NAVIGATION", key: "G / End", description: "Jump to last node", action: Action::LastNode },
-    KeyHelp { category: "NAVIGATION", key: "Tab", description: "Cycle focus between panels", action: Action::FocusNextPanel },
-    KeyHelp { category: "NAVIGATION", key: "1 / 2 / 3", description: "Direct focus panel [1] / [2] / [3]", action: Action::FocusPanel(1) },
-    KeyHelp { category: "NAVIGATION", key: "/", description: "Search nodes (live filtering)", action: Action::EnterSearch },
-
+    KeyHelp {
+        category: "NAVIGATION",
+        key: "j / ↓",
+        description: "Next node in matrix",
+        action: Action::NextNode,
+    },
+    KeyHelp {
+        category: "NAVIGATION",
+        key: "k / ↑",
+        description: "Previous node in matrix",
+        action: Action::PrevNode,
+    },
+    KeyHelp {
+        category: "NAVIGATION",
+        key: "g / Home",
+        description: "Jump to first node",
+        action: Action::FirstNode,
+    },
+    KeyHelp {
+        category: "NAVIGATION",
+        key: "G / End",
+        description: "Jump to last node",
+        action: Action::LastNode,
+    },
+    KeyHelp {
+        category: "NAVIGATION",
+        key: "Tab",
+        description: "Cycle focus between panels",
+        action: Action::FocusNextPanel,
+    },
+    KeyHelp {
+        category: "NAVIGATION",
+        key: "1 / 2 / 3",
+        description: "Direct focus panel [1] / [2] / [3]",
+        action: Action::FocusPanel(1),
+    },
+    KeyHelp {
+        category: "NAVIGATION",
+        key: "/",
+        description: "Search nodes (live filtering)",
+        action: Action::EnterSearch,
+    },
     // Connection
-    KeyHelp { category: "CONNECTION", key: "Enter", description: "Connect to selected / switch node", action: Action::ConnectSelected },
-    KeyHelp { category: "CONNECTION", key: "Space", description: "Toggle connect / disconnect", action: Action::ToggleConnection },
-    KeyHelp { category: "CONNECTION", key: "r", description: "Reconnect tunnel", action: Action::Reconnect },
-    KeyHelp { category: "CONNECTION", key: "K (Shift+k)", description: "Toggle stealth shield / kill-switch", action: Action::ToggleShield },
-
+    KeyHelp {
+        category: "CONNECTION",
+        key: "Enter",
+        description: "Connect to selected / switch node",
+        action: Action::ConnectSelected,
+    },
+    KeyHelp {
+        category: "CONNECTION",
+        key: "Space",
+        description: "Toggle connect / disconnect",
+        action: Action::ToggleConnection,
+    },
+    KeyHelp {
+        category: "CONNECTION",
+        key: "r",
+        description: "Reconnect tunnel",
+        action: Action::Reconnect,
+    },
+    KeyHelp {
+        category: "CONNECTION",
+        key: "K (Shift+k)",
+        description: "Toggle stealth shield / kill-switch",
+        action: Action::ToggleShield,
+    },
     // Nodes
-    KeyHelp { category: "NODES", key: "a", description: "Add config (link / sub / file)", action: Action::AddNode },
-    KeyHelp { category: "NODES", key: "e", description: "Edit / rename selected node", action: Action::EditNode },
-    KeyHelp { category: "NODES", key: "d", description: "Delete node (y/n confirm prompt)", action: Action::DeleteNode },
-    KeyHelp { category: "NODES", key: "y", description: "Copy config link to clipboard", action: Action::CopyConfig },
-    KeyHelp { category: "NODES", key: "s", description: "Show QR code / share payload", action: Action::ShowQr },
-    KeyHelp { category: "NODES", key: "o", description: "Cycle sort mode (RTT / name / proto)", action: Action::CycleSort },
-    KeyHelp { category: "NODES", key: "c", description: "Configure OpenVPN credentials vault", action: Action::ManageAuth },
-    KeyHelp { category: "NODES", key: "v", description: "Paste config / QR from clipboard", action: Action::PasteClipboard },
-
+    KeyHelp {
+        category: "NODES",
+        key: "a",
+        description: "Add config (link / sub / file)",
+        action: Action::AddNode,
+    },
+    KeyHelp {
+        category: "NODES",
+        key: "e",
+        description: "Edit / rename selected node",
+        action: Action::EditNode,
+    },
+    KeyHelp {
+        category: "NODES",
+        key: "d",
+        description: "Delete node (y/n confirm prompt)",
+        action: Action::DeleteNode,
+    },
+    KeyHelp {
+        category: "NODES",
+        key: "y",
+        description: "Copy config link to clipboard",
+        action: Action::CopyConfig,
+    },
+    KeyHelp {
+        category: "NODES",
+        key: "s",
+        description: "Show QR code / share payload",
+        action: Action::ShowQr,
+    },
+    KeyHelp {
+        category: "NODES",
+        key: "o",
+        description: "Cycle sort mode (RTT / name / proto)",
+        action: Action::CycleSort,
+    },
+    KeyHelp {
+        category: "NODES",
+        key: "c",
+        description: "Configure OpenVPN credentials vault",
+        action: Action::ManageAuth,
+    },
+    KeyHelp {
+        category: "NODES",
+        key: "v",
+        description: "Paste config / QR from clipboard",
+        action: Action::PasteClipboard,
+    },
     // Testing
-    KeyHelp { category: "TESTING", key: "t", description: "Test latency of selected node", action: Action::TestSelected },
-    KeyHelp { category: "TESTING", key: "T (Shift+t)", description: "Test latency of all nodes", action: Action::TestAll },
-    KeyHelp { category: "TESTING", key: "w", description: "Measure speed & bandwidth throughput", action: Action::SpeedTest },
-
+    KeyHelp {
+        category: "TESTING",
+        key: "t",
+        description: "Test latency of selected node",
+        action: Action::TestSelected,
+    },
+    KeyHelp {
+        category: "TESTING",
+        key: "T (Shift+t)",
+        description: "Test latency of all nodes",
+        action: Action::TestAll,
+    },
+    KeyHelp {
+        category: "TESTING",
+        key: "w",
+        description: "Measure speed & bandwidth throughput",
+        action: Action::SpeedTest,
+    },
     // Subscriptions
-    KeyHelp { category: "SUBSCRIPTIONS", key: "u", description: "Update all subscriptions", action: Action::UpdateSubs },
-    KeyHelp { category: "SUBSCRIPTIONS", key: "S (Shift+s)", description: "Manage subscription endpoints", action: Action::ManageSubs },
-
+    KeyHelp {
+        category: "SUBSCRIPTIONS",
+        key: "u",
+        description: "Update all subscriptions",
+        action: Action::UpdateSubs,
+    },
+    KeyHelp {
+        category: "SUBSCRIPTIONS",
+        key: "S (Shift+s)",
+        description: "Manage subscription endpoints",
+        action: Action::ManageSubs,
+    },
     // Views
-    KeyHelp { category: "VIEWS", key: "f", description: "Toggle active socket flows sniffer", action: Action::ToggleFlows },
-    KeyHelp { category: "VIEWS", key: "l", description: "Toggle kernel audit & core logs", action: Action::ToggleLog },
-    KeyHelp { category: "VIEWS", key: "i", description: "IP info / deep recon & leak check", action: Action::ShowIpInfo },
-
+    KeyHelp {
+        category: "VIEWS",
+        key: "f",
+        description: "Toggle active socket flows sniffer",
+        action: Action::ToggleFlows,
+    },
+    KeyHelp {
+        category: "VIEWS",
+        key: "l",
+        description: "Toggle kernel audit & core logs",
+        action: Action::ToggleLog,
+    },
+    KeyHelp {
+        category: "VIEWS",
+        key: "i",
+        description: "IP info / deep recon & leak check",
+        action: Action::ShowIpInfo,
+    },
     // General
-    KeyHelp { category: "GENERAL", key: "?", description: "Open command directory & help", action: Action::Help },
-    KeyHelp { category: "GENERAL", key: "q", description: "Quit (safe confirm if connected)", action: Action::Quit },
-    KeyHelp { category: "GENERAL", key: "Esc", description: "Close popup / dismiss / clear filter", action: Action::Cancel },
+    KeyHelp {
+        category: "GENERAL",
+        key: "?",
+        description: "Open command directory & help",
+        action: Action::Help,
+    },
+    KeyHelp {
+        category: "GENERAL",
+        key: "q",
+        description: "Quit (safe confirm if connected)",
+        action: Action::Quit,
+    },
+    KeyHelp {
+        category: "GENERAL",
+        key: "Esc",
+        description: "Close popup / dismiss / clear filter",
+        action: Action::Cancel,
+    },
 ];
 
 pub fn parse_key_spec(s: &str) -> Option<(KeyCode, KeyModifiers)> {
@@ -342,7 +486,9 @@ fn user_config_path() -> Option<PathBuf> {
 
 fn load_overrides() -> HashMap<(KeyCode, KeyModifiers), Action> {
     let mut map = HashMap::new();
-    let Some(path) = user_config_path() else { return map };
+    let Some(path) = user_config_path() else {
+        return map;
+    };
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return map,
@@ -467,24 +613,20 @@ pub fn map_key(mode: &Mode, key: KeyEvent) -> Option<Action> {
                 _ => None,
             }
         }
-        Mode::Confirm(kind) => {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::ConfirmYes),
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::ConfirmNo),
-                KeyCode::Char('b') | KeyCode::Char('B') if *kind == ConfirmKind::QuitWhileConnected => {
-                    Some(Action::ConfirmBackground)
-                }
-                _ => None,
+        Mode::Confirm(kind) => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::ConfirmYes),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Action::ConfirmNo),
+            KeyCode::Char('b') | KeyCode::Char('B') if *kind == ConfirmKind::QuitWhileConnected => {
+                Some(Action::ConfirmBackground)
             }
-        }
-        Mode::Help => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter => {
-                    Some(Action::Cancel)
-                }
-                _ => None,
+            _ => None,
+        },
+        Mode::Help => match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter => {
+                Some(Action::Cancel)
             }
-        }
+            _ => None,
+        },
         Mode::Add(_) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
@@ -509,44 +651,38 @@ pub fn map_key(mode: &Mode, key: KeyEvent) -> Option<Action> {
                 _ => None,
             }
         }
-        Mode::Qr => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('c') | KeyCode::Char('C') => {
-                    Some(Action::CopyConfig)
-                }
-                KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('e') | KeyCode::Char('E') => {
-                    Some(Action::ExportConfig)
-                }
-                _ => None,
+        Mode::Qr => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('c') | KeyCode::Char('C') => {
+                Some(Action::CopyConfig)
             }
-        }
-        Mode::Subs => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
-                KeyCode::Char('j') | KeyCode::Down => Some(Action::NextSub),
-                KeyCode::Char('k') | KeyCode::Up => Some(Action::PrevSub),
-                KeyCode::Enter | KeyCode::Char('u') => Some(Action::SyncSelectedSub),
-                KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::UpdateSubs),
-                KeyCode::Char('a') => Some(Action::AddNode),
-                KeyCode::Char('d') => Some(Action::DeleteSub),
-                _ => None,
+            KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('e') | KeyCode::Char('E') => {
+                Some(Action::ExportConfig)
             }
-        }
-        Mode::Recon => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => Some(Action::Cancel),
-                KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::RetryProbe),
-                _ => None,
+            _ => None,
+        },
+        Mode::Subs => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::NextSub),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::PrevSub),
+            KeyCode::Enter | KeyCode::Char('u') => Some(Action::SyncSelectedSub),
+            KeyCode::Char('s') | KeyCode::Char('S') => Some(Action::UpdateSubs),
+            KeyCode::Char('a') => Some(Action::AddNode),
+            KeyCode::Char('d') => Some(Action::DeleteSub),
+            _ => None,
+        },
+        Mode::Recon => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => Some(Action::Cancel),
+            KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::RetryProbe),
+            _ => None,
+        },
+        Mode::Speed => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
+                Some(Action::RetrySpeedTest)
             }
-        }
-        Mode::Speed => {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
-                KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => Some(Action::RetrySpeedTest),
-                _ => None,
-            }
-        }
+            _ => None,
+        },
     }
 }
 
@@ -604,66 +740,165 @@ mod tests {
     #[test]
     fn test_normal_mode_navigation() {
         let m = Mode::Normal;
-        assert_eq!(map_key(&m, press(KeyCode::Char('j'))), Some(Action::NextNode));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('j'))),
+            Some(Action::NextNode)
+        );
         assert_eq!(map_key(&m, press(KeyCode::Down)), Some(Action::NextNode));
-        assert_eq!(map_key(&m, press(KeyCode::Char('k'))), Some(Action::PrevNode));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('k'))),
+            Some(Action::PrevNode)
+        );
         assert_eq!(map_key(&m, press(KeyCode::Up)), Some(Action::PrevNode));
-        assert_eq!(map_key(&m, press(KeyCode::Char('g'))), Some(Action::FirstNode));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('g'))),
+            Some(Action::FirstNode)
+        );
         assert_eq!(map_key(&m, press(KeyCode::Home)), Some(Action::FirstNode));
-        assert_eq!(map_key(&m, press(KeyCode::Char('G'))), Some(Action::LastNode));
-        assert_eq!(map_key(&m, press_shift(KeyCode::Char('g'))), Some(Action::LastNode));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('G'))),
+            Some(Action::LastNode)
+        );
+        assert_eq!(
+            map_key(&m, press_shift(KeyCode::Char('g'))),
+            Some(Action::LastNode)
+        );
         assert_eq!(map_key(&m, press(KeyCode::End)), Some(Action::LastNode));
-        assert_eq!(map_key(&m, press(KeyCode::Tab)), Some(Action::FocusNextPanel));
-        assert_eq!(map_key(&m, press(KeyCode::Char('1'))), Some(Action::FocusPanel(1)));
-        assert_eq!(map_key(&m, press(KeyCode::Char('2'))), Some(Action::FocusPanel(2)));
-        assert_eq!(map_key(&m, press(KeyCode::Char('3'))), Some(Action::FocusPanel(3)));
-        assert_eq!(map_key(&m, press(KeyCode::Char('/'))), Some(Action::EnterSearch));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Tab)),
+            Some(Action::FocusNextPanel)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('1'))),
+            Some(Action::FocusPanel(1))
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('2'))),
+            Some(Action::FocusPanel(2))
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('3'))),
+            Some(Action::FocusPanel(3))
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('/'))),
+            Some(Action::EnterSearch)
+        );
     }
 
     #[test]
     fn test_normal_mode_connection() {
         let m = Mode::Normal;
-        assert_eq!(map_key(&m, press(KeyCode::Enter)), Some(Action::ConnectSelected));
-        assert_eq!(map_key(&m, press(KeyCode::Char(' '))), Some(Action::ToggleConnection));
-        assert_eq!(map_key(&m, press(KeyCode::Char('r'))), Some(Action::Reconnect));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Enter)),
+            Some(Action::ConnectSelected)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char(' '))),
+            Some(Action::ToggleConnection)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('r'))),
+            Some(Action::Reconnect)
+        );
 
         // Uppercase K for Shield, lowercase k is previous node!
-        assert_eq!(map_key(&m, press(KeyCode::Char('K'))), Some(Action::ToggleShield));
-        assert_eq!(map_key(&m, press_shift(KeyCode::Char('k'))), Some(Action::ToggleShield));
-        assert_eq!(map_key(&m, press(KeyCode::Char('k'))), Some(Action::PrevNode));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('K'))),
+            Some(Action::ToggleShield)
+        );
+        assert_eq!(
+            map_key(&m, press_shift(KeyCode::Char('k'))),
+            Some(Action::ToggleShield)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('k'))),
+            Some(Action::PrevNode)
+        );
     }
 
     #[test]
     fn test_normal_mode_nodes() {
         let m = Mode::Normal;
-        assert_eq!(map_key(&m, press(KeyCode::Char('a'))), Some(Action::AddNode));
-        assert_eq!(map_key(&m, press(KeyCode::Char('e'))), Some(Action::EditNode));
-        assert_eq!(map_key(&m, press(KeyCode::Char('d'))), Some(Action::DeleteNode));
-        assert_eq!(map_key(&m, press(KeyCode::Char('y'))), Some(Action::CopyConfig));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('a'))),
+            Some(Action::AddNode)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('e'))),
+            Some(Action::EditNode)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('d'))),
+            Some(Action::DeleteNode)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('y'))),
+            Some(Action::CopyConfig)
+        );
         assert_eq!(map_key(&m, press(KeyCode::Char('s'))), Some(Action::ShowQr));
-        assert_eq!(map_key(&m, press(KeyCode::Char('o'))), Some(Action::CycleSort));
-        assert_eq!(map_key(&m, press(KeyCode::Char('c'))), Some(Action::ManageAuth));
-        assert_eq!(map_key(&m, press(KeyCode::Char('v'))), Some(Action::PasteClipboard));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('o'))),
+            Some(Action::CycleSort)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('c'))),
+            Some(Action::ManageAuth)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('v'))),
+            Some(Action::PasteClipboard)
+        );
     }
 
     #[test]
     fn test_normal_mode_testing() {
         let m = Mode::Normal;
-        assert_eq!(map_key(&m, press(KeyCode::Char('t'))), Some(Action::TestSelected));
-        assert_eq!(map_key(&m, press(KeyCode::Char('T'))), Some(Action::TestAll));
-        assert_eq!(map_key(&m, press_shift(KeyCode::Char('t'))), Some(Action::TestAll));
-        assert_eq!(map_key(&m, press(KeyCode::Char('w'))), Some(Action::SpeedTest));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('t'))),
+            Some(Action::TestSelected)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('T'))),
+            Some(Action::TestAll)
+        );
+        assert_eq!(
+            map_key(&m, press_shift(KeyCode::Char('t'))),
+            Some(Action::TestAll)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('w'))),
+            Some(Action::SpeedTest)
+        );
     }
 
     #[test]
     fn test_normal_mode_subs_and_views() {
         let m = Mode::Normal;
-        assert_eq!(map_key(&m, press(KeyCode::Char('u'))), Some(Action::UpdateSubs));
-        assert_eq!(map_key(&m, press(KeyCode::Char('S'))), Some(Action::ManageSubs));
-        assert_eq!(map_key(&m, press_shift(KeyCode::Char('s'))), Some(Action::ManageSubs));
-        assert_eq!(map_key(&m, press(KeyCode::Char('f'))), Some(Action::ToggleFlows));
-        assert_eq!(map_key(&m, press(KeyCode::Char('l'))), Some(Action::ToggleLog));
-        assert_eq!(map_key(&m, press(KeyCode::Char('i'))), Some(Action::ShowIpInfo));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('u'))),
+            Some(Action::UpdateSubs)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('S'))),
+            Some(Action::ManageSubs)
+        );
+        assert_eq!(
+            map_key(&m, press_shift(KeyCode::Char('s'))),
+            Some(Action::ManageSubs)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('f'))),
+            Some(Action::ToggleFlows)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('l'))),
+            Some(Action::ToggleLog)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('i'))),
+            Some(Action::ShowIpInfo)
+        );
     }
 
     #[test]
@@ -677,20 +912,41 @@ mod tests {
     #[test]
     fn test_search_mode() {
         let m = Mode::Search("vless".into());
-        assert_eq!(map_key(&m, press(KeyCode::Char('x'))), Some(Action::InputChar('x')));
-        assert_eq!(map_key(&m, press(KeyCode::Backspace)), Some(Action::Backspace));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('x'))),
+            Some(Action::InputChar('x'))
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Backspace)),
+            Some(Action::Backspace)
+        );
         assert_eq!(map_key(&m, press(KeyCode::Enter)), Some(Action::Submit));
         assert_eq!(map_key(&m, press(KeyCode::Esc)), Some(Action::Cancel));
-        assert_eq!(map_key(&m, press_ctrl(KeyCode::Char('u'))), Some(Action::ClearInput));
+        assert_eq!(
+            map_key(&m, press_ctrl(KeyCode::Char('u'))),
+            Some(Action::ClearInput)
+        );
     }
 
     #[test]
     fn test_confirm_mode_delete() {
         let m = Mode::Confirm(ConfirmKind::DeleteNode);
-        assert_eq!(map_key(&m, press(KeyCode::Char('y'))), Some(Action::ConfirmYes));
-        assert_eq!(map_key(&m, press(KeyCode::Char('Y'))), Some(Action::ConfirmYes));
-        assert_eq!(map_key(&m, press(KeyCode::Char('n'))), Some(Action::ConfirmNo));
-        assert_eq!(map_key(&m, press(KeyCode::Char('N'))), Some(Action::ConfirmNo));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('y'))),
+            Some(Action::ConfirmYes)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('Y'))),
+            Some(Action::ConfirmYes)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('n'))),
+            Some(Action::ConfirmNo)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('N'))),
+            Some(Action::ConfirmNo)
+        );
         assert_eq!(map_key(&m, press(KeyCode::Esc)), Some(Action::ConfirmNo));
         // 'b' is not allowed for DeleteNode
         assert_eq!(map_key(&m, press(KeyCode::Char('b'))), None);
@@ -699,10 +955,22 @@ mod tests {
     #[test]
     fn test_confirm_mode_quit_connected() {
         let m = Mode::Confirm(ConfirmKind::QuitWhileConnected);
-        assert_eq!(map_key(&m, press(KeyCode::Char('y'))), Some(Action::ConfirmYes));
-        assert_eq!(map_key(&m, press(KeyCode::Char('n'))), Some(Action::ConfirmNo));
-        assert_eq!(map_key(&m, press(KeyCode::Char('b'))), Some(Action::ConfirmBackground));
-        assert_eq!(map_key(&m, press(KeyCode::Char('B'))), Some(Action::ConfirmBackground));
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('y'))),
+            Some(Action::ConfirmYes)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('n'))),
+            Some(Action::ConfirmNo)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('b'))),
+            Some(Action::ConfirmBackground)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('B'))),
+            Some(Action::ConfirmBackground)
+        );
         assert_eq!(map_key(&m, press(KeyCode::Esc)), Some(Action::ConfirmNo));
     }
 
@@ -731,10 +999,25 @@ mod tests {
 
     #[test]
     fn test_parse_key_spec() {
-        assert_eq!(parse_key_spec("j"), Some((KeyCode::Char('j'), KeyModifiers::NONE)));
-        assert_eq!(parse_key_spec("K"), Some((KeyCode::Char('K'), KeyModifiers::SHIFT)));
-        assert_eq!(parse_key_spec("down"), Some((KeyCode::Down, KeyModifiers::NONE)));
-        assert_eq!(parse_key_spec("ctrl+c"), Some((KeyCode::Char('c'), KeyModifiers::CONTROL)));
-        assert_eq!(parse_key_spec("shift+k"), Some((KeyCode::Char('k'), KeyModifiers::SHIFT)));
+        assert_eq!(
+            parse_key_spec("j"),
+            Some((KeyCode::Char('j'), KeyModifiers::NONE))
+        );
+        assert_eq!(
+            parse_key_spec("K"),
+            Some((KeyCode::Char('K'), KeyModifiers::SHIFT))
+        );
+        assert_eq!(
+            parse_key_spec("down"),
+            Some((KeyCode::Down, KeyModifiers::NONE))
+        );
+        assert_eq!(
+            parse_key_spec("ctrl+c"),
+            Some((KeyCode::Char('c'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(
+            parse_key_spec("shift+k"),
+            Some((KeyCode::Char('k'), KeyModifiers::SHIFT))
+        );
     }
 }

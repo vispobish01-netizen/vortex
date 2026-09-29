@@ -1,0 +1,25 @@
+[Unit]
+Description=Vortex Tunnel & Proxy Daemon
+Documentation=https://github.com/vispobish/vortex
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vortexd
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+
+# Minimal privilege capabilities when running without full root:
+# For unprivileged users, granting CAP_NET_ADMIN via setcap on vortexd / sing-box:
+#   sudo setcap cap_net_admin,cap_net_bind_service+ep ~/.local/bin/vortexd
+#   sudo setcap cap_net_admin,cap_net_bind_service+ep $(which sing-box)
+# AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+# Storage and runtime paths
+ReadWritePaths=%t %h/.config/vortex /run/vortex
+
+[Install]
+WantedBy=default.target

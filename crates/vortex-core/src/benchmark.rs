@@ -1,14 +1,7 @@
 use anyhow::{bail, Result};
-use serde::{Deserialize, Serialize};
 use std::process::Command;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SpeedResult {
-    pub bytes: u64,
-    pub duration_secs: f64,
-    pub mbps: f64,
-    pub mbs: f64,
-}
+pub use crate::model::SpeedResult;
 
 pub const DEFAULT_TEST_DURATION_SECS: u64 = 6;
 

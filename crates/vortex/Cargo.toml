@@ -1,0 +1,23 @@
+[package]
+name = "vortex"
+version = "0.2.0"
+edition = "2021"
+description = "Terminal client and CLI for Vortex VPN/proxy manager"
+
+[[bin]]
+name = "vortex"
+path = "src/main.rs"
+
+[dependencies]
+vortex-core = { path = "../vortex-core" }
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.28"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+toml = "0.8"
+libc = "0.2"
+qrcode = { version = "0.14.1", default-features = false }

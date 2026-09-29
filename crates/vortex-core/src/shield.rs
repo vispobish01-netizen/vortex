@@ -72,7 +72,10 @@ pub fn arm(iface: Option<&str>, server_endpoint: Option<&str>) -> Result<()> {
     let (server_ip, server_port) = match server_endpoint {
         Some(s) if !s.is_empty() => {
             let (h, p) = match s.rsplit_once(':') {
-                Some((host, port)) => (host.trim_matches(|c| c == '[' || c == ']'), port.parse::<u16>().ok()),
+                Some((host, port)) => (
+                    host.trim_matches(|c| c == '[' || c == ']'),
+                    port.parse::<u16>().ok(),
+                ),
                 None => (s.trim_matches(|c| c == '[' || c == ']'), None),
             };
             (Some(h.to_string()), p)
@@ -85,7 +88,10 @@ pub fn arm(iface: Option<&str>, server_endpoint: Option<&str>) -> Result<()> {
 
     // 1. IPv4 Rules
     let run_ip4 = |args: &[&str]| -> Result<()> {
-        let o = Command::new("iptables").args(args).output().context("iptables execution failed")?;
+        let o = Command::new("iptables")
+            .args(args)
+            .output()
+            .context("iptables execution failed")?;
         if !o.status.success() {
             let err = String::from_utf8_lossy(&o.stderr);
             bail!("iptables {} failed: {}", args.join(" "), err.trim());
@@ -105,15 +111,40 @@ pub fn arm(iface: Option<&str>, server_endpoint: Option<&str>) -> Result<()> {
     }
 
     // Allow DHCP client requests
-    let _ = run_ip4(&["-A", "VORTEX_SHIELD", "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT"]);
+    let _ = run_ip4(&[
+        "-A",
+        "VORTEX_SHIELD",
+        "-p",
+        "udp",
+        "--sport",
+        "68",
+        "--dport",
+        "67",
+        "-j",
+        "ACCEPT",
+    ]);
 
     // Allow local RFC1918 subnets and multicast so LAN / local services remain functional
     run_ip4(&["-A", "VORTEX_SHIELD", "-d", "127.0.0.0/8", "-j", "ACCEPT"])?;
     run_ip4(&["-A", "VORTEX_SHIELD", "-d", "10.0.0.0/8", "-j", "ACCEPT"])?;
     run_ip4(&["-A", "VORTEX_SHIELD", "-d", "172.16.0.0/12", "-j", "ACCEPT"])?;
-    run_ip4(&["-A", "VORTEX_SHIELD", "-d", "192.168.0.0/16", "-j", "ACCEPT"])?;
+    run_ip4(&[
+        "-A",
+        "VORTEX_SHIELD",
+        "-d",
+        "192.168.0.0/16",
+        "-j",
+        "ACCEPT",
+    ])?;
     run_ip4(&["-A", "VORTEX_SHIELD", "-d", "224.0.0.0/4", "-j", "ACCEPT"])?;
-    run_ip4(&["-A", "VORTEX_SHIELD", "-d", "255.255.255.255/32", "-j", "ACCEPT"])?;
+    run_ip4(&[
+        "-A",
+        "VORTEX_SHIELD",
+        "-d",
+        "255.255.255.255/32",
+        "-j",
+        "ACCEPT",
+    ])?;
 
     // Allow outbound connection to the remote VPN server IP and port
     if let Some(ref sip) = server_ip {
@@ -121,8 +152,30 @@ pub fn arm(iface: Option<&str>, server_endpoint: Option<&str>) -> Result<()> {
             if ip.is_ipv4() {
                 if let Some(port) = server_port {
                     let port_str = port.to_string();
-                    let _ = run_ip4(&["-A", "VORTEX_SHIELD", "-d", sip, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT"]);
-                    let _ = run_ip4(&["-A", "VORTEX_SHIELD", "-d", sip, "-p", "udp", "--dport", &port_str, "-j", "ACCEPT"]);
+                    let _ = run_ip4(&[
+                        "-A",
+                        "VORTEX_SHIELD",
+                        "-d",
+                        sip,
+                        "-p",
+                        "tcp",
+                        "--dport",
+                        &port_str,
+                        "-j",
+                        "ACCEPT",
+                    ]);
+                    let _ = run_ip4(&[
+                        "-A",
+                        "VORTEX_SHIELD",
+                        "-d",
+                        sip,
+                        "-p",
+                        "udp",
+                        "--dport",
+                        &port_str,
+                        "-j",
+                        "ACCEPT",
+                    ]);
                 } else {
                     let _ = run_ip4(&["-A", "VORTEX_SHIELD", "-d", sip, "-j", "ACCEPT"]);
                 }
@@ -139,7 +192,10 @@ pub fn arm(iface: Option<&str>, server_endpoint: Option<&str>) -> Result<()> {
     // 2. IPv6 Rules (drop all non-loopback / non-tunnel IPv6 traffic to block IPv6 leaks)
     if have("ip6tables") {
         let run_ip6 = |args: &[&str]| -> Result<()> {
-            let o = Command::new("ip6tables").args(args).output().context("ip6tables execution failed")?;
+            let o = Command::new("ip6tables")
+                .args(args)
+                .output()
+                .context("ip6tables execution failed")?;
             if !o.status.success() {
                 let err = String::from_utf8_lossy(&o.stderr);
                 bail!("ip6tables {} failed: {}", args.join(" "), err.trim());
@@ -176,15 +232,33 @@ pub fn disarm() -> Result<()> {
     }
 
     // Remove IPv4 chain and rules
-    while Command::new("iptables").args(["-D", "OUTPUT", "-j", "VORTEX_SHIELD"]).status().map(|s| s.success()).unwrap_or(false) {}
-    let _ = Command::new("iptables").args(["-F", "VORTEX_SHIELD"]).output();
-    let _ = Command::new("iptables").args(["-X", "VORTEX_SHIELD"]).output();
+    while Command::new("iptables")
+        .args(["-D", "OUTPUT", "-j", "VORTEX_SHIELD"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {}
+    let _ = Command::new("iptables")
+        .args(["-F", "VORTEX_SHIELD"])
+        .output();
+    let _ = Command::new("iptables")
+        .args(["-X", "VORTEX_SHIELD"])
+        .output();
 
     // Remove IPv6 chain and rules
     if have("ip6tables") {
-        while Command::new("ip6tables").args(["-D", "OUTPUT", "-j", "VORTEX_SHIELD"]).status().map(|s| s.success()).unwrap_or(false) {}
-        let _ = Command::new("ip6tables").args(["-F", "VORTEX_SHIELD"]).output();
-        let _ = Command::new("ip6tables").args(["-X", "VORTEX_SHIELD"]).output();
+        while Command::new("ip6tables")
+            .args(["-D", "OUTPUT", "-j", "VORTEX_SHIELD"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {}
+        let _ = Command::new("ip6tables")
+            .args(["-F", "VORTEX_SHIELD"])
+            .output();
+        let _ = Command::new("ip6tables")
+            .args(["-X", "VORTEX_SHIELD"])
+            .output();
     }
 
     let _ = fs::remove_file(SHIELD_STATE);

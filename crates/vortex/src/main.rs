@@ -1,10 +1,5 @@
-mod benchmark;
+use vortex_core::{benchmark, ping, recon, shield, store, tunnel};
 mod keymap;
-mod ping;
-mod recon;
-mod shield;
-mod store;
-mod tunnel;
 mod ui;
 
 use anyhow::{bail, Result};
@@ -42,26 +37,38 @@ protocols: VLESS · VMess · Trojan · Shadowsocks · Hysteria2 · TUIC (via sin
            WireGuard · AmneziaWG · OpenVPN · Amnezia vpn:// links
 ";
 
-
 fn find(q: &str) -> Result<store::Profile> {
     let all = store::load_all();
     let q = q.trim().to_lowercase();
     if q.is_empty() {
-        let id = store::last().ok_or_else(|| anyhow::anyhow!("no profile given and none used before"))?;
-        return all.into_iter().find(|p| p.id == id).ok_or_else(|| anyhow::anyhow!("last used profile no longer exists"));
+        let id = store::last()
+            .ok_or_else(|| anyhow::anyhow!("no profile given and none used before"))?;
+        return all
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow::anyhow!("last used profile no longer exists"));
     }
     if let Ok(n) = q.parse::<usize>() {
         if n >= 1 && n <= all.len() {
             return Ok(all[n - 1].clone());
         }
     }
-    let hits: Vec<&store::Profile> = all.iter().filter(|p| p.id == q || p.name.to_lowercase().contains(&q)).collect();
+    let hits: Vec<&store::Profile> = all
+        .iter()
+        .filter(|p| p.id == q || p.name.to_lowercase().contains(&q))
+        .collect();
     match hits.as_slice() {
         [p] => Ok((*p).clone()),
         [] => bail!("no such profile — see `vortex list`"),
-        many => match many.iter().find(|p| p.id == q || p.name.to_lowercase() == q) {
+        many => match many
+            .iter()
+            .find(|p| p.id == q || p.name.to_lowercase() == q)
+        {
             Some(p) => Ok((**p).clone()),
-            None => bail!("'{q}' matches {} profiles — be more specific or use its number", many.len()),
+            None => bail!(
+                "'{q}' matches {} profiles — be more specific or use its number",
+                many.len()
+            ),
         },
     }
 }
@@ -87,7 +94,10 @@ fn connect_cli(p: &store::Profile) -> Result<()> {
     } else {
         None
     };
-    let s = tunnel::connect_with_credentials(&p, creds.as_ref().map(|(u, pw)| (u.as_str(), pw.as_str())))?;
+    let s = tunnel::connect_with_credentials(
+        &p,
+        creds.as_ref().map(|(u, pw)| (u.as_str(), pw.as_str())),
+    )?;
     println!("connected: {} ({})", s.name, s.kind.tag());
     Ok(())
 }
@@ -125,7 +135,14 @@ fn handle_proxy(args: &[String]) -> Result<()> {
         }
         "test" => {
             let out = Command::new("curl")
-                .args(["-s", "--max-time", "5", "-x", "socks5://127.0.0.1:1080", "https://cloudflare.com/cdn-cgi/trace"])
+                .args([
+                    "-s",
+                    "--max-time",
+                    "5",
+                    "-x",
+                    "socks5://127.0.0.1:1080",
+                    "https://cloudflare.com/cdn-cgi/trace",
+                ])
                 .output();
             match out {
                 Ok(o) if o.status.success() => {
@@ -146,7 +163,11 @@ fn handle_proxy(args: &[String]) -> Result<()> {
             println!("  SOCKS5 Bridge : \x1b[1;32msocks5://127.0.0.1:1080\x1b[0m");
             println!("  HTTP Bridge   : \x1b[1;32mhttp://127.0.0.1:1080\x1b[0m");
             match sess {
-                Some(s) => println!("  Tunnel Link   : \x1b[1;32m● ACTIVE\x1b[0m -> {} ({})", s.name, s.kind.tag()),
+                Some(s) => println!(
+                    "  Tunnel Link   : \x1b[1;32m● ACTIVE\x1b[0m -> {} ({})",
+                    s.name,
+                    s.kind.tag()
+                ),
                 None => println!("  Tunnel Link   : \x1b[2m○ INACTIVE (run `vortex up`)\x1b[0m"),
             }
             println!("\n\x1b[1mTerminal Environment Export:\x1b[0m");
@@ -167,8 +188,15 @@ fn handle_speed() -> Result<()> {
     }
     let res = benchmark::run_speed_test(4)?;
     println!("\x1b[1;32m✔ Benchmark Complete\x1b[0m");
-    println!("  Throughput  : \x1b[1;32m{:.2} Mbps\x1b[0m ({:.2} MB/s)", res.mbps, res.mbs);
-    println!("  Transferred : {:.2} MB in {:.2}s", res.bytes as f64 / 1_048_576.0, res.duration_secs);
+    println!(
+        "  Throughput  : \x1b[1;32m{:.2} Mbps\x1b[0m ({:.2} MB/s)",
+        res.mbps, res.mbs
+    );
+    println!(
+        "  Transferred : {:.2} MB in {:.2}s",
+        res.bytes as f64 / 1_048_576.0,
+        res.duration_secs
+    );
     let rating = if res.mbps > 50.0 {
         "ULTRA-FAST // OPTIMAL FOR STREAMING & ENCRYPTED WARFARE"
     } else if res.mbps > 15.0 {
@@ -182,15 +210,31 @@ fn handle_speed() -> Result<()> {
 
 fn handle_flows() -> Result<()> {
     let flows = tunnel::active_flows();
-    println!("\x1b[1;36m◈ 0xNET // ACTIVE FLOWS & SOCKET MATRIX ({} ESTABLISHED)\x1b[0m", flows.len());
+    println!(
+        "\x1b[1;36m◈ 0xNET // ACTIVE FLOWS & SOCKET MATRIX ({} ESTABLISHED)\x1b[0m",
+        flows.len()
+    );
     if flows.is_empty() {
         println!("  No active flows captured.");
         return Ok(());
     }
-    println!("{:<5} {:<18} {:<32} {:<24}", "PROTO", "PROCESS", "TARGET DESTINATION", "LOCAL SOURCE");
+    println!(
+        "{:<5} {:<18} {:<32} {:<24}",
+        "PROTO", "PROCESS", "TARGET DESTINATION", "LOCAL SOURCE"
+    );
     for f in flows.iter().take(25) {
-        let target = if !f.host.is_empty() { format!("{} ({})", f.destination, f.host) } else { f.destination.clone() };
-        println!("{:<5} {:<18} {:<32} {:<24}", f.network.to_uppercase(), trunc_str(&f.process, 18), trunc_str(&target, 32), f.source);
+        let target = if !f.host.is_empty() {
+            format!("{} ({})", f.destination, f.host)
+        } else {
+            f.destination.clone()
+        };
+        println!(
+            "{:<5} {:<18} {:<32} {:<24}",
+            f.network.to_uppercase(),
+            trunc_str(&f.process, 18),
+            trunc_str(&target, 32),
+            f.source
+        );
     }
     Ok(())
 }
@@ -198,13 +242,31 @@ fn handle_flows() -> Result<()> {
 fn handle_status() -> Result<()> {
     match tunnel::load_session() {
         Some(s) => {
-            let shield_str = if shield::is_armed() { "\x1b[1;32m[SHIELD: ARMED]\x1b[0m" } else { "\x1b[2m[SHIELD: OFF]\x1b[0m" };
-            println!("● {} ({}) via {}  {}", s.name, s.kind.tag(), s.server, shield_str);
-            println!("  uptime {}s · exit {}", tunnel::now().saturating_sub(s.since), tunnel::public_ip());
+            let shield_str = if shield::is_armed() {
+                "\x1b[1;32m[SHIELD: ARMED]\x1b[0m"
+            } else {
+                "\x1b[2m[SHIELD: OFF]\x1b[0m"
+            };
+            println!(
+                "● {} ({}) via {}  {}",
+                s.name,
+                s.kind.tag(),
+                s.server,
+                shield_str
+            );
+            println!(
+                "  uptime {}s · exit {}",
+                tunnel::now().saturating_sub(s.since),
+                tunnel::public_ip()
+            );
             println!("  proxy bridge: socks5://127.0.0.1:1080 · http://127.0.0.1:1080");
         }
         None => {
-            let shield_str = if shield::is_armed() { "\x1b[1;32m[SHIELD: ARMED]\x1b[0m" } else { "\x1b[2m[SHIELD: OFF]\x1b[0m" };
+            let shield_str = if shield::is_armed() {
+                "\x1b[1;32m[SHIELD: ARMED]\x1b[0m"
+            } else {
+                "\x1b[2m[SHIELD: OFF]\x1b[0m"
+            };
             println!("○ disconnected  {}", shield_str);
         }
     }
@@ -213,7 +275,10 @@ fn handle_status() -> Result<()> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-h" | "--help" | "help")
+    ) {
         print!("{HELP}");
         return Ok(());
     }
@@ -249,8 +314,18 @@ fn main() -> Result<()> {
         Some("list") | Some("ls") => {
             let active = tunnel::load_session().map(|s| s.id);
             for (i, p) in store::load_all().iter().enumerate() {
-                let mark = if active.as_deref() == Some(p.id.as_str()) { "●" } else { " " };
-                println!("{mark} {:>2}  {:<7} {:<32} {}", i + 1, p.kind.tag(), p.name, p.server);
+                let mark = if active.as_deref() == Some(p.id.as_str()) {
+                    "●"
+                } else {
+                    " "
+                };
+                println!(
+                    "{mark} {:>2}  {:<7} {:<32} {}",
+                    i + 1,
+                    p.kind.tag(),
+                    p.name,
+                    p.server
+                );
             }
             Ok(())
         }
@@ -260,7 +335,13 @@ fn main() -> Result<()> {
                 eprintln!("note: a tunnel is active — numbers are measured through it. `vortex down` first for real ones.");
             }
             for (p, r) in ping::measure_all(store::load_all()) {
-                println!("{}  {:<7} {:<32} {}", fmt_ping(r), p.kind.tag(), p.name, p.server);
+                println!(
+                    "{}  {:<7} {:<32} {}",
+                    fmt_ping(r),
+                    p.kind.tag(),
+                    p.name,
+                    p.server
+                );
             }
             Ok(())
         }
@@ -270,7 +351,10 @@ fn main() -> Result<()> {
             for (p, r) in ranked.iter().take(5) {
                 println!("{}  {:<7} {}", fmt_ping(*r), p.kind.tag(), p.name);
             }
-            match ranked.into_iter().find(|(_, r)| matches!(r, ping::Ping::Ms(_))) {
+            match ranked
+                .into_iter()
+                .find(|(_, r)| matches!(r, ping::Ping::Ms(_)))
+            {
                 Some((p, _)) => connect_cli(&p),
                 None => bail!("no reachable profile"),
             }
@@ -316,7 +400,11 @@ fn main() -> Result<()> {
                 println!("exported configuration to {}", path.display());
                 return Ok(());
             }
-            println!("\x1b[1;36m# Configuration for {} ({})\x1b[0m", p.name, p.kind.tag());
+            println!(
+                "\x1b[1;36m# Configuration for {} ({})\x1b[0m",
+                p.name,
+                p.kind.tag()
+            );
             println!("{}", p.data);
             if p.kind.is_singbox() {
                 if let Ok((_, ob, _, _)) = store::outbound(&p.data) {
@@ -335,24 +423,48 @@ fn main() -> Result<()> {
                         println!("no subscriptions configured — use `vortex sub add <url>`");
                         return Ok(());
                     }
-                    println!("{:<3} {:<16} {:<24} {:<8} {:<12} URL", "#", "ID", "NAME", "NODES", "UPDATED");
+                    println!(
+                        "{:<3} {:<16} {:<24} {:<8} {:<12} URL",
+                        "#", "ID", "NAME", "NODES", "UPDATED"
+                    );
                     for (i, s) in subs.iter().enumerate() {
-                        let updated = s.updated.map(|ts| {
-                            let diff = tunnel::now().saturating_sub(ts);
-                            if diff < 60 { format!("{diff}s ago") }
-                            else if diff < 3600 { format!("{}m ago", diff / 60) }
-                            else if diff < 86400 { format!("{}h ago", diff / 3600) }
-                            else { format!("{}d ago", diff / 86400) }
-                        }).unwrap_or_else(|| "never".into());
-                        println!("{:>2}  {:<16} {:<24} {:<8} {:<12} {}", i + 1, s.id, trunc_str(&s.name, 24), s.count, updated, s.url);
+                        let updated = s
+                            .updated
+                            .map(|ts| {
+                                let diff = tunnel::now().saturating_sub(ts);
+                                if diff < 60 {
+                                    format!("{diff}s ago")
+                                } else if diff < 3600 {
+                                    format!("{}m ago", diff / 60)
+                                } else if diff < 86400 {
+                                    format!("{}h ago", diff / 3600)
+                                } else {
+                                    format!("{}d ago", diff / 86400)
+                                }
+                            })
+                            .unwrap_or_else(|| "never".into());
+                        println!(
+                            "{:>2}  {:<16} {:<24} {:<8} {:<12} {}",
+                            i + 1,
+                            s.id,
+                            trunc_str(&s.name, 24),
+                            s.count,
+                            updated,
+                            s.url
+                        );
                     }
                     Ok(())
                 }
                 "add" => {
-                    let url = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: vortex sub add <url> [name]"))?;
+                    let url = args
+                        .get(2)
+                        .ok_or_else(|| anyhow::anyhow!("usage: vortex sub add <url> [name]"))?;
                     let name = args.get(3).map(String::as_str);
                     let (sub, count) = store::add_sub(url, name)?;
-                    println!("added subscription '{}' ({}) with {} node(s)", sub.name, sub.id, count);
+                    println!(
+                        "added subscription '{}' ({}) with {} node(s)",
+                        sub.name, sub.id, count
+                    );
                     Ok(())
                 }
                 "update" | "up" | "sync" => {
@@ -372,12 +484,16 @@ fn main() -> Result<()> {
                     Ok(())
                 }
                 "rm" | "remove" | "del" => {
-                    let target = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: vortex sub rm <id>"))?;
+                    let target = args
+                        .get(2)
+                        .ok_or_else(|| anyhow::anyhow!("usage: vortex sub rm <id>"))?;
                     let removed = store::remove_sub(target, true)?;
                     println!("removed subscription and cleaned up {removed} profile(s)");
                     Ok(())
                 }
-                other => bail!("unknown subscription command '{other}' — try list, add, update, rm"),
+                other => {
+                    bail!("unknown subscription command '{other}' — try list, add, update, rm")
+                }
             }
         }
         Some("update") | Some("sync") => {
@@ -404,7 +520,8 @@ fn main() -> Result<()> {
             if let Some(ref a) = p.auth {
                 println!("current saved username for '{}': {}", p.name, a.username);
             }
-            let cred = tunnel::prompt_ovpn_credentials(p.auth.as_ref().map(|a| a.username.as_str()))?;
+            let cred =
+                tunnel::prompt_ovpn_credentials(p.auth.as_ref().map(|a| a.username.as_str()))?;
             if cred.save {
                 store::set_auth(&p.id, cred.username, cred.password)?;
                 println!("credentials saved for '{}'", p.name);
@@ -422,7 +539,10 @@ fn main() -> Result<()> {
         }
         Some("rm") | Some("remove") => {
             let p = find(&args[1..].join(" "))?;
-            if tunnel::load_session().map(|s| s.id == p.id).unwrap_or(false) {
+            if tunnel::load_session()
+                .map(|s| s.id == p.id)
+                .unwrap_or(false)
+            {
                 bail!("{} is connected — `vortex down` first", p.name);
             }
             store::remove(&p.id)?;
@@ -439,30 +559,52 @@ fn main() -> Result<()> {
                     let srv = sess.as_ref().map(|s| s.server.as_str());
                     shield::set_enabled_preference(true);
                     shield::arm(iface, srv)?;
-                    println!("\x1b[1;32m✔ Stealth Shield ARMED // Zero-leak killswitch engaged\x1b[0m");
+                    println!(
+                        "\x1b[1;32m✔ Stealth Shield ARMED // Zero-leak killswitch engaged\x1b[0m"
+                    );
                     if let Some(s) = sess {
-                        println!("  Secured on interface {} via endpoint {}", s.iface, s.server);
+                        println!(
+                            "  Secured on interface {} via endpoint {}",
+                            s.iface, s.server
+                        );
                     }
                 }
                 "off" | "disable" | "disarm" => {
                     shield::set_enabled_preference(false);
                     shield::disarm()?;
-                    println!("\x1b[1;33m○ Stealth Shield DISARMED // Firewall rules cleared\x1b[0m");
+                    println!(
+                        "\x1b[1;33m○ Stealth Shield DISARMED // Firewall rules cleared\x1b[0m"
+                    );
                 }
                 _ => {
                     let st = shield::status();
                     let pref = shield::is_enabled_preference();
-                    println!("\x1b[1;36m◈ 0xSHIELD // STEALTH KILL SWITCH & ANTI-LEAK FIREWALL\x1b[0m");
-                    let armed_str = if st.armed { "\x1b[1;32mARMED (ACTIVE ENFORCEMENT)\x1b[0m" } else { "\x1b[2mDISARMED (OFF)\x1b[0m" };
+                    println!(
+                        "\x1b[1;36m◈ 0xSHIELD // STEALTH KILL SWITCH & ANTI-LEAK FIREWALL\x1b[0m"
+                    );
+                    let armed_str = if st.armed {
+                        "\x1b[1;32mARMED (ACTIVE ENFORCEMENT)\x1b[0m"
+                    } else {
+                        "\x1b[2mDISARMED (OFF)\x1b[0m"
+                    };
                     println!("  Firewall Status : {armed_str}");
-                    println!("  Auto-Arm On Up  : {}", if pref { "\x1b[1;32mENABLED\x1b[0m" } else { "\x1b[2mDISABLED\x1b[0m" });
+                    println!(
+                        "  Auto-Arm On Up  : {}",
+                        if pref {
+                            "\x1b[1;32mENABLED\x1b[0m"
+                        } else {
+                            "\x1b[2mDISABLED\x1b[0m"
+                        }
+                    );
                     if let Some(ifc) = &st.iface {
                         println!("  Tunnel Interface: {ifc}");
                     }
                     if let Some(srv) = &st.server {
                         println!("  Exempt Server   : {srv}");
                     }
-                    println!("\n\x1b[2mToggle with `vortex shield on` or `vortex shield off`\x1b[0m");
+                    println!(
+                        "\n\x1b[2mToggle with `vortex shield on` or `vortex shield off`\x1b[0m"
+                    );
                 }
             }
             Ok(())
@@ -480,10 +622,18 @@ fn main() -> Result<()> {
                 println!("    Reverse DNS   : {r}");
             }
             if let Some(asn) = rep.asn {
-                println!("    ASN & Carrier : {} ({})", asn, rep.org.unwrap_or_default());
+                println!(
+                    "    ASN & Carrier : {} ({})",
+                    asn,
+                    rep.org.unwrap_or_default()
+                );
             }
             if let Some(c) = rep.country {
-                println!("    Location      : {}, {}", rep.city.unwrap_or_default(), c);
+                println!(
+                    "    Location      : {}, {}",
+                    rep.city.unwrap_or_default(),
+                    c
+                );
             }
             if let Some(loc) = rep.loc {
                 println!("    Coordinates   : {loc}");
@@ -508,7 +658,11 @@ fn main() -> Result<()> {
             }
             if let Some(ip) = rep.exit_ip {
                 println!("\n\x1b[1;32m[+] ROUTE EXIT STATUS\x1b[0m");
-                println!("    Live Exit IP  : {} (Cloudflare Datacenter: {})", ip, rep.exit_colo.unwrap_or_default());
+                println!(
+                    "    Live Exit IP  : {} (Cloudflare Datacenter: {})",
+                    ip,
+                    rep.exit_colo.unwrap_or_default()
+                );
             }
             Ok(())
         }
@@ -519,13 +673,38 @@ fn main() -> Result<()> {
             let mut cfg = tunnel::load_routing();
             match sub {
                 "list" => {
-                    println!("\x1b[1;36m◈ 0xROUTE // SPLIT TUNNELING & ROUTING RULES MATRIX\x1b[0m");
-                    println!("  Bypass LAN (RFC1918) : {}", if cfg.bypass_lan { "\x1b[1;32mENABLED\x1b[0m" } else { "\x1b[2mDISABLED\x1b[0m" });
-                    println!("  Direct Domains (LAN) : {}", if cfg.direct_domains.is_empty() { "none".into() } else { cfg.direct_domains.join(", ") });
-                    println!("  Blocked Domains (Ad) : {}", if cfg.blocked_domains.is_empty() { "none".into() } else { cfg.blocked_domains.join(", ") });
+                    println!(
+                        "\x1b[1;36m◈ 0xROUTE // SPLIT TUNNELING & ROUTING RULES MATRIX\x1b[0m"
+                    );
+                    println!(
+                        "  Bypass LAN (RFC1918) : {}",
+                        if cfg.bypass_lan {
+                            "\x1b[1;32mENABLED\x1b[0m"
+                        } else {
+                            "\x1b[2mDISABLED\x1b[0m"
+                        }
+                    );
+                    println!(
+                        "  Direct Domains (LAN) : {}",
+                        if cfg.direct_domains.is_empty() {
+                            "none".into()
+                        } else {
+                            cfg.direct_domains.join(", ")
+                        }
+                    );
+                    println!(
+                        "  Blocked Domains (Ad) : {}",
+                        if cfg.blocked_domains.is_empty() {
+                            "none".into()
+                        } else {
+                            cfg.blocked_domains.join(", ")
+                        }
+                    );
                 }
                 "bypass" => {
-                    let domain = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: vortex route bypass <domain>"))?;
+                    let domain = args
+                        .get(2)
+                        .ok_or_else(|| anyhow::anyhow!("usage: vortex route bypass <domain>"))?;
                     if !cfg.direct_domains.contains(&domain.to_string()) {
                         cfg.direct_domains.push(domain.to_string());
                         tunnel::save_routing(&cfg)?;
@@ -533,7 +712,9 @@ fn main() -> Result<()> {
                     }
                 }
                 "block" => {
-                    let domain = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: vortex route block <domain>"))?;
+                    let domain = args
+                        .get(2)
+                        .ok_or_else(|| anyhow::anyhow!("usage: vortex route block <domain>"))?;
                     if !cfg.blocked_domains.contains(&domain.to_string()) {
                         cfg.blocked_domains.push(domain.to_string());
                         tunnel::save_routing(&cfg)?;

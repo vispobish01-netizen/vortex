@@ -1,10 +1,4 @@
-use crate::benchmark::{self, SpeedResult};
 use crate::keymap::{self, Action, ConfirmKind, Mode};
-use crate::ping::{self, Ping};
-use crate::recon::{self, ReconReport};
-use crate::shield;
-use crate::store::{self, Kind, Profile};
-use crate::tunnel::{self, ActiveFlow, Session};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent},
@@ -24,21 +18,27 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use vortex_core::benchmark::{self, SpeedResult};
+use vortex_core::ping::{self, Ping};
+use vortex_core::recon::{self, ReconReport};
+use vortex_core::shield;
+use vortex_core::store::{self, Kind, Profile};
+use vortex_core::tunnel::{self, ActiveFlow, Session};
 
 // Elite Black-Hat Cyber Palette
-const FG: Color = Color::Rgb(0xd2, 0xf7, 0xee);         // Phosphor Ice-White
-const FG_DIM: Color = Color::Rgb(0x60, 0x8a, 0x8e);     // Tactical Cyan-Gray
-const DIM: Color = Color::Rgb(0x2a, 0x46, 0x4c);        // Dark Matrix Dim
-const CYAN: Color = Color::Rgb(0x00, 0xf0, 0xff);       // Electric Cyan
-const PURPLE: Color = Color::Rgb(0xbd, 0x42, 0xff);     // Plasma Violet
-const BLUE: Color = Color::Rgb(0x2d, 0x9c, 0xff);       // Cobalt Blue
-const GREEN: Color = Color::Rgb(0x00, 0xff, 0x66);      // Neon Lime Phosphor
-const YELLOW: Color = Color::Rgb(0xff, 0xb8, 0x00);     // Amber Warning
-const RED: Color = Color::Rgb(0xff, 0x22, 0x55);        // Breach Red
-const BORDER: Color = Color::Rgb(0x16, 0x3d, 0x44);     // Deep Cyber Teal Border
+const FG: Color = Color::Rgb(0xd2, 0xf7, 0xee); // Phosphor Ice-White
+const FG_DIM: Color = Color::Rgb(0x60, 0x8a, 0x8e); // Tactical Cyan-Gray
+const DIM: Color = Color::Rgb(0x2a, 0x46, 0x4c); // Dark Matrix Dim
+const CYAN: Color = Color::Rgb(0x00, 0xf0, 0xff); // Electric Cyan
+const PURPLE: Color = Color::Rgb(0xbd, 0x42, 0xff); // Plasma Violet
+const BLUE: Color = Color::Rgb(0x2d, 0x9c, 0xff); // Cobalt Blue
+const GREEN: Color = Color::Rgb(0x00, 0xff, 0x66); // Neon Lime Phosphor
+const YELLOW: Color = Color::Rgb(0xff, 0xb8, 0x00); // Amber Warning
+const RED: Color = Color::Rgb(0xff, 0x22, 0x55); // Breach Red
+const BORDER: Color = Color::Rgb(0x16, 0x3d, 0x44); // Deep Cyber Teal Border
 const BORDER_ACTIVE: Color = Color::Rgb(0x00, 0xf0, 0xff); // Active Cyan Frame
-const SEL_BG: Color = Color::Rgb(0x0a, 0x26, 0x2c);     // Tactical Selection Glow
-const SEL_FG: Color = Color::Rgb(0x00, 0xff, 0xcc);     // Highlight Active
+const SEL_BG: Color = Color::Rgb(0x0a, 0x26, 0x2c); // Tactical Selection Glow
+const SEL_FG: Color = Color::Rgb(0x00, 0xff, 0xcc); // Highlight Active
 const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const HIST: usize = 240;
 
@@ -154,7 +154,11 @@ impl App {
         };
         a.rebuild();
         // start on the active profile, else the one used last time
-        let want = a.session.as_ref().map(|s| s.id.clone()).or_else(store::last);
+        let want = a
+            .session
+            .as_ref()
+            .map(|s| s.id.clone())
+            .or_else(store::last);
         if let Some(id) = want {
             if let Some(i) = a.view.iter().position(|&i| a.profiles[i].id == id) {
                 a.list.select(Some(i));
@@ -170,7 +174,9 @@ impl App {
     }
 
     fn cur(&self) -> Option<&Profile> {
-        self.view.get(self.list.selected()?).map(|&i| &self.profiles[i])
+        self.view
+            .get(self.list.selected()?)
+            .map(|&i| &self.profiles[i])
     }
 
     fn toast(&mut self, m: impl Into<String>, ok: bool) {
@@ -197,13 +203,20 @@ impl App {
             });
         }
         self.view = v;
-        let idx = keep.and_then(|id| self.view.iter().position(|&i| self.profiles[i].id == id)).unwrap_or(0);
-        self.list.select(if self.view.is_empty() { None } else { Some(idx.min(self.view.len() - 1)) });
+        let idx = keep
+            .and_then(|id| self.view.iter().position(|&i| self.profiles[i].id == id))
+            .unwrap_or(0);
+        self.list.select(if self.view.is_empty() {
+            None
+        } else {
+            Some(idx.min(self.view.len() - 1))
+        });
     }
 
     fn reload(&mut self) {
         self.profiles = store::load_all();
-        self.pings.retain(|id, _| self.profiles.iter().any(|p| &p.id == id));
+        self.pings
+            .retain(|id, _| self.profiles.iter().any(|p| &p.id == id));
         self.rebuild();
     }
 
@@ -223,12 +236,18 @@ impl App {
     /// latency-test the visible profiles (or just the selected one)
     fn test(&mut self, only_selected: bool) {
         if self.session.is_some() {
-            return self.toast("disconnect first — server latency can't be measured through the tunnel", false);
+            return self.toast(
+                "disconnect first — server latency can't be measured through the tunnel",
+                false,
+            );
         }
         let jobs: Vec<Profile> = if only_selected {
             self.cur().cloned().into_iter().collect()
         } else {
-            self.view.iter().map(|&i| self.profiles[i].clone()).collect()
+            self.view
+                .iter()
+                .map(|&i| self.profiles[i].clone())
+                .collect()
         };
         if jobs.is_empty() {
             return;
@@ -248,7 +267,9 @@ impl App {
         if self.busy.is_some() {
             return;
         }
-        let Some(mut p) = self.cur().cloned() else { return };
+        let Some(mut p) = self.cur().cloned() else {
+            return;
+        };
         let creds = if tunnel::ovpn_needs_auth(&p) {
             if let Some(ref a) = p.auth {
                 Some((a.username.clone(), a.password.clone()))
@@ -283,14 +304,19 @@ impl App {
         self.ip.clear();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let r = tunnel::connect_with_credentials(&p, creds.as_ref().map(|(u, pw)| (u.as_str(), pw.as_str())))
-                .map_err(|e| format!("{e:#}"));
+            let r = tunnel::connect_with_credentials(
+                &p,
+                creds.as_ref().map(|(u, pw)| (u.as_str(), pw.as_str())),
+            )
+            .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Connected(r));
         });
     }
 
     fn manage_auth(&mut self) {
-        let Some(mut p) = self.cur().cloned() else { return };
+        let Some(mut p) = self.cur().cloned() else {
+            return;
+        };
         if p.kind != Kind::Ovpn {
             self.toast("credentials only apply to OpenVPN profiles", false);
             return;
@@ -363,7 +389,9 @@ impl App {
     }
 
     fn rename(&mut self, name: String) {
-        let Some(id) = self.cur().map(|p| p.id.clone()) else { return };
+        let Some(id) = self.cur().map(|p| p.id.clone()) else {
+            return;
+        };
         match store::rename(&id, &name) {
             Ok(()) => {
                 if let Some(s) = self.session.as_mut().filter(|s| s.id == id) {
@@ -383,10 +411,12 @@ impl App {
         self.start("syncing subscriptions");
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let r = store::update_all_subs().map(|results| {
-                let total: usize = results.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
-                total
-            }).map_err(|e| format!("{e:#}"));
+            let r = store::update_all_subs()
+                .map(|results| {
+                    let total: usize = results.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
+                    total
+                })
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::SubsUpdated(r));
         });
     }
@@ -398,7 +428,9 @@ impl App {
         self.start("updating sub");
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let r = store::update_sub(&id).map(|(_, count)| count).map_err(|e| format!("{e:#}"));
+            let r = store::update_sub(&id)
+                .map(|(_, count)| count)
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::SubsUpdated(r));
         });
     }
@@ -407,7 +439,10 @@ impl App {
         let get_text = || -> Option<String> {
             if let Ok(u) = std::env::var("SUDO_USER") {
                 if !u.is_empty() && u != "root" {
-                    if let Ok(o) = Command::new("sudo").args(["-u", &u, "wl-paste", "-n"]).output() {
+                    if let Ok(o) = Command::new("sudo")
+                        .args(["-u", &u, "wl-paste", "-n"])
+                        .output()
+                    {
                         if o.status.success() {
                             let s = String::from_utf8_lossy(&o.stdout).to_string();
                             if !s.trim().is_empty() {
@@ -570,11 +605,19 @@ impl App {
 
     fn tick(&mut self) -> bool {
         let mut changed = false;
-        if self.toast.as_ref().map(|t| t.2.elapsed() > Duration::from_secs(5)).unwrap_or(false) {
+        if self
+            .toast
+            .as_ref()
+            .map(|t| t.2.elapsed() > Duration::from_secs(5))
+            .unwrap_or(false)
+        {
             self.toast = None;
             changed = true;
         }
-        if self.show_flows && self.busy.is_none() && self.last_flows_tick.elapsed() >= Duration::from_millis(1500) {
+        if self.show_flows
+            && self.busy.is_none()
+            && self.last_flows_tick.elapsed() >= Duration::from_millis(1500)
+        {
             self.last_flows_tick = Instant::now();
             let tx = self.tx.clone();
             thread::spawn(move || {
@@ -582,7 +625,11 @@ impl App {
                 let _ = tx.send(Msg::Flows(flows));
             });
         }
-        if self.session.is_some() && self.busy.is_none() && !self.rtt_busy && self.last_rtt.elapsed() >= Duration::from_secs(2) {
+        if self.session.is_some()
+            && self.busy.is_none()
+            && !self.rtt_busy
+            && self.last_rtt.elapsed() >= Duration::from_secs(2)
+        {
             self.rtt_busy = true;
             self.last_rtt = Instant::now();
             let tx = self.tx.clone();
@@ -634,7 +681,11 @@ impl App {
         }
         if let Some(s) = &self.session {
             let sid = s.id.clone();
-            if let Some(i) = self.view.iter().position(|&idx| self.profiles[idx].id == sid) {
+            if let Some(i) = self
+                .view
+                .iter()
+                .position(|&idx| self.profiles[idx].id == sid)
+            {
                 self.list.select(Some(i));
             }
         }
@@ -707,27 +758,25 @@ impl App {
                 self.mode = Mode::Normal;
                 self.toast = None;
             }
-            Action::Cancel => {
-                match &self.mode {
-                    Mode::Normal => {
-                        if self.show_log {
-                            self.show_log = false;
-                        } else if !self.filter.is_empty() {
-                            self.filter.clear();
-                            self.rebuild();
-                        }
-                    }
-                    Mode::Search(_) => {
+            Action::Cancel => match &self.mode {
+                Mode::Normal => {
+                    if self.show_log {
+                        self.show_log = false;
+                    } else if !self.filter.is_empty() {
                         self.filter.clear();
                         self.rebuild();
-                        self.mode = Mode::Normal;
-                    }
-                    _ => {
-                        self.mode = Mode::Normal;
-                        self.toast = None;
                     }
                 }
-            }
+                Mode::Search(_) => {
+                    self.filter.clear();
+                    self.rebuild();
+                    self.mode = Mode::Normal;
+                }
+                _ => {
+                    self.mode = Mode::Normal;
+                    self.toast = None;
+                }
+            },
             Action::NextNode => self.mv(1),
             Action::PrevNode => self.mv(-1),
             Action::FirstNode => {
@@ -810,7 +859,14 @@ impl App {
             Action::CycleSort => {
                 self.sort_ping = !self.sort_ping;
                 self.rebuild();
-                self.toast(if self.sort_ping { "sorted by latency" } else { "sorted by name" }, true);
+                self.toast(
+                    if self.sort_ping {
+                        "sorted by latency"
+                    } else {
+                        "sorted by name"
+                    },
+                    true,
+                );
             }
             Action::TestSelected => self.test(true),
             Action::TestAll => self.test(false),
@@ -840,7 +896,13 @@ impl App {
                 self.show_flows = !self.show_flows;
                 if self.show_flows {
                     self.flows = tunnel::active_flows();
-                    self.toast(format!("FLOW SNIFFER ENGAGED // {} ACTIVE SOCKET(S)", self.flows.len()), true);
+                    self.toast(
+                        format!(
+                            "FLOW SNIFFER ENGAGED // {} ACTIVE SOCKET(S)",
+                            self.flows.len()
+                        ),
+                        true,
+                    );
                 } else {
                     self.toast("FLOW SNIFFER DISENGAGED", true);
                 }
@@ -895,20 +957,18 @@ impl App {
                 }
                 _ => {}
             },
-            Action::Submit => {
-                match std::mem::replace(&mut self.mode, Mode::Normal) {
-                    Mode::Search(_) => {}
-                    Mode::Add(s) => {
-                        if !s.trim().is_empty() {
-                            self.import(s);
-                        }
+            Action::Submit => match std::mem::replace(&mut self.mode, Mode::Normal) {
+                Mode::Search(_) => {}
+                Mode::Add(s) => {
+                    if !s.trim().is_empty() {
+                        self.import(s);
                     }
-                    Mode::Edit(s) => {
-                        self.rename(s);
-                    }
-                    _ => {}
                 }
-            }
+                Mode::Edit(s) => {
+                    self.rename(s);
+                }
+                _ => {}
+            },
             Action::ExportConfig => {
                 if let Some(p) = &self.qr_profile {
                     match store::export_to_file(p) {
@@ -932,7 +992,8 @@ impl App {
                 let n = self.subs.len();
                 if n > 0 {
                     let cur = self.subs_list.selected().unwrap_or(0) as i32;
-                    self.subs_list.select(Some((cur - 1).rem_euclid(n as i32) as usize));
+                    self.subs_list
+                        .select(Some((cur - 1).rem_euclid(n as i32) as usize));
                 }
             }
             Action::SyncSelectedSub => {
@@ -1043,7 +1104,10 @@ pub fn run() -> Result<()> {
     })();
     restore()?;
     if let Some(s) = tunnel::load_session() {
-        println!("tunnel still running: {} — `vortex down` to stop it", s.name);
+        println!(
+            "tunnel still running: {} — `vortex down` to stop it",
+            s.name
+        );
     }
     res
 }
@@ -1082,9 +1146,9 @@ fn kind_color(k: Kind) -> Color {
         Kind::Trojan => BLUE,
         Kind::Hy2 => PURPLE,
         Kind::Tuic => Color::Rgb(0xd9, 0x46, 0xef), // Fuchsia
-        Kind::Ss => Color::Rgb(0x06, 0xb6, 0xd4),    // Electric Teal
+        Kind::Ss => Color::Rgb(0x06, 0xb6, 0xd4),   // Electric Teal
         Kind::Wg => GREEN,
-        Kind::Awg => Color::Rgb(0x10, 0xb9, 0x81),  // Emerald
+        Kind::Awg => Color::Rgb(0x10, 0xb9, 0x81), // Emerald
         Kind::Ovpn => YELLOW,
     }
 }
@@ -1138,18 +1202,17 @@ fn block(title: &str, active: bool) -> Block<'static> {
         .border_style(Style::new().fg(border_color))
         .title(Line::from(vec![
             Span::styled(" ◈ [ ", Style::new().fg(border_color)),
-            Span::styled(title.to_string(), Style::new().fg(if active { CYAN } else { FG }).bold()),
+            Span::styled(
+                title.to_string(),
+                Style::new().fg(if active { CYAN } else { FG }).bold(),
+            ),
             Span::styled(" ] ", Style::new().fg(border_color)),
         ]))
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let header_h = if area.height >= 12 {
-        2
-    } else {
-        1
-    };
+    let header_h = if area.height >= 12 { 2 } else { 1 };
     let footer_h = if area.height >= 6 { 1 } else { 0 };
     let rows = Layout::vertical([
         Constraint::Length(header_h),
@@ -1160,7 +1223,8 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     header(f, rows[0], app);
     if area.width >= 84 {
-        let cols = Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)]).split(rows[1]);
+        let cols = Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)])
+            .split(rows[1]);
         profiles(f, cols[0], app);
         info(f, cols[1], app);
     } else if app.show_log {
@@ -1173,8 +1237,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     let mode = app.mode.clone();
     match &mode {
-        Mode::Add(s) => popup(f, area, "0xIN // INJECT CONFIGURATION PAYLOAD", "VLESS · VMESS · TROJAN · SS · HY2 · TUIC · WG · AWG · OVPN · SUB URL", s),
-        Mode::Edit(s) => popup(f, area, "0xRN // MUTATE TARGET IDENTIFIER", "enter new cryptographic profile alias", s),
+        Mode::Add(s) => popup(
+            f,
+            area,
+            "0xIN // INJECT CONFIGURATION PAYLOAD",
+            "VLESS · VMESS · TROJAN · SS · HY2 · TUIC · WG · AWG · OVPN · SUB URL",
+            s,
+        ),
+        Mode::Edit(s) => popup(
+            f,
+            area,
+            "0xRN // MUTATE TARGET IDENTIFIER",
+            "enter new cryptographic profile alias",
+            s,
+        ),
         Mode::Confirm(kind) => confirm_popup(f, area, app, *kind),
         Mode::Help => help(f, area),
         Mode::Qr => {
@@ -1203,23 +1279,38 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
         Span::styled("⚡ VORTEX", Style::new().fg(GREEN).bold()),
         Span::styled(" // ", Style::new().fg(BORDER)),
         Span::styled("CYBER WARFARE NETWORK TUNNEL", Style::new().fg(CYAN).bold()),
-        Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), Style::new().fg(FG_DIM)),
+        Span::styled(
+            format!("  v{}", env!("CARGO_PKG_VERSION")),
+            Style::new().fg(FG_DIM),
+        ),
     ]);
 
     let right_status = if let Some(b) = app.busy {
         let sp = SPIN[(app.busy_since.elapsed().as_millis() / 90) as usize % SPIN.len()];
         Line::from(vec![
-            Span::styled(format!("[⌁ SWEEP: {b} {sp}] "), Style::new().fg(YELLOW).bold()),
+            Span::styled(
+                format!("[⌁ SWEEP: {b} {sp}] "),
+                Style::new().fg(YELLOW).bold(),
+            ),
             Span::styled("SCANNING ROUTE...", Style::new().fg(FG_DIM)),
         ])
     } else if let Some(s) = &app.session {
         let mut v = vec![
             Span::styled("[● LINK ENGAGED] ", Style::new().fg(GREEN).bold()),
-            Span::styled(format!("{}: ", s.kind.tag()), Style::new().fg(kind_color(s.kind)).bold()),
-            Span::styled(format!("{} ", trunc(&s.name, 18)), Style::new().fg(FG).bold()),
+            Span::styled(
+                format!("{}: ", s.kind.tag()),
+                Style::new().fg(kind_color(s.kind)).bold(),
+            ),
+            Span::styled(
+                format!("{} ", trunc(&s.name, 18)),
+                Style::new().fg(FG).bold(),
+            ),
         ];
         if let Some(ms) = app.rtt {
-            v.push(Span::styled(format!("{ms}ms "), Style::new().fg(ms_color(ms)).bold()));
+            v.push(Span::styled(
+                format!("{ms}ms "),
+                Style::new().fg(ms_color(ms)).bold(),
+            ));
         }
         v.push(Span::styled(
             format!("[UP: {}] ", fmt_dur(tunnel::now().saturating_sub(s.since))),
@@ -1228,7 +1319,10 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
         Line::from(v)
     } else {
         Line::from(vec![
-            Span::styled("[○ STANDBY // DIRECT PROBE ACTIVE] ", Style::new().fg(FG_DIM)),
+            Span::styled(
+                "[○ STANDBY // DIRECT PROBE ACTIVE] ",
+                Style::new().fg(FG_DIM),
+            ),
             Span::styled("[PROXY: 127.0.0.1:1080] ", Style::new().fg(PURPLE).bold()),
         ])
     };
@@ -1283,11 +1377,18 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
 
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(a);
     f.render_widget(Paragraph::new(left_title), rows[0]);
-    f.render_widget(Paragraph::new(right_status).alignment(Alignment::Right), rows[0]);
+    f.render_widget(
+        Paragraph::new(right_status).alignment(Alignment::Right),
+        rows[0],
+    );
     let right_len = if a.width >= 100 { 44 } else { 22 };
-    let sub_cols = Layout::horizontal([Constraint::Min(20), Constraint::Length(right_len)]).split(rows[1]);
+    let sub_cols =
+        Layout::horizontal([Constraint::Min(20), Constraint::Length(right_len)]).split(rows[1]);
     f.render_widget(Paragraph::new(sub_line), sub_cols[0]);
-    f.render_widget(Paragraph::new(right_sub).alignment(Alignment::Right), sub_cols[1]);
+    f.render_widget(
+        Paragraph::new(right_sub).alignment(Alignment::Right),
+        sub_cols[1],
+    );
 }
 
 fn ping_cell(app: &App, id: &str) -> Span<'static> {
@@ -1318,7 +1419,11 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
     let is_focused = app.focused_panel == 1;
     let mut title = format!("[1] TARGET MATRIX [ {:02} NODES ]", app.view.len());
     if !app.filter.is_empty() {
-        title = format!("[1] TARGET MATRIX [ SCAN: \"{}\"█ · {} MATCHES ]", trunc(&app.filter, 12), app.view.len());
+        title = format!(
+            "[1] TARGET MATRIX [ SCAN: \"{}\"█ · {} MATCHES ]",
+            trunc(&app.filter, 12),
+            app.view.len()
+        );
     } else if app.sort_ping {
         title = format!("[1] TARGET MATRIX [ {:02} NODES · ↑RTT ]", app.view.len());
     }
@@ -1332,16 +1437,31 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
         let msg = if app.profiles.is_empty() {
             vec![
                 Line::from(""),
-                Line::from(Span::styled("[!] NO TARGET TUNNELS CONFIGURED", Style::new().fg(YELLOW).bold())),
+                Line::from(Span::styled(
+                    "[!] NO TARGET TUNNELS CONFIGURED",
+                    Style::new().fg(YELLOW).bold(),
+                )),
                 Line::from(""),
-                Line::from(Span::styled("  A  // INJECT LINK · SUBSCRIPTION · FILE", Style::new().fg(CYAN))),
-                Line::from(Span::styled("  V  // INJECT TARGET FROM CLIPBOARD", Style::new().fg(FG_DIM))),
+                Line::from(Span::styled(
+                    "  A  // INJECT LINK · SUBSCRIPTION · FILE",
+                    Style::new().fg(CYAN),
+                )),
+                Line::from(Span::styled(
+                    "  V  // INJECT TARGET FROM CLIPBOARD",
+                    Style::new().fg(FG_DIM),
+                )),
             ]
         } else {
             vec![
                 Line::from(""),
-                Line::from(Span::styled("[!] PATTERN SCAN: NO MATCHING TARGETS", Style::new().fg(RED).bold())),
-                Line::from(Span::styled("  ESC // CLEAR SCAN FILTER", Style::new().fg(FG_DIM))),
+                Line::from(Span::styled(
+                    "[!] PATTERN SCAN: NO MATCHING TARGETS",
+                    Style::new().fg(RED).bold(),
+                )),
+                Line::from(Span::styled(
+                    "  ESC // CLEAR SCAN FILTER",
+                    Style::new().fg(FG_DIM),
+                )),
             ]
         };
         f.render_widget(Paragraph::new(msg).alignment(Alignment::Center), inner);
@@ -1363,9 +1483,15 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
             let name = trunc(&p.name, nw);
             let pad = nw.saturating_sub(name.chars().count());
             Line::from(vec![
-                Span::styled(if on { "[●] " } else { "[○] " }, Style::new().fg(if on { GREEN } else { DIM }).bold()),
+                Span::styled(
+                    if on { "[●] " } else { "[○] " },
+                    Style::new().fg(if on { GREEN } else { DIM }).bold(),
+                ),
                 Span::styled(num, Style::new().fg(if on { GREEN } else { FG_DIM })),
-                Span::styled(name.into_owned(), Style::new().fg(if on { GREEN } else { FG }).bold()),
+                Span::styled(
+                    name.into_owned(),
+                    Style::new().fg(if on { GREEN } else { FG }).bold(),
+                ),
                 Span::raw(spaces(pad + 1)),
                 ping_cell(app, &p.id),
                 Span::raw(" "),
@@ -1381,8 +1507,18 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, area, &mut app.list);
 }
 
-fn circuit_diagram(local_iface: &str, node: &str, cipher: &str, exit_ip: &str, width: usize) -> Line<'static> {
-    let clean_exit = if exit_ip.is_empty() { "ANALYZING..." } else { exit_ip };
+fn circuit_diagram(
+    local_iface: &str,
+    node: &str,
+    cipher: &str,
+    exit_ip: &str,
+    width: usize,
+) -> Line<'static> {
+    let clean_exit = if exit_ip.is_empty() {
+        "ANALYZING..."
+    } else {
+        exit_ip
+    };
     if width >= 58 {
         let fixed = 2 + local_iface.len() + 6 + cipher.len() + 7 + 7 + clean_exit.len() + 4;
         let max_node_w = width.saturating_sub(fixed).max(6);
@@ -1392,7 +1528,10 @@ fn circuit_diagram(local_iface: &str, node: &str, cipher: &str, exit_ip: &str, w
             Span::styled("] ══[ ", Style::new().fg(BORDER)),
             Span::styled(cipher.to_string(), Style::new().fg(PURPLE).bold()),
             Span::styled(" ]══► [", Style::new().fg(BORDER)),
-            Span::styled(trunc(node, max_node_w).into_owned(), Style::new().fg(FG).bold()),
+            Span::styled(
+                trunc(node, max_node_w).into_owned(),
+                Style::new().fg(FG).bold(),
+            ),
             Span::styled("] ══► [", Style::new().fg(BORDER)),
             Span::styled(clean_exit.to_string(), Style::new().fg(GREEN).bold()),
             Span::styled(" 🌐]", Style::new().fg(GREEN)),
@@ -1421,7 +1560,10 @@ fn circuit_diagram_direct(width: usize) -> Line<'static> {
     if width >= 66 {
         Line::from(vec![
             Span::styled(" [LOCAL: DIRECT] ", Style::new().fg(DIM)),
-            Span::styled("──────[ UNENCRYPTED CLEAR-NET ]──────► ", Style::new().fg(RED).bold()),
+            Span::styled(
+                "──────[ UNENCRYPTED CLEAR-NET ]──────► ",
+                Style::new().fg(RED).bold(),
+            ),
             Span::styled("[PUBLIC GATEWAY]", Style::new().fg(DIM)),
         ])
     } else if width >= 50 {
@@ -1441,7 +1583,10 @@ fn circuit_diagram_direct(width: usize) -> Line<'static> {
 
 fn kv<'a>(k: &str, v: impl Into<Cow<'a, str>>, c: Color) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!(" {:<11} ", k.to_ascii_uppercase()), Style::new().fg(FG_DIM).bold()),
+        Span::styled(
+            format!(" {:<11} ", k.to_ascii_uppercase()),
+            Style::new().fg(FG_DIM).bold(),
+        ),
         Span::styled("► ", Style::new().fg(BORDER_ACTIVE)),
         Span::styled(v.into(), Style::new().fg(c).bold()),
     ])
@@ -1455,7 +1600,10 @@ fn spark(f: &mut Frame, r: Rect, data: &[u64], c: Color) {
 
 fn info(f: &mut Frame, area: Rect, app: &App) {
     if app.show_log {
-        let blk = block("0x04 // [2] KERNEL AUDIT & CORE LOGS", app.focused_panel == 2);
+        let blk = block(
+            "0x04 // [2] KERNEL AUDIT & CORE LOGS",
+            app.focused_panel == 2,
+        );
         let inner = blk.inner(area);
         f.render_widget(blk, area);
         let inner = inner.inner(Margin::new(1, 1));
@@ -1463,13 +1611,24 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
             .into_iter()
             .map(|l| {
                 let lower = l.to_lowercase();
-                let (prefix, c) = if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
+                let (prefix, c) = if lower.contains("error")
+                    || lower.contains("fatal")
+                    || lower.contains("panic")
+                {
                     ("[✕ ALERT] ", RED)
                 } else if lower.contains("warn") {
                     ("[! WARN ] ", YELLOW)
-                } else if lower.contains("connected") || lower.contains("ready") || lower.contains("success") || lower.contains("started") {
+                } else if lower.contains("connected")
+                    || lower.contains("ready")
+                    || lower.contains("success")
+                    || lower.contains("started")
+                {
                     ("[✔ OK   ] ", GREEN)
-                } else if lower.contains("dns") || lower.contains("route") || lower.contains("tun") || lower.contains("inbound") {
+                } else if lower.contains("dns")
+                    || lower.contains("route")
+                    || lower.contains("tun")
+                    || lower.contains("inbound")
+                {
                     ("[◈ NET  ] ", CYAN)
                 } else {
                     ("[· CORE ] ", FG_DIM)
@@ -1491,7 +1650,13 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         _ => None,
     };
     let Some((name, kind, server)) = shown else {
-        f.render_widget(block("0x02 // [2] TELEMETRY // NO SELECTION", app.focused_panel == 2), area);
+        f.render_widget(
+            block(
+                "0x02 // [2] TELEMETRY // NO SELECTION",
+                app.focused_panel == 2,
+            ),
+            area,
+        );
         return;
     };
 
@@ -1506,27 +1671,80 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![];
     match &app.session {
         Some(s) => {
-            let cipher_tag = if inner.width >= 72 { "CHACHA20-POLY1305" } else { "CHACHA20" };
-            lines.push(circuit_diagram(&s.iface, &s.server, cipher_tag, &app.ip, inner.width as usize));
+            let cipher_tag = if inner.width >= 72 {
+                "CHACHA20-POLY1305"
+            } else {
+                "CHACHA20"
+            };
+            lines.push(circuit_diagram(
+                &s.iface,
+                &s.server,
+                cipher_tag,
+                &app.ip,
+                inner.width as usize,
+            ));
             lines.push(Line::from(""));
             lines.push(kv("status", "● ENGAGED // ENCRYPTED TUNNEL ACTIVE", GREEN));
             lines.push(kv("target", trunc(&name, nw), FG));
-            lines.push(kv("protocol", format!("{} [STRICT-ROUTE / TUN]", s.kind.tag()), kind_color(s.kind)));
+            lines.push(kv(
+                "protocol",
+                format!("{} [STRICT-ROUTE / TUN]", s.kind.tag()),
+                kind_color(s.kind),
+            ));
             lines.push(kv("endpoint", trunc(&server, nw), FG));
-            lines.push(kv("exit ip", if app.ip.is_empty() { "ANALYZING IP..." } else { &app.ip }, CYAN));
-            lines.push(kv("uptime", format!("{} [SESSION: 0x{:04X}]", fmt_dur(tunnel::now().saturating_sub(s.since)), s.pid.unwrap_or(0) & 0xFFFF), FG_DIM));
+            lines.push(kv(
+                "exit ip",
+                if app.ip.is_empty() {
+                    "ANALYZING IP..."
+                } else {
+                    &app.ip
+                },
+                CYAN,
+            ));
+            lines.push(kv(
+                "uptime",
+                format!(
+                    "{} [SESSION: 0x{:04X}]",
+                    fmt_dur(tunnel::now().saturating_sub(s.since)),
+                    s.pid.unwrap_or(0) & 0xFFFF
+                ),
+                FG_DIM,
+            ));
             lines.push(match app.rtt {
-                Some(ms) => kv("latency", format!("{ms} ms [REALTIME ICMP ECHO]"), ms_color(ms)),
+                Some(ms) => kv(
+                    "latency",
+                    format!("{ms} ms [REALTIME ICMP ECHO]"),
+                    ms_color(ms),
+                ),
                 None => kv("latency", "PROBING ICMP...", FG_DIM),
             });
-            lines.push(kv("proxy", "127.0.0.1:1080 [SOCKS5 / HTTP MIXED BRIDGE]", PURPLE));
-            lines.push(kv("shield", if app.shield_armed || shield::is_armed() { "ARMED // STRICT LEAK-PREVENTION ACTIVE" } else { "OFF // CLEAR-NET UNPROTECTED ON DROP" }, if app.shield_armed || shield::is_armed() { GREEN } else { RED }));
+            lines.push(kv(
+                "proxy",
+                "127.0.0.1:1080 [SOCKS5 / HTTP MIXED BRIDGE]",
+                PURPLE,
+            ));
+            lines.push(kv(
+                "shield",
+                if app.shield_armed || shield::is_armed() {
+                    "ARMED // STRICT LEAK-PREVENTION ACTIVE"
+                } else {
+                    "OFF // CLEAR-NET UNPROTECTED ON DROP"
+                },
+                if app.shield_armed || shield::is_armed() {
+                    GREEN
+                } else {
+                    RED
+                },
+            ));
         }
         None => {
             lines.push(circuit_diagram_direct(inner.width as usize));
             lines.push(Line::from(vec![
                 Span::styled("  [!] ALERT: ", Style::new().fg(RED).bold()),
-                Span::styled("INTERNET TRAFFIC UNPROTECTED · LOCAL IP VISIBLE", Style::new().fg(FG_DIM)),
+                Span::styled(
+                    "INTERNET TRAFFIC UNPROTECTED · LOCAL IP VISIBLE",
+                    Style::new().fg(FG_DIM),
+                ),
             ]));
             lines.push(Line::from(""));
             lines.push(kv("status", "○ STANDBY // ROUTE DISENGAGED", FG_DIM));
@@ -1535,12 +1753,28 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
             lines.push(kv("endpoint", trunc(&server, nw), FG));
             let id = sel.map(|p| p.id.as_str()).unwrap_or("");
             lines.push(match app.pings.get(id) {
-                Some(Ping::Ms(ms)) => kv("probe rtt", format!("{ms} ms [TELEMETRY OPTIMAL]"), ms_color(*ms)),
+                Some(Ping::Ms(ms)) => kv(
+                    "probe rtt",
+                    format!("{ms} ms [TELEMETRY OPTIMAL]"),
+                    ms_color(*ms),
+                ),
                 Some(Ping::Timeout) => kv("probe rtt", "UNREACHABLE / TIMEOUT [✕]", RED),
                 None => kv("probe rtt", "NO TELEMETRY [PRESS T TO PROBE]", FG_DIM),
             });
             lines.push(kv("proxy", "127.0.0.1:1080 [READY ON TUNNEL UP]", DIM));
-            lines.push(kv("shield", if app.shield_armed || shield::is_armed() { "ARMED // WILL ENGAGE ON CONNECT" } else { "OFF // DISARMED" }, if app.shield_armed || shield::is_armed() { GREEN } else { RED }));
+            lines.push(kv(
+                "shield",
+                if app.shield_armed || shield::is_armed() {
+                    "ARMED // WILL ENGAGE ON CONNECT"
+                } else {
+                    "OFF // DISARMED"
+                },
+                if app.shield_armed || shield::is_armed() {
+                    GREEN
+                } else {
+                    RED
+                },
+            ));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("  [⏎] ENGAGE NODE  ", Style::new().fg(CYAN).bold()),
@@ -1570,16 +1804,25 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         .split(inner);
         let dn = app.down.last().copied().unwrap_or(0);
         let upn = app.up.last().copied().unwrap_or(0);
-        let tot = app.last.map(|(r, t)| (r.saturating_sub(app.base.0), t.saturating_sub(app.base.1))).unwrap_or((0, 0));
+        let tot = app
+            .last
+            .map(|(r, t)| (r.saturating_sub(app.base.0), t.saturating_sub(app.base.1)))
+            .unwrap_or((0, 0));
         let line = if inner.width >= 62 {
             Line::from(vec![
                 Span::styled("RX SPEED ► ", Style::new().fg(CYAN).bold()),
                 Span::styled(format!("{}/s", fmt_bytes(dn)), Style::new().fg(FG).bold()),
-                Span::styled(format!(" [PEAK: {}/s]", fmt_bytes(app.down_peak)), Style::new().fg(FG_DIM)),
+                Span::styled(
+                    format!(" [PEAK: {}/s]", fmt_bytes(app.down_peak)),
+                    Style::new().fg(FG_DIM),
+                ),
                 Span::raw("   "),
                 Span::styled("TX SPEED ▲ ", Style::new().fg(PURPLE).bold()),
                 Span::styled(format!("{}/s", fmt_bytes(upn)), Style::new().fg(FG).bold()),
-                Span::styled(format!(" [PEAK: {}/s]", fmt_bytes(app.up_peak)), Style::new().fg(FG_DIM)),
+                Span::styled(
+                    format!(" [PEAK: {}/s]", fmt_bytes(app.up_peak)),
+                    Style::new().fg(FG_DIM),
+                ),
             ])
         } else {
             Line::from(vec![
@@ -1592,13 +1835,19 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         let sub = if inner.width >= 62 {
             Line::from(vec![
                 Span::styled("CUMULATIVE: ", Style::new().fg(DIM).bold()),
-                Span::styled(format!("RX {} · TX {}", fmt_bytes(tot.0), fmt_bytes(tot.1)), Style::new().fg(FG_DIM)),
+                Span::styled(
+                    format!("RX {} · TX {}", fmt_bytes(tot.0), fmt_bytes(tot.1)),
+                    Style::new().fg(FG_DIM),
+                ),
                 Span::styled("  │  MTU: 9000  │  BBR: ENGAGED", Style::new().fg(GREEN)),
             ])
         } else {
             Line::from(vec![
                 Span::styled("TOTAL: ", Style::new().fg(DIM)),
-                Span::styled(format!("RX {} · TX {}", fmt_bytes(tot.0), fmt_bytes(tot.1)), Style::new().fg(FG_DIM)),
+                Span::styled(
+                    format!("RX {} · TX {}", fmt_bytes(tot.0), fmt_bytes(tot.1)),
+                    Style::new().fg(FG_DIM),
+                ),
             ])
         };
         f.render_widget(Paragraph::new(line), rows[0]);
@@ -1608,10 +1857,15 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         let (lo, hi) = (app.rtt_hist.iter().min(), app.rtt_hist.iter().max());
         let cur_rtt = app.rtt.unwrap_or(0);
         let rtt_txt = match (lo, hi) {
-            (Some(l), Some(h)) => format!("⌁ RTT JITTER SPECTRUM   MIN {l}ms · CUR {cur_rtt}ms · MAX {h}ms   [ICMP ECHO]"),
+            (Some(l), Some(h)) => format!(
+                "⌁ RTT JITTER SPECTRUM   MIN {l}ms · CUR {cur_rtt}ms · MAX {h}ms   [ICMP ECHO]"
+            ),
             _ => "⌁ RTT JITTER SPECTRUM".to_string(),
         };
-        f.render_widget(Paragraph::new(Span::styled(rtt_txt, Style::new().fg(FG_DIM).bold())), rows[4]);
+        f.render_widget(
+            Paragraph::new(Span::styled(rtt_txt, Style::new().fg(FG_DIM).bold())),
+            rows[4],
+        );
         spark(f, rows[5], &app.rtt_hist, YELLOW);
     } else {
         let blk = block("0x03 // [3] TARGET PARAMETERS", app.focused_panel == 3);
@@ -1634,7 +1888,10 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
 
         if inner.height >= 9 && inner.width >= 60 {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(" ┌─[ TARGET VECTOR INTELLIGENCE ]──────────────────────────┐", Style::new().fg(BORDER))));
+            lines.push(Line::from(Span::styled(
+                " ┌─[ TARGET VECTOR INTELLIGENCE ]──────────────────────────┐",
+                Style::new().fg(BORDER),
+            )));
             lines.push(Line::from(vec![
                 Span::styled(" │ CORE: ", Style::new().fg(BORDER)),
                 Span::styled("sing-box/bpf       ", Style::new().fg(CYAN)),
@@ -1649,26 +1906,38 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled("KILL-SWITCH ARMED  ", Style::new().fg(PURPLE)),
                 Span::styled("│", Style::new().fg(BORDER)),
             ]));
-            lines.push(Line::from(Span::styled(" └────────────────────────────────────────────────────────┘", Style::new().fg(BORDER))));
+            lines.push(Line::from(Span::styled(
+                " └────────────────────────────────────────────────────────┘",
+                Style::new().fg(BORDER),
+            )));
         }
         f.render_widget(Paragraph::new(lines), inner);
     }
 }
 
 fn flows_table(f: &mut Frame, area: Rect, app: &App) {
-    let blk = block(&format!("0x03 // [3] PACKET FLOWS [ {:02} ACTIVE ]", app.flows.len()), app.focused_panel == 3);
+    let blk = block(
+        &format!("0x03 // [3] PACKET FLOWS [ {:02} ACTIVE ]", app.flows.len()),
+        app.focused_panel == 3,
+    );
     let inner = blk.inner(area).inner(Margin::new(1, 0));
     f.render_widget(blk, area);
 
     if app.flows.is_empty() {
         let msg = vec![
             Line::from(""),
-            Line::from(Span::styled("[○] NO ACTIVE FLOWS INTERCEPTED // SYSTEM IDLE", Style::new().fg(FG_DIM).bold())),
+            Line::from(Span::styled(
+                "[○] NO ACTIVE FLOWS INTERCEPTED // SYSTEM IDLE",
+                Style::new().fg(FG_DIM).bold(),
+            )),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  ◈ SOCKS5/HTTP PROXY: ", Style::new().fg(DIM).bold()),
                 Span::styled("127.0.0.1:1080", Style::new().fg(CYAN).bold()),
-                Span::styled(" (READY FOR BURP / NMAP / CURL / PROXYCHAINS)", Style::new().fg(FG_DIM)),
+                Span::styled(
+                    " (READY FOR BURP / NMAP / CURL / PROXYCHAINS)",
+                    Style::new().fg(FG_DIM),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("  ◈ CLASH API BRIDGE : ", Style::new().fg(DIM).bold()),
@@ -1676,9 +1945,10 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(" (TRAFFIC CONTROLLER READY)", Style::new().fg(FG_DIM)),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("  [F] TOGGLE SPECTRUM / FLOWS  ·  [W] BENCHMARK SPEED", Style::new().fg(FG_DIM)),
-            ]),
+            Line::from(vec![Span::styled(
+                "  [F] TOGGLE SPECTRUM / FLOWS  ·  [W] BENCHMARK SPEED",
+                Style::new().fg(FG_DIM),
+            )]),
         ];
         f.render_widget(Paragraph::new(msg), inner);
         return;
@@ -1702,7 +1972,10 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
         ])
     };
     lines.push(header_line);
-    lines.push(Line::from(Span::styled(" ─────────────────────────────────────────────────────────────────────────────", Style::new().fg(BORDER))));
+    lines.push(Line::from(Span::styled(
+        " ─────────────────────────────────────────────────────────────────────────────",
+        Style::new().fg(BORDER),
+    )));
 
     let max_rows = (inner.height as usize).saturating_sub(2);
     for flow in app.flows.iter().take(max_rows) {
@@ -1719,17 +1992,42 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
         };
         if inner.width >= 70 {
             lines.push(Line::from(vec![
-                Span::styled(format!(" {:<5} ", proto), Style::new().fg(if proto == "TCP" { CYAN } else { PURPLE }).bold()),
-                Span::styled(format!("{:<18} ", trunc(&flow.source, 17)), Style::new().fg(FG_DIM)),
-                Span::styled(format!("{:<24} ", trunc(target, 23)), Style::new().fg(FG).bold()),
-                Span::styled(format!("{:<10} ", trunc(&flow.process, 9)), Style::new().fg(YELLOW)),
+                Span::styled(
+                    format!(" {:<5} ", proto),
+                    Style::new()
+                        .fg(if proto == "TCP" { CYAN } else { PURPLE })
+                        .bold(),
+                ),
+                Span::styled(
+                    format!("{:<18} ", trunc(&flow.source, 17)),
+                    Style::new().fg(FG_DIM),
+                ),
+                Span::styled(
+                    format!("{:<24} ", trunc(target, 23)),
+                    Style::new().fg(FG).bold(),
+                ),
+                Span::styled(
+                    format!("{:<10} ", trunc(&flow.process, 9)),
+                    Style::new().fg(YELLOW),
+                ),
                 Span::styled(stats, Style::new().fg(GREEN)),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(format!(" {:<5} ", proto), Style::new().fg(if proto == "TCP" { CYAN } else { PURPLE }).bold()),
-                Span::styled(format!("{:<21} ", trunc(target, 20)), Style::new().fg(FG).bold()),
-                Span::styled(format!("{:<10} ", trunc(&flow.process, 9)), Style::new().fg(YELLOW)),
+                Span::styled(
+                    format!(" {:<5} ", proto),
+                    Style::new()
+                        .fg(if proto == "TCP" { CYAN } else { PURPLE })
+                        .bold(),
+                ),
+                Span::styled(
+                    format!("{:<21} ", trunc(target, 20)),
+                    Style::new().fg(FG).bold(),
+                ),
+                Span::styled(
+                    format!("{:<10} ", trunc(&flow.process, 9)),
+                    Style::new().fg(YELLOW),
+                ),
                 Span::styled(stats, Style::new().fg(GREEN)),
             ]));
         }
@@ -1748,7 +2046,10 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
             (" [✕ ALERT / ERROR] >> ", RED)
         };
         let text = format!("{tag}{}", trunc(m, (a.width as usize).saturating_sub(25)));
-        f.render_widget(Paragraph::new(Span::styled(text, Style::new().fg(c).bold())), a);
+        f.render_widget(
+            Paragraph::new(Span::styled(text, Style::new().fg(c).bold())),
+            a,
+        );
         return;
     }
     match &app.mode {
@@ -1789,8 +2090,16 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
             let is_connected = app.session.is_some();
             let shield_armed = app.shield_armed || shield::is_armed();
 
-            let space_desc = if is_connected { "disconnect" } else { "connect" };
-            let shield_desc = if shield_armed { "shield:armed" } else { "shield:off" };
+            let space_desc = if is_connected {
+                "disconnect"
+            } else {
+                "connect"
+            };
+            let shield_desc = if shield_armed {
+                "shield:armed"
+            } else {
+                "shield:off"
+            };
 
             let hints: [(&str, &str); 8] = [
                 ("Enter", "connect"),
@@ -1866,7 +2175,10 @@ fn confirm_popup(f: &mut Frame, area: Rect, app: &App, kind: ConfirmKind) {
                 .border_style(Style::new().fg(RED))
                 .title(Line::from(vec![
                     Span::styled(" ◈ [ ", Style::new().fg(RED)),
-                    Span::styled("0xDEL // TARGET PURGE CONFIRMATION", Style::new().fg(RED).bold()),
+                    Span::styled(
+                        "0xDEL // TARGET PURGE CONFIRMATION",
+                        Style::new().fg(RED).bold(),
+                    ),
                     Span::styled(" ] ", Style::new().fg(RED)),
                 ]));
             let inner = blk.inner(r).inner(Margin::new(2, 1));
@@ -1878,7 +2190,10 @@ fn confirm_popup(f: &mut Frame, area: Rect, app: &App, kind: ConfirmKind) {
                 ]),
                 Line::from(vec![
                     Span::styled("TARGET: ", Style::new().fg(FG_DIM)),
-                    Span::styled(trunc(&p.name, (inner.width as usize).saturating_sub(10)), Style::new().fg(YELLOW).bold()),
+                    Span::styled(
+                        trunc(&p.name, (inner.width as usize).saturating_sub(10)),
+                        Style::new().fg(YELLOW).bold(),
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![
@@ -1892,13 +2207,20 @@ fn confirm_popup(f: &mut Frame, area: Rect, app: &App, kind: ConfirmKind) {
             f.render_widget(Paragraph::new(lines), inner);
         }
         ConfirmKind::QuitWhileConnected => {
-            let s_name = app.session.as_ref().map(|s| s.name.as_str()).unwrap_or("ACTIVE TUNNEL");
+            let s_name = app
+                .session
+                .as_ref()
+                .map(|s| s.name.as_str())
+                .unwrap_or("ACTIVE TUNNEL");
             let blk = Block::bordered()
                 .border_type(BorderType::Plain)
                 .border_style(Style::new().fg(YELLOW))
                 .title(Line::from(vec![
                     Span::styled(" ◈ [ ", Style::new().fg(YELLOW)),
-                    Span::styled("0xQUIT // TUNNEL RUNNING CONFIRMATION", Style::new().fg(YELLOW).bold()),
+                    Span::styled(
+                        "0xQUIT // TUNNEL RUNNING CONFIRMATION",
+                        Style::new().fg(YELLOW).bold(),
+                    ),
                     Span::styled(" ] ", Style::new().fg(YELLOW)),
                 ]));
             let inner = blk.inner(r).inner(Margin::new(2, 1));
@@ -1906,9 +2228,15 @@ fn confirm_popup(f: &mut Frame, area: Rect, app: &App, kind: ConfirmKind) {
             let lines = vec![
                 Line::from(vec![
                     Span::styled("[!] ACTIVE LINK: ", Style::new().fg(YELLOW).bold()),
-                    Span::styled(trunc(s_name, (inner.width as usize).saturating_sub(18)), Style::new().fg(FG).bold()),
+                    Span::styled(
+                        trunc(s_name, (inner.width as usize).saturating_sub(18)),
+                        Style::new().fg(FG).bold(),
+                    ),
                 ]),
-                Line::from(Span::styled("Choose termination policy before console detach:", Style::new().fg(FG_DIM))),
+                Line::from(Span::styled(
+                    "Choose termination policy before console detach:",
+                    Style::new().fg(FG_DIM),
+                )),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  [", Style::new().fg(FG_DIM)),
@@ -1932,7 +2260,9 @@ fn confirm_popup(f: &mut Frame, area: Rect, app: &App, kind: ConfirmKind) {
 }
 
 fn time_ago(ts: Option<u64>) -> String {
-    let Some(ts) = ts else { return "never".to_string() };
+    let Some(ts) = ts else {
+        return "never".to_string();
+    };
     let diff = crate::tunnel::now().saturating_sub(ts);
     if diff < 60 {
         format!("{diff}s ago")
@@ -1945,7 +2275,13 @@ fn time_ago(ts: Option<u64>) -> String {
     }
 }
 
-fn qr_popup(f: &mut Frame, area: Rect, p: &Profile, qr: &Result<String, String>, exported: Option<&str>) {
+fn qr_popup(
+    f: &mut Frame,
+    area: Rect,
+    p: &Profile,
+    qr: &Result<String, String>,
+    exported: Option<&str>,
+) {
     let w = (area.width.saturating_sub(2)).min(94);
     let h = (area.height.saturating_sub(2)).min(32);
     let r = Rect {
@@ -1967,11 +2303,7 @@ fn qr_popup(f: &mut Frame, area: Rect, p: &Profile, qr: &Result<String, String>,
         ])
         .split(inner)
     } else {
-        Layout::vertical([
-            Constraint::Percentage(55),
-            Constraint::Percentage(45),
-        ])
-        .split(inner)
+        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(inner)
     };
 
     let qr_blk = Block::bordered()
@@ -1996,12 +2328,21 @@ fn qr_popup(f: &mut Frame, area: Rect, p: &Profile, qr: &Result<String, String>,
         Err(e) => {
             let warn = vec![
                 Line::from(""),
-                Line::from(Span::styled("[!] QR CODE PAYLOAD LIMIT EXCEEDED", Style::new().fg(YELLOW).bold())),
+                Line::from(Span::styled(
+                    "[!] QR CODE PAYLOAD LIMIT EXCEEDED",
+                    Style::new().fg(YELLOW).bold(),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(e.clone(), Style::new().fg(FG_DIM))),
                 Line::from(""),
-                Line::from(Span::styled("Use [C] to copy raw config to clipboard,", Style::new().fg(FG))),
-                Line::from(Span::styled("or [S] to export directly to disk.", Style::new().fg(FG))),
+                Line::from(Span::styled(
+                    "Use [C] to copy raw config to clipboard,",
+                    Style::new().fg(FG),
+                )),
+                Line::from(Span::styled(
+                    "or [S] to export directly to disk.",
+                    Style::new().fg(FG),
+                )),
             ];
             f.render_widget(Paragraph::new(warn), qr_inner);
         }
@@ -2021,11 +2362,17 @@ fn qr_popup(f: &mut Frame, area: Rect, p: &Profile, qr: &Result<String, String>,
     let mut lines = vec![
         Line::from(vec![
             Span::styled(" IDENTIFIER : ", Style::new().fg(CYAN).bold()),
-            Span::styled(trunc(&p.name, (det_inner.width as usize).saturating_sub(15)), Style::new().fg(FG).bold()),
+            Span::styled(
+                trunc(&p.name, (det_inner.width as usize).saturating_sub(15)),
+                Style::new().fg(FG).bold(),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" PROTOCOL   : ", Style::new().fg(CYAN).bold()),
-            Span::styled(format!("{} ", p.kind.tag()), Style::new().fg(kind_color(p.kind)).bold()),
+            Span::styled(
+                format!("{} ", p.kind.tag()),
+                Style::new().fg(kind_color(p.kind)).bold(),
+            ),
             Span::styled(format!("({})", p.id), Style::new().fg(FG_DIM)),
         ]),
         Line::from(vec![
@@ -2036,7 +2383,10 @@ fn qr_popup(f: &mut Frame, area: Rect, p: &Profile, qr: &Result<String, String>,
 
     for (k, v) in store::details(p) {
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:<11}: ", k.to_uppercase()), Style::new().fg(FG_DIM)),
+            Span::styled(
+                format!(" {:<11}: ", k.to_uppercase()),
+                Style::new().fg(FG_DIM),
+            ),
             Span::styled(v, Style::new().fg(FG)),
         ]));
     }
@@ -2045,7 +2395,10 @@ fn qr_popup(f: &mut Frame, area: Rect, p: &Profile, qr: &Result<String, String>,
     let exp_status = if let Some(path) = exported {
         Line::from(vec![
             Span::styled(" EXPORT FILE: ", Style::new().fg(GREEN).bold()),
-            Span::styled(trunc(path, (det_inner.width as usize).saturating_sub(15)), Style::new().fg(GREEN)),
+            Span::styled(
+                trunc(path, (det_inner.width as usize).saturating_sub(15)),
+                Style::new().fg(GREEN),
+            ),
         ])
     } else {
         Line::from(vec![
@@ -2056,7 +2409,10 @@ fn qr_popup(f: &mut Frame, area: Rect, p: &Profile, qr: &Result<String, String>,
     lines.push(exp_status);
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(" ── ACTION CONTROLS ─────────────────", Style::new().fg(BORDER))));
+    lines.push(Line::from(Span::styled(
+        " ── ACTION CONTROLS ─────────────────",
+        Style::new().fg(BORDER),
+    )));
     lines.push(Line::from(vec![
         Span::styled(" [C] ", Style::new().fg(CYAN).bold()),
         Span::styled("COPY FULL PAYLOAD TO CLIPBOARD", Style::new().fg(FG)),
@@ -2101,14 +2457,23 @@ fn subs_popup(f: &mut Frame, area: Rect, list: &mut ListState, subs: &[store::Su
         Span::styled("LAST SYNC     ", Style::new().fg(CYAN).bold()),
         Span::styled("ENDPOINT URL", Style::new().fg(CYAN).bold()),
     ]);
-    let sep = Line::from(Span::styled(" ─────────────────────────────────────────────────────────────────────────────", Style::new().fg(BORDER)));
+    let sep = Line::from(Span::styled(
+        " ─────────────────────────────────────────────────────────────────────────────",
+        Style::new().fg(BORDER),
+    ));
     f.render_widget(Paragraph::new(vec![header_line, sep]), rows[0]);
 
     if subs.is_empty() {
         let empty_msg = vec![
             Line::from(""),
-            Line::from(Span::styled("  [!] NO REMOTE SUBSCRIPTIONS REGISTERED", Style::new().fg(YELLOW).bold())),
-            Line::from(Span::styled("  PRESS [A] TO INJECT A SUBSCRIPTION URL (e.g. https://...)", Style::new().fg(FG_DIM))),
+            Line::from(Span::styled(
+                "  [!] NO REMOTE SUBSCRIPTIONS REGISTERED",
+                Style::new().fg(YELLOW).bold(),
+            )),
+            Line::from(Span::styled(
+                "  PRESS [A] TO INJECT A SUBSCRIPTION URL (e.g. https://...)",
+                Style::new().fg(FG_DIM),
+            )),
         ];
         f.render_widget(Paragraph::new(empty_msg), rows[1]);
     } else {
@@ -2119,7 +2484,10 @@ fn subs_popup(f: &mut Frame, area: Rect, list: &mut ListState, subs: &[store::Su
                 let up = time_ago(s.updated);
                 let line = Line::from(vec![
                     Span::styled(format!(" {:>2}  ", i + 1), Style::new().fg(BORDER)),
-                    Span::styled(format!("{:<24} ", trunc(&s.name, 23)), Style::new().fg(FG).bold()),
+                    Span::styled(
+                        format!("{:<24} ", trunc(&s.name, 23)),
+                        Style::new().fg(FG).bold(),
+                    ),
                     Span::styled(format!("{:>4} nodes  ", s.count), Style::new().fg(GREEN)),
                     Span::styled(format!("{:<13} ", up), Style::new().fg(FG_DIM)),
                     Span::styled(trunc(&s.url, 26), Style::new().fg(BLUE)),
@@ -2159,7 +2527,10 @@ fn recon_popup(f: &mut Frame, area: Rect, report_res: &Result<ReconReport, Strin
         height: h,
     };
     f.render_widget(Clear, r);
-    let blk = block("0xRC // DEEP NODE RECONNAISSANCE & TLS FINGERPRINT REPORT", true);
+    let blk = block(
+        "0xRC // DEEP NODE RECONNAISSANCE & TLS FINGERPRINT REPORT",
+        true,
+    );
     let inner = blk.inner(r).inner(Margin::new(1, 0));
     f.render_widget(blk, r);
 
@@ -2167,7 +2538,10 @@ fn recon_popup(f: &mut Frame, area: Rect, report_res: &Result<ReconReport, Strin
         Err(e) => {
             let lines = vec![
                 Line::from(""),
-                Line::from(Span::styled("[✕] DEEP RECON VECTOR FAILED", Style::new().fg(RED).bold())),
+                Line::from(Span::styled(
+                    "[✕] DEEP RECON VECTOR FAILED",
+                    Style::new().fg(RED).bold(),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(format!("ERROR: {e}"), Style::new().fg(FG_DIM))),
                 Line::from(""),
@@ -2191,57 +2565,133 @@ fn recon_popup(f: &mut Frame, area: Rect, report_res: &Result<ReconReport, Strin
                 ]),
                 Line::from(vec![
                     Span::styled(" REMOTE TARGET : ", Style::new().fg(CYAN).bold()),
-                    Span::styled(format!("{}:{}", rep.host, rep.port), Style::new().fg(FG).bold()),
-                    Span::styled(format!("  (ENDPOINT: {})", rep.target_endpoint), Style::new().fg(FG_DIM)),
+                    Span::styled(
+                        format!("{}:{}", rep.host, rep.port),
+                        Style::new().fg(FG).bold(),
+                    ),
+                    Span::styled(
+                        format!("  (ENDPOINT: {})", rep.target_endpoint),
+                        Style::new().fg(FG_DIM),
+                    ),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled(" ┌─[ DNS RESOLUTION & REVERSE PTR ]─────────────────────────────────┐", Style::new().fg(BORDER))),
+                Line::from(Span::styled(
+                    " ┌─[ DNS RESOLUTION & REVERSE PTR ]─────────────────────────────────┐",
+                    Style::new().fg(BORDER),
+                )),
                 Line::from(vec![
                     Span::styled(" │ RESOLVED IP(S): ", Style::new().fg(BORDER)),
-                    Span::styled(if rep.resolved_ips.is_empty() { "NONE".into() } else { rep.resolved_ips.join(", ") }, Style::new().fg(GREEN).bold()),
+                    Span::styled(
+                        if rep.resolved_ips.is_empty() {
+                            "NONE".into()
+                        } else {
+                            rep.resolved_ips.join(", ")
+                        },
+                        Style::new().fg(GREEN).bold(),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" │ REVERSE PTR   : ", Style::new().fg(BORDER)),
-                    Span::styled(rep.reverse_dns.as_deref().unwrap_or("NO_PTR_RECORD"), Style::new().fg(FG)),
+                    Span::styled(
+                        rep.reverse_dns.as_deref().unwrap_or("NO_PTR_RECORD"),
+                        Style::new().fg(FG),
+                    ),
                 ]),
-                Line::from(Span::styled(" ├─[ AUTONOMOUS SYSTEM (ASN) & GEOIP VECTOR ]────────────────────────┤", Style::new().fg(BORDER))),
+                Line::from(Span::styled(
+                    " ├─[ AUTONOMOUS SYSTEM (ASN) & GEOIP VECTOR ]────────────────────────┤",
+                    Style::new().fg(BORDER),
+                )),
                 Line::from(vec![
                     Span::styled(" │ ASN & ORG     : ", Style::new().fg(BORDER)),
-                    Span::styled(format!("{} - {}", rep.asn.as_deref().unwrap_or("N/A"), rep.org.as_deref().unwrap_or("UNKNOWN")), Style::new().fg(PURPLE).bold()),
+                    Span::styled(
+                        format!(
+                            "{} - {}",
+                            rep.asn.as_deref().unwrap_or("N/A"),
+                            rep.org.as_deref().unwrap_or("UNKNOWN")
+                        ),
+                        Style::new().fg(PURPLE).bold(),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" │ GEOLOCATION   : ", Style::new().fg(BORDER)),
-                    Span::styled(format!("{}, {} ({})", rep.city.as_deref().unwrap_or("?"), rep.country.as_deref().unwrap_or("?"), rep.loc.as_deref().unwrap_or("?")), Style::new().fg(CYAN)),
+                    Span::styled(
+                        format!(
+                            "{}, {} ({})",
+                            rep.city.as_deref().unwrap_or("?"),
+                            rep.country.as_deref().unwrap_or("?"),
+                            rep.loc.as_deref().unwrap_or("?")
+                        ),
+                        Style::new().fg(CYAN),
+                    ),
                 ]),
-                Line::from(Span::styled(" ├─[ MULTI-PROBE TCP JITTER SPECTRUM ]───────────────────────────────┤", Style::new().fg(BORDER))),
+                Line::from(Span::styled(
+                    " ├─[ MULTI-PROBE TCP JITTER SPECTRUM ]───────────────────────────────┤",
+                    Style::new().fg(BORDER),
+                )),
                 Line::from(vec![
                     Span::styled(" │ LATENCY METRIC: ", Style::new().fg(BORDER)),
-                    Span::styled(format!("MIN {}ms  ·  AVG {}ms  ·  MAX {}ms", rep.rtt_min, rep.rtt_avg, rep.rtt_max), Style::new().fg(ms_color(rep.rtt_avg)).bold()),
-                    Span::styled(format!("   JITTER DELTA: ±{}ms", rep.jitter), Style::new().fg(YELLOW).bold()),
+                    Span::styled(
+                        format!(
+                            "MIN {}ms  ·  AVG {}ms  ·  MAX {}ms",
+                            rep.rtt_min, rep.rtt_avg, rep.rtt_max
+                        ),
+                        Style::new().fg(ms_color(rep.rtt_avg)).bold(),
+                    ),
+                    Span::styled(
+                        format!("   JITTER DELTA: ±{}ms", rep.jitter),
+                        Style::new().fg(YELLOW).bold(),
+                    ),
                 ]),
-                Line::from(Span::styled(" ├─[ CRYPTOGRAPHIC TLS HANDSHAKE FINGERPRINT ]──────────────────────┤", Style::new().fg(BORDER))),
+                Line::from(Span::styled(
+                    " ├─[ CRYPTOGRAPHIC TLS HANDSHAKE FINGERPRINT ]──────────────────────┤",
+                    Style::new().fg(BORDER),
+                )),
                 Line::from(vec![
                     Span::styled(" │ TLS PROTOCOL  : ", Style::new().fg(BORDER)),
-                    Span::styled(rep.tls_version.as_deref().unwrap_or("NO_TLS_EXCHANGE"), Style::new().fg(GREEN).bold()),
+                    Span::styled(
+                        rep.tls_version.as_deref().unwrap_or("NO_TLS_EXCHANGE"),
+                        Style::new().fg(GREEN).bold(),
+                    ),
                     Span::styled("  CIPHER: ", Style::new().fg(BORDER)),
-                    Span::styled(rep.tls_cipher.as_deref().unwrap_or("N/A"), Style::new().fg(CYAN).bold()),
+                    Span::styled(
+                        rep.tls_cipher.as_deref().unwrap_or("N/A"),
+                        Style::new().fg(CYAN).bold(),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" │ CERT SUBJECT  : ", Style::new().fg(BORDER)),
-                    Span::styled(trunc(rep.tls_cert_subject.as_deref().unwrap_or("NONE"), nw), Style::new().fg(FG)),
+                    Span::styled(
+                        trunc(rep.tls_cert_subject.as_deref().unwrap_or("NONE"), nw),
+                        Style::new().fg(FG),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" │ CERT ISSUER   : ", Style::new().fg(BORDER)),
-                    Span::styled(trunc(rep.tls_cert_issuer.as_deref().unwrap_or("NONE"), nw), Style::new().fg(FG_DIM)),
+                    Span::styled(
+                        trunc(rep.tls_cert_issuer.as_deref().unwrap_or("NONE"), nw),
+                        Style::new().fg(FG_DIM),
+                    ),
                 ]),
-                Line::from(Span::styled(" ├─[ EXIT TRAFFIC ROUTE VERIFICATION ]──────────────────────────────┤", Style::new().fg(BORDER))),
+                Line::from(Span::styled(
+                    " ├─[ EXIT TRAFFIC ROUTE VERIFICATION ]──────────────────────────────┤",
+                    Style::new().fg(BORDER),
+                )),
                 Line::from(vec![
                     Span::styled(" │ CURRENT EXIT  : ", Style::new().fg(BORDER)),
-                    Span::styled(rep.exit_ip.as_deref().unwrap_or("UNAVAILABLE"), Style::new().fg(GREEN).bold()),
+                    Span::styled(
+                        rep.exit_ip.as_deref().unwrap_or("UNAVAILABLE"),
+                        Style::new().fg(GREEN).bold(),
+                    ),
                     Span::styled("  CF TRANSIT COLO: ", Style::new().fg(BORDER)),
-                    Span::styled(rep.exit_colo.as_deref().unwrap_or("N/A"), Style::new().fg(PURPLE).bold()),
+                    Span::styled(
+                        rep.exit_colo.as_deref().unwrap_or("N/A"),
+                        Style::new().fg(PURPLE).bold(),
+                    ),
                 ]),
-                Line::from(Span::styled(" └──────────────────────────────────────────────────────────────────┘", Style::new().fg(BORDER))),
+                Line::from(Span::styled(
+                    " └──────────────────────────────────────────────────────────────────┘",
+                    Style::new().fg(BORDER),
+                )),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled(" [R] ", Style::new().fg(CYAN).bold()),
@@ -2265,21 +2715,34 @@ fn speed_popup(f: &mut Frame, area: Rect, result: Option<&SpeedResult>, running:
         height: h,
     };
     f.render_widget(Clear, r);
-    let blk = block("0xSPD // LIVE BANDWIDTH THROUGHPUT & NETWORK BENCHMARK", true);
+    let blk = block(
+        "0xSPD // LIVE BANDWIDTH THROUGHPUT & NETWORK BENCHMARK",
+        true,
+    );
     let inner = blk.inner(r).inner(Margin::new(1, 0));
     f.render_widget(blk, r);
 
     if running {
         let lines = vec![
             Line::from(""),
-            Line::from(vec![
-                Span::styled(" ⌁ RUNNING MULTI-STREAM SATURATION BENCHMARK...", Style::new().fg(YELLOW).bold()),
-            ]),
+            Line::from(vec![Span::styled(
+                " ⌁ RUNNING MULTI-STREAM SATURATION BENCHMARK...",
+                Style::new().fg(YELLOW).bold(),
+            )]),
             Line::from(""),
-            Line::from(Span::styled("  Generating throughput load across edge CDN servers...", Style::new().fg(FG))),
-            Line::from(Span::styled("  Measuring real-world bandwidth, transfer rate, and socket performance.", Style::new().fg(FG_DIM))),
+            Line::from(Span::styled(
+                "  Generating throughput load across edge CDN servers...",
+                Style::new().fg(FG),
+            )),
+            Line::from(Span::styled(
+                "  Measuring real-world bandwidth, transfer rate, and socket performance.",
+                Style::new().fg(FG_DIM),
+            )),
             Line::from(""),
-            Line::from(Span::styled("  [!] Please standby while payload saturation completes (2-5s)...", Style::new().fg(CYAN))),
+            Line::from(Span::styled(
+                "  [!] Please standby while payload saturation completes (2-5s)...",
+                Style::new().fg(CYAN),
+            )),
         ];
         f.render_widget(Paragraph::new(lines), inner);
         return;
@@ -2289,9 +2752,15 @@ fn speed_popup(f: &mut Frame, area: Rect, result: Option<&SpeedResult>, running:
         None => {
             let lines = vec![
                 Line::from(""),
-                Line::from(Span::styled("[!] NO BENCHMARK DATA AVAILABLE", Style::new().fg(RED).bold())),
+                Line::from(Span::styled(
+                    "[!] NO BENCHMARK DATA AVAILABLE",
+                    Style::new().fg(RED).bold(),
+                )),
                 Line::from(""),
-                Line::from(Span::styled("Benchmark failed or timed out reaching edge servers.", Style::new().fg(FG_DIM))),
+                Line::from(Span::styled(
+                    "Benchmark failed or timed out reaching edge servers.",
+                    Style::new().fg(FG_DIM),
+                )),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("PRESS [", Style::new().fg(FG_DIM)),
@@ -2318,20 +2787,32 @@ fn speed_popup(f: &mut Frame, area: Rect, result: Option<&SpeedResult>, running:
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  DOWNLOAD THROUGHPUT : ", Style::new().fg(CYAN).bold()),
-                    Span::styled(format!("{:.2} Mbps", res.mbps), Style::new().fg(GREEN).bold()),
-                    Span::styled(format!("  ({:.2} MB/s)", res.mbs), Style::new().fg(FG).bold()),
+                    Span::styled(
+                        format!("{:.2} Mbps", res.mbps),
+                        Style::new().fg(GREEN).bold(),
+                    ),
+                    Span::styled(
+                        format!("  ({:.2} MB/s)", res.mbs),
+                        Style::new().fg(FG).bold(),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("  DATA TRANSFERRED    : ", Style::new().fg(CYAN).bold()),
                     Span::styled(fmt_bytes(res.bytes), Style::new().fg(FG).bold()),
-                    Span::styled(format!(" in {:.2}s window", res.duration_secs), Style::new().fg(FG_DIM)),
+                    Span::styled(
+                        format!(" in {:.2}s window", res.duration_secs),
+                        Style::new().fg(FG_DIM),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("  LINK EVALUATION     : ", Style::new().fg(CYAN).bold()),
                     Span::styled(format!("[ {tier} ]"), Style::new().fg(tier_col).bold()),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled(" ────────────────────────────────────────────────────────────────────────", Style::new().fg(BORDER))),
+                Line::from(Span::styled(
+                    " ────────────────────────────────────────────────────────────────────────",
+                    Style::new().fg(BORDER),
+                )),
                 Line::from(vec![
                     Span::styled(" [R / ENTER] ", Style::new().fg(CYAN).bold()),
                     Span::styled("RE-RUN BENCHMARK  ", Style::new().fg(FG_DIM)),
@@ -2366,12 +2847,20 @@ fn help(f: &mut Frame, area: Rect) {
             if !last_cat.is_empty() {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(Span::styled(format!(" // {}", entry.category), Style::new().fg(CYAN).bold())));
+            lines.push(Line::from(Span::styled(
+                format!(" // {}", entry.category),
+                Style::new().fg(CYAN).bold(),
+            )));
             last_cat = entry.category;
         }
         let is_primary = entry.key.contains("Enter") || entry.key.contains("Space");
         lines.push(Line::from(vec![
-            Span::styled(format!(" [{:<13}] ", entry.key), Style::new().fg(if is_primary { GREEN } else { CYAN }).bold()),
+            Span::styled(
+                format!(" [{:<13}] ", entry.key),
+                Style::new()
+                    .fg(if is_primary { GREEN } else { CYAN })
+                    .bold(),
+            ),
             Span::styled("► ", Style::new().fg(BORDER_ACTIVE)),
             Span::styled(entry.description, Style::new().fg(FG)),
         ]));
@@ -2385,14 +2874,28 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn prof(id: &str, name: &str, kind: Kind, data: &str) -> Profile {
-        Profile { id: id.into(), name: name.into(), kind, server: "203.0.113.7:443".into(), data: data.into(), auth: None, sub_id: None }
+        Profile {
+            id: id.into(),
+            name: name.into(),
+            kind,
+            server: "203.0.113.7:443".into(),
+            data: data.into(),
+            ..Default::default()
+        }
     }
 
     fn render(w: u16, h: u16, app: &mut App) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, app)).unwrap();
         let b = t.backend().buffer().clone();
-        (0..h).map(|y| (0..w).map(|x| b[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| b[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -2441,7 +2944,12 @@ mod tests {
             KeyCode::Char('w') if ctrl => {
                 let t = s.trim_end().len();
                 s.truncate(t);
-                while s.chars().last().map(|c| !c.is_whitespace()).unwrap_or(false) {
+                while s
+                    .chars()
+                    .last()
+                    .map(|c| !c.is_whitespace())
+                    .unwrap_or(false)
+                {
                     s.pop();
                 }
                 true
@@ -2460,9 +2968,15 @@ mod tests {
         let mut s = String::from("ab cd");
         assert!(edit(&mut s, &k('e')));
         assert_eq!(s, "ab cde");
-        assert!(edit(&mut s, &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+        assert!(edit(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
         assert_eq!(s, "ab ");
-        assert!(edit(&mut s, &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
+        assert!(edit(
+            &mut s,
+            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+        ));
         assert_eq!(s, "");
     }
 
@@ -2498,20 +3012,29 @@ mod tests {
 
     #[test]
     fn test_qr_generation() {
-        use qrcode::QrCode;
         use qrcode::render::unicode;
+        use qrcode::QrCode;
         let link = "vless://b6a03649-61f4-41aa-a51b-402c3cc6c547@203.0.113.7:443?security=reality&sni=example.com&pbk=1234567890abcdef1234567890abcdef1234567890a&type=grpc&serviceName=grpc-test#Frankfurt";
         let code = QrCode::new(link).unwrap();
         let qr_str = code.render::<unicode::Dense1x2>().quiet_zone(false).build();
         let lines: Vec<&str> = qr_str.lines().collect();
-        println!("QR (no quiet zone) lines: {}, width: {}", lines.len(), lines.first().map(|l| l.chars().count()).unwrap_or(0));
+        println!(
+            "QR (no quiet zone) lines: {}, width: {}",
+            lines.len(),
+            lines.first().map(|l| l.chars().count()).unwrap_or(0)
+        );
         println!("\n{qr_str}\n");
     }
 
     #[test]
     fn test_qr_modal_render() {
         let mut app = App::new();
-        let p = prof("test-qr", "Frankfurt QR", Kind::Vless, "vless://u@example.com:443?security=reality#Frankfurt");
+        let p = prof(
+            "test-qr",
+            "Frankfurt QR",
+            Kind::Vless,
+            "vless://u@example.com:443?security=reality#Frankfurt",
+        );
         let qr = store::generate_qr(&p.data).map_err(|e| format!("{e}"));
         app.qr_profile = Some(p);
         app.qr_code = Some(qr);
@@ -2529,15 +3052,14 @@ mod tests {
         let mut app = App::new();
         let mut list = ListState::default();
         list.select(Some(0));
-        let subs = vec![
-            store::Subscription {
-                id: "vip-node".into(),
-                name: "VIP Dedicated Nodes".into(),
-                url: "https://example.com/sub/token".into(),
-                count: 12,
-                updated: Some(1720000000),
-            },
-        ];
+        let subs = vec![store::Subscription {
+            id: "vip-node".into(),
+            name: "VIP Dedicated Nodes".into(),
+            url: "https://example.com/sub/token".into(),
+            count: 12,
+            updated: Some(1720000000),
+            error: None,
+        }];
         app.subs = subs;
         app.subs_list = list;
         app.mode = Mode::Subs;
@@ -2550,7 +3072,12 @@ mod tests {
     #[test]
     fn test_ui_hotkeys_navigation() {
         let mut app = App::new();
-        let p = prof("test-hk", "HotKey Node", Kind::Vless, "vless://u@example.com:443#HotKey");
+        let p = prof(
+            "test-hk",
+            "HotKey Node",
+            Kind::Vless,
+            "vless://u@example.com:443#HotKey",
+        );
         app.profiles = vec![p];
         app.rebuild();
         assert_eq!(app.view.len(), 1);
@@ -2658,18 +3185,16 @@ mod tests {
     fn test_flows_table_render() {
         let mut app = App::new();
         app.show_flows = true;
-        app.flows = vec![
-            ActiveFlow {
-                id: "flow-1".into(),
-                network: "tcp".into(),
-                host: "api.github.com:443".into(),
-                destination: "140.82.121.6:443".into(),
-                source: "127.0.0.1:48292".into(),
-                process: "curl".into(),
-                upload: 1024,
-                download: 65536,
-            },
-        ];
+        app.flows = vec![ActiveFlow {
+            id: "flow-1".into(),
+            network: "tcp".into(),
+            host: "api.github.com:443".into(),
+            destination: "140.82.121.6:443".into(),
+            source: "127.0.0.1:48292".into(),
+            process: "curl".into(),
+            upload: 1024,
+            download: 65536,
+        }];
         let p = prof("a", "Frankfurt", Kind::Vless, "vless://u@203.0.113.7:443");
         app.profiles = vec![p];
         app.view = vec![0];
