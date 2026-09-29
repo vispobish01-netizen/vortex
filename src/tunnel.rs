@@ -36,6 +36,15 @@ fn sess_path() -> String {
     format!("{RUN}/session.json")
 }
 
+fn write_session(s: &Session) -> Result<()> {
+    let _ = fs::create_dir_all(RUN);
+    let _ = fs::set_permissions(RUN, fs::Permissions::from_mode(0o755));
+    let path = sess_path();
+    fs::write(&path, serde_json::to_string(s)?)?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+    Ok(())
+}
+
 fn write_secret(path: &str, content: &str) -> Result<()> {
     fs::write(path, content)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
@@ -150,6 +159,101 @@ pub fn public_ip() -> String {
         .unwrap_or_else(|| "unreachable".into())
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ActiveFlow {
+    pub id: String,
+    pub network: String,
+    pub host: String,
+    pub destination: String,
+    pub source: String,
+    pub process: String,
+    pub upload: u64,
+    pub download: u64,
+}
+
+pub fn active_flows() -> Vec<ActiveFlow> {
+    // 1. Try sing-box clash_api controller at 127.0.0.1:9090/connections
+    if let Ok(o) = Command::new("curl").args(["-s", "--max-time", "1", "http://127.0.0.1:9090/connections"]).output() {
+        if o.status.success() {
+            if let Ok(val) = serde_json::from_slice::<Value>(&o.stdout) {
+                if let Some(conns) = val["connections"].as_array() {
+                    let mut flows = vec![];
+                    for c in conns {
+                        let id = c["id"].as_str().unwrap_or("").to_string();
+                        let net = c["metadata"]["network"].as_str().unwrap_or("tcp").to_string();
+                        let host = c["metadata"]["host"].as_str().unwrap_or("").to_string();
+                        let dst_ip = c["metadata"]["destinationIP"].as_str().unwrap_or("");
+                        let dst_p = c["metadata"]["destinationPort"].as_str().unwrap_or("");
+                        let destination = if !dst_ip.is_empty() {
+                            format!("{dst_ip}:{dst_p}")
+                        } else {
+                            host.clone()
+                        };
+                        let src_ip = c["metadata"]["sourceIP"].as_str().unwrap_or("");
+                        let src_p = c["metadata"]["sourcePort"].as_str().unwrap_or("");
+                        let source = format!("{src_ip}:{src_p}");
+                        let proc_path = c["metadata"]["processPath"].as_str().unwrap_or("");
+                        let process = if !proc_path.is_empty() {
+                            proc_path.rsplit('/').next().unwrap_or(proc_path).to_string()
+                        } else {
+                            "system".to_string()
+                        };
+                        let upload = c["upload"].as_u64().unwrap_or(0);
+                        let download = c["download"].as_u64().unwrap_or(0);
+
+                        flows.push(ActiveFlow {
+                            id,
+                            network: net,
+                            host,
+                            destination,
+                            source,
+                            process,
+                            upload,
+                            download,
+                        });
+                    }
+                    if !flows.is_empty() {
+                        return flows;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: Parse active established connections via `ss -ntp state established`
+    let mut flows = vec![];
+    if let Ok(o) = Command::new("ss").args(["-ntp", "state", "established"]).output() {
+        if o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for l in text.lines().skip(1) {
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    let local = parts.get(2).unwrap_or(&"");
+                    let peer = parts.get(3).unwrap_or(&"");
+                    let proc_info = parts.get(4).unwrap_or(&"");
+                    let proc_name = if let Some((_, rest)) = proc_info.split_once("users:((\"") {
+                        rest.split_once('"').map(|(n, _)| n).unwrap_or("unknown")
+                    } else {
+                        "kernel"
+                    };
+
+                    flows.push(ActiveFlow {
+                        id: format!("{local}->{peer}"),
+                        network: "tcp".into(),
+                        host: "".into(),
+                        destination: peer.to_string(),
+                        source: local.to_string(),
+                        process: proc_name.to_string(),
+                        upload: 0,
+                        download: 0,
+                    });
+                }
+            }
+        }
+    }
+    flows
+}
+
 // ───────────────────────── connect / disconnect ─────────────────────────
 
 #[derive(Clone, Debug)]
@@ -220,8 +324,11 @@ pub fn connect_with_credentials(p: &Profile, credentials: Option<(&str, &str)>) 
         up_wg(p)?
     };
     s.since = now();
-    write_secret(&sess_path(), &serde_json::to_string(&s)?)?;
+    write_session(&s)?;
     crate::store::set_last(&s.id);
+    if crate::shield::is_enabled_preference() {
+        let _ = crate::shield::arm(Some(&s.iface), Some(&s.server));
+    }
     Ok(s)
 }
 
@@ -240,6 +347,9 @@ pub fn disconnect() -> Result<()> {
     }
     let _ = fs::remove_file(&s.conf);
     let _ = fs::remove_file(sess_path());
+    if crate::shield::is_armed() && !crate::shield::is_enabled_preference() {
+        let _ = crate::shield::disarm();
+    }
     Ok(())
 }
 
@@ -286,12 +396,74 @@ fn session(p: &Profile, iface: &str, pid: Option<u32>, conf: &str) -> Session {
     }
 }
 
-// ───────────────────────── sing-box ─────────────────────────
+pub const PROXY_PORT: u16 = 1080;
+pub const ROUTING_FILE: &str = "/etc/vortex/routing.json";
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RoutingConfig {
+    #[serde(default = "default_true")]
+    pub bypass_lan: bool,
+    #[serde(default)]
+    pub direct_domains: Vec<String>,
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        RoutingConfig {
+            bypass_lan: true,
+            direct_domains: vec!["local".into(), "lan".into(), "home.arpa".into()],
+            blocked_domains: vec![],
+        }
+    }
+}
+
+pub fn load_routing() -> RoutingConfig {
+    fs::read_to_string(ROUTING_FILE)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_routing(cfg: &RoutingConfig) -> Result<()> {
+    fs::write(ROUTING_FILE, serde_json::to_string_pretty(cfg)?)?;
+    Ok(())
+}
 
 fn up_singbox(p: &Profile) -> Result<Session> {
     need("sing-box", "sing-box (pacman -S sing-box)")?;
     let (_, ob, _, _) = outbound(&p.data)?;
     let logp = format!("{RUN}/core.log");
+    let routing = load_routing();
+
+    let mut rules = vec![
+        json!({"action": "sniff"}),
+        json!({"protocol": "dns", "action": "hijack-dns"}),
+    ];
+
+    if !routing.blocked_domains.is_empty() {
+        rules.push(json!({
+            "domain_suffix": routing.blocked_domains,
+            "action": "reject"
+        }));
+    }
+
+    if routing.bypass_lan {
+        rules.push(json!({"ip_is_private": true, "outbound": "direct"}));
+    }
+
+    if !routing.direct_domains.is_empty() {
+        rules.push(json!({
+            "domain_suffix": routing.direct_domains,
+            "outbound": "direct"
+        }));
+    }
+
     let cfg = json!({
         "log": {"level": "warn", "timestamp": true, "output": logp},
         "dns": {
@@ -304,23 +476,31 @@ fn up_singbox(p: &Profile) -> Result<Session> {
             "strategy": "ipv4_only",
             "cache_capacity": 4096
         },
-        "inbounds": [{
-            "type": "tun", "tag": "tun-in", "interface_name": TUN_IF,
-            "address": ["172.19.0.1/30"],
-            "mtu": 9000,
-            "auto_route": true, "auto_redirect": true, "strict_route": true, "stack": "mixed",
-            "endpoint_independent_nat": true
-        }],
+        "inbounds": [
+            {
+                "type": "tun", "tag": "tun-in", "interface_name": TUN_IF,
+                "address": ["172.19.0.1/30"],
+                "mtu": 9000,
+                "auto_route": true, "auto_redirect": true, "strict_route": true, "stack": "mixed",
+                "endpoint_independent_nat": true
+            },
+            {
+                "type": "mixed", "tag": "mixed-in",
+                "listen": "127.0.0.1", "listen_port": PROXY_PORT
+            }
+        ],
         "outbounds": [ob, {"type": "direct", "tag": "direct"}],
         "route": {
             "auto_detect_interface": true,
             "default_domain_resolver": "bootstrap",
             "final": "proxy",
-            "rules": [
-                {"action": "sniff"},
-                {"protocol": "dns", "action": "hijack-dns"},
-                {"ip_is_private": true, "outbound": "direct"}
-            ]
+            "rules": rules
+        },
+        "experimental": {
+            "clash_api": {
+                "external_controller": "127.0.0.1:9090",
+                "secret": ""
+            }
         }
     });
     let path = format!("{RUN}/singbox.json");

@@ -1,6 +1,9 @@
+use crate::benchmark::{self, SpeedResult};
 use crate::ping::{self, Ping};
+use crate::recon::{self, ReconReport};
+use crate::shield;
 use crate::store::{self, Kind, Profile};
-use crate::tunnel::{self, Session};
+use crate::tunnel::{self, ActiveFlow, Session};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -46,6 +49,9 @@ enum Msg {
     Ip(String),
     Ping(String, Ping),
     Rtt(Option<u32>),
+    ReconDone(Result<ReconReport, String>),
+    SpeedDone(Result<SpeedResult, String>),
+    Flows(Vec<ActiveFlow>),
 }
 
 enum Mode {
@@ -64,6 +70,11 @@ enum Mode {
         list: ListState,
         subs: Vec<store::Subscription>,
     },
+    Recon(Result<ReconReport, String>),
+    Speed {
+        result: Option<SpeedResult>,
+        running: bool,
+    },
 }
 
 struct App {
@@ -79,6 +90,10 @@ struct App {
     busy_since: Instant,
     toast: Option<(String, bool, Instant)>,
     show_log: bool,
+    show_flows: bool,
+    flows: Vec<ActiveFlow>,
+    last_flows_tick: Instant,
+    shield_armed: bool,
     down: Vec<u64>,
     up: Vec<u64>,
     down_peak: u64,
@@ -147,6 +162,10 @@ impl App {
             busy_since: Instant::now(),
             toast: None,
             show_log: false,
+            show_flows: false,
+            flows: vec![],
+            last_flows_tick: Instant::now(),
+            shield_armed: shield::is_armed(),
             down: vec![],
             up: vec![],
             down_peak: 0,
@@ -550,6 +569,32 @@ impl App {
                         push(&mut self.rtt_hist, ms as u64);
                     }
                 }
+                Msg::Flows(flows) => {
+                    self.flows = flows;
+                }
+                Msg::ReconDone(res) => {
+                    self.busy = None;
+                    self.mode = Mode::Recon(res);
+                }
+                Msg::SpeedDone(res) => {
+                    self.busy = None;
+                    match res {
+                        Ok(res) => {
+                            self.mode = Mode::Speed {
+                                result: Some(res),
+                                running: false,
+                            };
+                            self.toast("BENCHMARK SATURATION COMPLETE", true);
+                        }
+                        Err(e) => {
+                            self.mode = Mode::Speed {
+                                result: None,
+                                running: false,
+                            };
+                            self.toast(format!("BENCHMARK FAILED: {e}"), false);
+                        }
+                    }
+                }
             }
         }
         changed
@@ -560,6 +605,14 @@ impl App {
         if self.toast.as_ref().map(|t| t.2.elapsed() > Duration::from_secs(5)).unwrap_or(false) {
             self.toast = None;
             changed = true;
+        }
+        if self.show_flows && self.busy.is_none() && self.last_flows_tick.elapsed() >= Duration::from_millis(1500) {
+            self.last_flows_tick = Instant::now();
+            let tx = self.tx.clone();
+            thread::spawn(move || {
+                let flows = tunnel::active_flows();
+                let _ = tx.send(Msg::Flows(flows));
+            });
         }
         if self.session.is_some() && self.busy.is_none() && !self.rtt_busy && self.last_rtt.elapsed() >= Duration::from_secs(2) {
             self.rtt_busy = true;
@@ -745,6 +798,46 @@ impl App {
                 }
                 return false;
             }
+            Mode::Recon(res) => {
+                match k.code {
+                    Esc | Char('q') | Enter => {}
+                    Char('r') | Char('R') => {
+                        if let Some(p) = self.cur().cloned() {
+                            self.start("reconnaissance probe");
+                            self.toast(format!("RE-PROBING NODE // TARGET: {}", p.name), true);
+                            let tx = self.tx.clone();
+                            thread::spawn(move || {
+                                let r = recon::probe_recon(&p).map_err(|e| format!("{e:#}"));
+                                let _ = tx.send(Msg::ReconDone(r));
+                            });
+                        }
+                    }
+                    _ => {
+                        self.mode = Mode::Recon(res);
+                    }
+                }
+                return false;
+            }
+            Mode::Speed { result, running } => {
+                match k.code {
+                    Esc | Char('q') => {}
+                    Char('r') | Char('R') | Enter if !running => {
+                        self.start("speed benchmark");
+                        self.toast("INITIATING MULTI-STREAM SPEED BENCHMARK...", true);
+                        self.mode = Mode::Speed { result: None, running: true };
+                        let tx = self.tx.clone();
+                        thread::spawn(move || {
+                            let res = benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS)
+                                .map_err(|e| format!("{e:#}"));
+                            let _ = tx.send(Msg::SpeedDone(res));
+                        });
+                    }
+                    _ => {
+                        self.mode = Mode::Speed { result, running };
+                    }
+                }
+                return false;
+            }
             Mode::Normal => {}
         }
         match k.code {
@@ -827,6 +920,62 @@ impl App {
                     self.ip.clear();
                     self.spawn_ip();
                 }
+            }
+            Char('K') | Char('z') | Char('Z') => {
+                let pref = shield::is_enabled_preference();
+                if pref {
+                    let _ = shield::set_enabled_preference(false);
+                    let _ = shield::disarm();
+                    self.shield_armed = false;
+                    self.toast("ANTI-LEAK SHIELD DISARMED // KILL-SWITCH OFF", false);
+                } else {
+                    let _ = shield::set_enabled_preference(true);
+                    if let Some(s) = &self.session {
+                        let endpoint_host = s.server.split(':').next().unwrap_or(&s.server);
+                        if let Err(e) = shield::arm(Some(&s.iface), Some(endpoint_host)) {
+                            self.toast(format!("SHIELD ARM ERROR: {e}"), false);
+                        } else {
+                            self.shield_armed = true;
+                            self.toast("ANTI-LEAK SHIELD ARMED // PACKET LEAKAGE BLOCKED", true);
+                        }
+                    } else {
+                        self.shield_armed = false;
+                        self.toast("SHIELD PREFERENCE ARMED (AUTO-LOCK ON CONNECT)", true);
+                    }
+                }
+            }
+            Char('n') | Char('N') => {
+                self.show_flows = !self.show_flows;
+                if self.show_flows {
+                    self.flows = tunnel::active_flows();
+                    self.toast(format!("FLOW SNIFFER ENGAGED // {} ACTIVE SOCKET(S)", self.flows.len()), true);
+                } else {
+                    self.toast("FLOW SNIFFER DISENGAGED", true);
+                }
+            }
+            Char('x') | Char('X') => {
+                if let Some(p) = self.cur().cloned() {
+                    self.start("reconnaissance probe");
+                    self.toast(format!("LAUNCHING DEEP RECON // TARGET: {}", p.name), true);
+                    let tx = self.tx.clone();
+                    thread::spawn(move || {
+                        let r = recon::probe_recon(&p).map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(Msg::ReconDone(r));
+                    });
+                } else {
+                    self.toast("SELECT A TARGET NODE FIRST", false);
+                }
+            }
+            Char('w') | Char('W') => {
+                self.start("speed benchmark");
+                self.toast("LAUNCHING BANDWIDTH BENCHMARK (MULTI-STREAM)...", true);
+                self.mode = Mode::Speed { result: None, running: true };
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let res = benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS)
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::SpeedDone(res));
+                });
             }
             _ => {}
         }
@@ -1028,6 +1177,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         Mode::Help => help(f, area),
         Mode::Qr { profile, qr, exported } => qr_popup(f, area, profile, qr, exported.as_deref()),
         Mode::Subs { list, subs } => subs_popup(f, area, list, subs),
+        Mode::Recon(res) => recon_popup(f, area, res),
+        Mode::Speed { result, running } => speed_popup(f, area, result.as_ref(), *running),
         _ => {}
     }
 }
@@ -1066,7 +1217,7 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
     } else {
         Line::from(vec![
             Span::styled("[○ STANDBY // DIRECT PROBE ACTIVE] ", Style::new().fg(FG_DIM)),
-            Span::styled("[PORT: DIRECT] ", Style::new().fg(DIM)),
+            Span::styled("[PROXY: 127.0.0.1:1080] ", Style::new().fg(PURPLE).bold()),
         ])
     };
 
@@ -1076,6 +1227,7 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
         return;
     }
 
+    let armed = app.shield_armed || shield::is_armed();
     let (sub_line, right_sub) = if a.width >= 100 {
         (
             Line::from(vec![
@@ -1083,28 +1235,36 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
                 Span::styled("sing-box/bpf", Style::new().fg(CYAN)),
                 Span::styled("  ◈  KERNEL: ", Style::new().fg(DIM).bold()),
                 Span::styled("vx0", Style::new().fg(FG)),
+                Span::styled("  ◈  PROXY: ", Style::new().fg(DIM).bold()),
+                Span::styled("127.0.0.1:1080", Style::new().fg(CYAN)),
                 Span::styled("  ◈  DNS: ", Style::new().fg(DIM).bold()),
                 Span::styled("1.1.1.1:DoH", Style::new().fg(GREEN)),
-                Span::styled("  ◈  ROUTE: ", Style::new().fg(DIM).bold()),
-                Span::styled("STRICT", Style::new().fg(PURPLE)),
             ]),
             Line::from(vec![
-                Span::styled("[SECLEVEL: ", Style::new().fg(DIM)),
-                Span::styled("CLASSIFIED", Style::new().fg(GREEN).bold()),
-                Span::styled(" · SHIELD: ", Style::new().fg(DIM)),
-                Span::styled("ENGAGED] ", Style::new().fg(CYAN).bold()),
+                Span::styled("[SHIELD: ", Style::new().fg(DIM)),
+                if armed {
+                    Span::styled("ARMED", Style::new().fg(GREEN).bold())
+                } else {
+                    Span::styled("OFF", Style::new().fg(RED).bold())
+                },
+                Span::styled(" · PROXY: ", Style::new().fg(DIM)),
+                Span::styled(":1080] ", Style::new().fg(PURPLE).bold()),
             ]),
         )
     } else {
         (
             Line::from(vec![
                 Span::styled("  CORE: ", Style::new().fg(DIM).bold()),
-                Span::styled("sing-box/bpf", Style::new().fg(CYAN)),
-                Span::styled("  ◈  NET_ADMIN  ◈  MTU: 9000  ◈  DNS: DoH", Style::new().fg(FG_DIM)),
+                Span::styled("sing-box", Style::new().fg(CYAN)),
+                Span::styled("  ◈  PROXY: :1080  ◈  DNS: DoH", Style::new().fg(FG_DIM)),
             ]),
             Line::from(vec![
-                Span::styled("[LEAK_SHIELD: ", Style::new().fg(DIM)),
-                Span::styled("ENGAGED] ", Style::new().fg(CYAN).bold()),
+                Span::styled("[SHIELD: ", Style::new().fg(DIM)),
+                if armed {
+                    Span::styled("ARMED] ", Style::new().fg(GREEN).bold())
+                } else {
+                    Span::styled("OFF] ", Style::new().fg(RED).bold())
+                },
             ]),
         )
     };
@@ -1346,7 +1506,8 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
                 Some(ms) => kv("latency", format!("{ms} ms [REALTIME ICMP ECHO]"), ms_color(ms)),
                 None => kv("latency", "PROBING ICMP...", FG_DIM),
             });
-            lines.push(kv("shield", "DNS-OVER-HTTPS [1.1.1.1] · IPV6 ISOLATED", GREEN));
+            lines.push(kv("proxy", "127.0.0.1:1080 [SOCKS5 / HTTP MIXED BRIDGE]", PURPLE));
+            lines.push(kv("shield", if app.shield_armed || shield::is_armed() { "ARMED // STRICT LEAK-PREVENTION ACTIVE" } else { "OFF // CLEAR-NET UNPROTECTED ON DROP" }, if app.shield_armed || shield::is_armed() { GREEN } else { RED }));
         }
         None => {
             lines.push(circuit_diagram_direct(inner.width as usize));
@@ -1365,18 +1526,22 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
                 Some(Ping::Timeout) => kv("probe rtt", "UNREACHABLE / TIMEOUT [✕]", RED),
                 None => kv("probe rtt", "NO TELEMETRY [PRESS T TO PROBE]", FG_DIM),
             });
+            lines.push(kv("proxy", "127.0.0.1:1080 [READY ON TUNNEL UP]", DIM));
+            lines.push(kv("shield", if app.shield_armed || shield::is_armed() { "ARMED // WILL ENGAGE ON CONNECT" } else { "OFF // DISARMED" }, if app.shield_armed || shield::is_armed() { GREEN } else { RED }));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("  [⏎] ENGAGE NODE  ", Style::new().fg(CYAN).bold()),
                 Span::styled(" [T] PROBE LATENCY  ", Style::new().fg(YELLOW).bold()),
-                Span::styled(" [U] AUTH CREDENTIALS", Style::new().fg(FG_DIM)),
+                Span::styled(" [X] DEEP RECON", Style::new().fg(GREEN).bold()),
             ]));
         }
     }
     f.render_widget(Paragraph::new(lines), inner);
 
-    // ── traffic (connected) / details (idle)
-    if is_connected {
+    // ── traffic (connected) / details (idle) / flows (when show_flows)
+    if app.show_flows {
+        flows_table(f, parts[1], app);
+    } else if is_connected {
         let blk = block("0x03 // PACKET FLOW & SPECTRUM ANALYZER", true);
         let inner = blk.inner(parts[1]).inner(Margin::new(1, 0));
         f.render_widget(blk, parts[1]);
@@ -1477,6 +1642,88 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn flows_table(f: &mut Frame, area: Rect, app: &App) {
+    let blk = block(&format!("0x03 // LIVE SOCKET & PACKET FLOW SNIFFER [ {:02} ACTIVE FLOWS ]", app.flows.len()), true);
+    let inner = blk.inner(area).inner(Margin::new(1, 0));
+    f.render_widget(blk, area);
+
+    if app.flows.is_empty() {
+        let msg = vec![
+            Line::from(""),
+            Line::from(Span::styled("[○] NO ACTIVE FLOWS INTERCEPTED // SYSTEM IDLE", Style::new().fg(FG_DIM).bold())),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ◈ SOCKS5/HTTP PROXY: ", Style::new().fg(DIM).bold()),
+                Span::styled("127.0.0.1:1080", Style::new().fg(CYAN).bold()),
+                Span::styled(" (READY FOR BURP / NMAP / CURL / PROXYCHAINS)", Style::new().fg(FG_DIM)),
+            ]),
+            Line::from(vec![
+                Span::styled("  ◈ CLASH API BRIDGE : ", Style::new().fg(DIM).bold()),
+                Span::styled("127.0.0.1:9090", Style::new().fg(PURPLE).bold()),
+                Span::styled(" (TRAFFIC CONTROLLER READY)", Style::new().fg(FG_DIM)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  [N] TOGGLE SPECTRUM / FLOWS  ·  [W] BENCHMARK SPEED", Style::new().fg(FG_DIM)),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(msg), inner);
+        return;
+    }
+
+    let mut lines = vec![];
+    let header_line = if inner.width >= 70 {
+        Line::from(vec![
+            Span::styled(" PROTO ", Style::new().fg(CYAN).bold()),
+            Span::styled("SOURCE            ", Style::new().fg(CYAN).bold()),
+            Span::styled("DESTINATION / TARGET    ", Style::new().fg(CYAN).bold()),
+            Span::styled("PROCESS   ", Style::new().fg(CYAN).bold()),
+            Span::styled("STATS", Style::new().fg(CYAN).bold()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" PROTO ", Style::new().fg(CYAN).bold()),
+            Span::styled("DESTINATION / TARGET ", Style::new().fg(CYAN).bold()),
+            Span::styled("PROCESS   ", Style::new().fg(CYAN).bold()),
+            Span::styled("STATS", Style::new().fg(CYAN).bold()),
+        ])
+    };
+    lines.push(header_line);
+    lines.push(Line::from(Span::styled(" ─────────────────────────────────────────────────────────────────────────────", Style::new().fg(BORDER))));
+
+    let max_rows = (inner.height as usize).saturating_sub(2);
+    for flow in app.flows.iter().take(max_rows) {
+        let proto = flow.network.to_ascii_uppercase();
+        let target = if !flow.host.is_empty() {
+            &flow.host
+        } else {
+            &flow.destination
+        };
+        let stats = if flow.download > 0 || flow.upload > 0 {
+            format!("↓{} ↑{}", fmt_bytes(flow.download), fmt_bytes(flow.upload))
+        } else {
+            "OK".to_string()
+        };
+        if inner.width >= 70 {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:<5} ", proto), Style::new().fg(if proto == "TCP" { CYAN } else { PURPLE }).bold()),
+                Span::styled(format!("{:<18} ", trunc(&flow.source, 17)), Style::new().fg(FG_DIM)),
+                Span::styled(format!("{:<24} ", trunc(target, 23)), Style::new().fg(FG).bold()),
+                Span::styled(format!("{:<10} ", trunc(&flow.process, 9)), Style::new().fg(YELLOW)),
+                Span::styled(stats, Style::new().fg(GREEN)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {:<5} ", proto), Style::new().fg(if proto == "TCP" { CYAN } else { PURPLE }).bold()),
+                Span::styled(format!("{:<21} ", trunc(target, 20)), Style::new().fg(FG).bold()),
+                Span::styled(format!("{:<10} ", trunc(&flow.process, 9)), Style::new().fg(YELLOW)),
+                Span::styled(stats, Style::new().fg(GREEN)),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn footer(f: &mut Frame, a: Rect, app: &App) {
     if a.height == 0 {
         return;
@@ -1498,6 +1745,10 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
     let keys = [
         ("RET", "ENGAGE"),
         ("SPC", "SEVER"),
+        ("K", "SHIELD"),
+        ("N", "FLOWS"),
+        ("X", "RECON"),
+        ("W", "SPEED"),
         ("A", "INJECT"),
         ("C", "QR/CONF"),
         ("B", "SUBS"),
@@ -1808,12 +2059,211 @@ fn subs_popup(f: &mut Frame, area: Rect, list: &mut ListState, subs: &[store::Su
     f.render_widget(Paragraph::new(vec![Line::from(""), controls]), rows[2]);
 }
 
+fn recon_popup(f: &mut Frame, area: Rect, report_res: &Result<ReconReport, String>) {
+    let w = (area.width.saturating_sub(2)).min(94);
+    let h = (area.height.saturating_sub(2)).min(32);
+    let r = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let blk = block("0xRC // DEEP NODE RECONNAISSANCE & TLS FINGERPRINT REPORT", true);
+    let inner = blk.inner(r).inner(Margin::new(1, 0));
+    f.render_widget(blk, r);
+
+    match report_res {
+        Err(e) => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled("[✕] DEEP RECON VECTOR FAILED", Style::new().fg(RED).bold())),
+                Line::from(""),
+                Line::from(Span::styled(format!("ERROR: {e}"), Style::new().fg(FG_DIM))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("PRESS [", Style::new().fg(FG_DIM)),
+                    Span::styled("R", Style::new().fg(CYAN).bold()),
+                    Span::styled("] TO RETRY PROBE  ·  [", Style::new().fg(FG_DIM)),
+                    Span::styled("ESC", Style::new().fg(RED).bold()),
+                    Span::styled("] TO DISMISS", Style::new().fg(FG_DIM)),
+                ]),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        Ok(rep) => {
+            let nw = (inner.width as usize).saturating_sub(20);
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled(" TARGET NODE   : ", Style::new().fg(CYAN).bold()),
+                    Span::styled(trunc(&rep.node_name, nw), Style::new().fg(FG).bold()),
+                    Span::styled(format!("  [{}]", rep.kind), Style::new().fg(YELLOW).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled(" REMOTE TARGET : ", Style::new().fg(CYAN).bold()),
+                    Span::styled(format!("{}:{}", rep.host, rep.port), Style::new().fg(FG).bold()),
+                    Span::styled(format!("  (ENDPOINT: {})", rep.target_endpoint), Style::new().fg(FG_DIM)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(" ┌─[ DNS RESOLUTION & REVERSE PTR ]─────────────────────────────────┐", Style::new().fg(BORDER))),
+                Line::from(vec![
+                    Span::styled(" │ RESOLVED IP(S): ", Style::new().fg(BORDER)),
+                    Span::styled(if rep.resolved_ips.is_empty() { "NONE".into() } else { rep.resolved_ips.join(", ") }, Style::new().fg(GREEN).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled(" │ REVERSE PTR   : ", Style::new().fg(BORDER)),
+                    Span::styled(rep.reverse_dns.as_deref().unwrap_or("NO_PTR_RECORD"), Style::new().fg(FG)),
+                ]),
+                Line::from(Span::styled(" ├─[ AUTONOMOUS SYSTEM (ASN) & GEOIP VECTOR ]────────────────────────┤", Style::new().fg(BORDER))),
+                Line::from(vec![
+                    Span::styled(" │ ASN & ORG     : ", Style::new().fg(BORDER)),
+                    Span::styled(format!("{} - {}", rep.asn.as_deref().unwrap_or("N/A"), rep.org.as_deref().unwrap_or("UNKNOWN")), Style::new().fg(PURPLE).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled(" │ GEOLOCATION   : ", Style::new().fg(BORDER)),
+                    Span::styled(format!("{}, {} ({})", rep.city.as_deref().unwrap_or("?"), rep.country.as_deref().unwrap_or("?"), rep.loc.as_deref().unwrap_or("?")), Style::new().fg(CYAN)),
+                ]),
+                Line::from(Span::styled(" ├─[ MULTI-PROBE TCP JITTER SPECTRUM ]───────────────────────────────┤", Style::new().fg(BORDER))),
+                Line::from(vec![
+                    Span::styled(" │ LATENCY METRIC: ", Style::new().fg(BORDER)),
+                    Span::styled(format!("MIN {}ms  ·  AVG {}ms  ·  MAX {}ms", rep.rtt_min, rep.rtt_avg, rep.rtt_max), Style::new().fg(ms_color(rep.rtt_avg)).bold()),
+                    Span::styled(format!("   JITTER DELTA: ±{}ms", rep.jitter), Style::new().fg(YELLOW).bold()),
+                ]),
+                Line::from(Span::styled(" ├─[ CRYPTOGRAPHIC TLS HANDSHAKE FINGERPRINT ]──────────────────────┤", Style::new().fg(BORDER))),
+                Line::from(vec![
+                    Span::styled(" │ TLS PROTOCOL  : ", Style::new().fg(BORDER)),
+                    Span::styled(rep.tls_version.as_deref().unwrap_or("NO_TLS_EXCHANGE"), Style::new().fg(GREEN).bold()),
+                    Span::styled("  CIPHER: ", Style::new().fg(BORDER)),
+                    Span::styled(rep.tls_cipher.as_deref().unwrap_or("N/A"), Style::new().fg(CYAN).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled(" │ CERT SUBJECT  : ", Style::new().fg(BORDER)),
+                    Span::styled(trunc(rep.tls_cert_subject.as_deref().unwrap_or("NONE"), nw), Style::new().fg(FG)),
+                ]),
+                Line::from(vec![
+                    Span::styled(" │ CERT ISSUER   : ", Style::new().fg(BORDER)),
+                    Span::styled(trunc(rep.tls_cert_issuer.as_deref().unwrap_or("NONE"), nw), Style::new().fg(FG_DIM)),
+                ]),
+                Line::from(Span::styled(" ├─[ EXIT TRAFFIC ROUTE VERIFICATION ]──────────────────────────────┤", Style::new().fg(BORDER))),
+                Line::from(vec![
+                    Span::styled(" │ CURRENT EXIT  : ", Style::new().fg(BORDER)),
+                    Span::styled(rep.exit_ip.as_deref().unwrap_or("UNAVAILABLE"), Style::new().fg(GREEN).bold()),
+                    Span::styled("  CF TRANSIT COLO: ", Style::new().fg(BORDER)),
+                    Span::styled(rep.exit_colo.as_deref().unwrap_or("N/A"), Style::new().fg(PURPLE).bold()),
+                ]),
+                Line::from(Span::styled(" └──────────────────────────────────────────────────────────────────┘", Style::new().fg(BORDER))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(" [R] ", Style::new().fg(CYAN).bold()),
+                    Span::styled("RE-EXECUTE PROBE  ", Style::new().fg(FG_DIM)),
+                    Span::styled("[ESC / Q] ", Style::new().fg(RED).bold()),
+                    Span::styled("DISMISS RECON REPORT", Style::new().fg(FG_DIM)),
+                ]),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+    }
+}
+
+fn speed_popup(f: &mut Frame, area: Rect, result: Option<&SpeedResult>, running: bool) {
+    let w = (area.width.saturating_sub(2)).min(82);
+    let h = (area.height.saturating_sub(2)).min(18);
+    let r = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let blk = block("0xSPD // LIVE BANDWIDTH THROUGHPUT & NETWORK BENCHMARK", true);
+    let inner = blk.inner(r).inner(Margin::new(1, 0));
+    f.render_widget(blk, r);
+
+    if running {
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" ⌁ RUNNING MULTI-STREAM SATURATION BENCHMARK...", Style::new().fg(YELLOW).bold()),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("  Generating throughput load across edge CDN servers...", Style::new().fg(FG))),
+            Line::from(Span::styled("  Measuring real-world bandwidth, transfer rate, and socket performance.", Style::new().fg(FG_DIM))),
+            Line::from(""),
+            Line::from(Span::styled("  [!] Please standby while payload saturation completes (2-5s)...", Style::new().fg(CYAN))),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    match result {
+        None => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled("[!] NO BENCHMARK DATA AVAILABLE", Style::new().fg(RED).bold())),
+                Line::from(""),
+                Line::from(Span::styled("Benchmark failed or timed out reaching edge servers.", Style::new().fg(FG_DIM))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("PRESS [", Style::new().fg(FG_DIM)),
+                    Span::styled("R", Style::new().fg(CYAN).bold()),
+                    Span::styled("] TO START BENCHMARK  ·  [", Style::new().fg(FG_DIM)),
+                    Span::styled("ESC", Style::new().fg(RED).bold()),
+                    Span::styled("] TO DISMISS", Style::new().fg(FG_DIM)),
+                ]),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        Some(res) => {
+            let (tier, tier_col) = if res.mbps >= 100.0 {
+                ("ULTRA-TIER / GIGABIT READY", GREEN)
+            } else if res.mbps >= 50.0 {
+                ("HIGH SPEED STREAMING", CYAN)
+            } else if res.mbps >= 15.0 {
+                ("STANDARD BROADBAND", YELLOW)
+            } else {
+                ("CONGESTED / HIGH JITTER", RED)
+            };
+
+            let lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  DOWNLOAD THROUGHPUT : ", Style::new().fg(CYAN).bold()),
+                    Span::styled(format!("{:.2} Mbps", res.mbps), Style::new().fg(GREEN).bold()),
+                    Span::styled(format!("  ({:.2} MB/s)", res.mbs), Style::new().fg(FG).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled("  DATA TRANSFERRED    : ", Style::new().fg(CYAN).bold()),
+                    Span::styled(fmt_bytes(res.bytes), Style::new().fg(FG).bold()),
+                    Span::styled(format!(" in {:.2}s window", res.duration_secs), Style::new().fg(FG_DIM)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  LINK EVALUATION     : ", Style::new().fg(CYAN).bold()),
+                    Span::styled(format!("[ {tier} ]"), Style::new().fg(tier_col).bold()),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(" ────────────────────────────────────────────────────────────────────────", Style::new().fg(BORDER))),
+                Line::from(vec![
+                    Span::styled(" [R / ENTER] ", Style::new().fg(CYAN).bold()),
+                    Span::styled("RE-RUN BENCHMARK  ", Style::new().fg(FG_DIM)),
+                    Span::styled("[ESC / Q] ", Style::new().fg(RED).bold()),
+                    Span::styled("DISMISS", Style::new().fg(FG_DIM)),
+                ]),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+    }
+}
+
 fn help(f: &mut Frame, area: Rect) {
-    let rows: [(&str, &str, &str); 20] = [
+    let rows: [(&str, &str, &str); 24] = [
         ("TUNNEL CONTROL", "RET / ENTER", "ENGAGE SELECTED TARGET NODE"),
         ("TUNNEL CONTROL", "SPC / S", "SEVER / ABORT ACTIVE TUNNEL"),
         ("TUNNEL CONTROL", "J K ↑ ↓", "NAVIGATE TARGET NODE MATRIX"),
         ("TUNNEL CONTROL", "G / SHIFT+G", "JUMP TO FIRST / LAST NODE"),
+        ("STEALTH SHIELD", "K / Z", "TOGGLE ANTI-LEAK KILL SWITCH SHIELD"),
+        ("NET MONITOR", "N", "TOGGLE LIVE SOCKET & PACKET FLOW SNIFFER"),
+        ("NET MONITOR", "W", "RUN BANDWIDTH THROUGHPUT BENCHMARK (CDNS)"),
+        ("RECON & PROBE", "X", "DEEP NODE RECONNAISSANCE & TLS PROBE"),
         ("RECON & PROBE", "T", "EXECUTE LATENCY PROBE (ALL NODES)"),
         ("RECON & PROBE", "SHIFT+T", "EXECUTE LATENCY PROBE (SELECTED)"),
         ("RECON & PROBE", "O", "CYCLE SORT ORDER (RTT SPEED ⇄ ID)"),
@@ -2016,5 +2466,98 @@ mod tests {
         // Press Esc to dismiss Subs modal
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Normal));
+
+        // Press 'n' to toggle flows view
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.show_flows);
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(!app.show_flows);
+
+        // Press 'w' to initiate speed benchmark modal
+        app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Speed { .. }));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn test_recon_modal_render() {
+        let mut app = App::new();
+        let report = ReconReport {
+            node_name: "Frankfurt Cyber-Node".into(),
+            kind: "VLESS".into(),
+            target_endpoint: "203.0.113.7:443".into(),
+            host: "203.0.113.7".into(),
+            port: 443,
+            resolved_ips: vec!["203.0.113.7".into()],
+            reverse_dns: Some("node-fra.example.net".into()),
+            asn: Some("AS13335".into()),
+            org: Some("Cloudflare, Inc.".into()),
+            city: Some("Frankfurt am Main".into()),
+            country: Some("DE".into()),
+            loc: Some("50.1109,8.6821".into()),
+            rtt_min: 24,
+            rtt_avg: 27,
+            rtt_max: 31,
+            jitter: 7,
+            tls_version: Some("TLSv1.3".into()),
+            tls_cipher: Some("TLS_AES_256_GCM_SHA384".into()),
+            tls_cert_subject: Some("CN=*.example.net".into()),
+            tls_cert_issuer: Some("CN=Let's Encrypt Authority".into()),
+            exit_ip: Some("185.220.101.5".into()),
+            exit_colo: Some("FRA".into()),
+        };
+        app.mode = Mode::Recon(Ok(report));
+        let out = render(100, 32, &mut app);
+        assert!(out.contains("0xRC // DEEP NODE RECONNAISSANCE & TLS FINGERPRINT REPORT"));
+        assert!(out.contains("Frankfurt Cyber-Node"));
+        assert!(out.contains("AS13335"));
+        assert!(out.contains("TLSv1.3"));
+        assert!(out.contains("TLS_AES_256_GCM_SHA384"));
+    }
+
+    #[test]
+    fn test_speed_modal_render() {
+        let mut app = App::new();
+        let speed = SpeedResult {
+            bytes: 52_428_800,
+            duration_secs: 4.12,
+            mbps: 101.8,
+            mbs: 12.72,
+        };
+        app.mode = Mode::Speed {
+            result: Some(speed),
+            running: false,
+        };
+        let out = render(90, 20, &mut app);
+        assert!(out.contains("0xSPD // LIVE BANDWIDTH THROUGHPUT & NETWORK BENCHMARK"));
+        assert!(out.contains("101.80 Mbps"));
+        assert!(out.contains("ULTRA-TIER / GIGABIT READY"));
+    }
+
+    #[test]
+    fn test_flows_table_render() {
+        let mut app = App::new();
+        app.show_flows = true;
+        app.flows = vec![
+            ActiveFlow {
+                id: "flow-1".into(),
+                network: "tcp".into(),
+                host: "api.github.com:443".into(),
+                destination: "140.82.121.6:443".into(),
+                source: "127.0.0.1:48292".into(),
+                process: "curl".into(),
+                upload: 1024,
+                download: 65536,
+            },
+        ];
+        let p = prof("a", "Frankfurt", Kind::Vless, "vless://u@203.0.113.7:443");
+        app.profiles = vec![p];
+        app.view = vec![0];
+        app.list.select(Some(0));
+        let out = render(110, 30, &mut app);
+        assert!(out.contains("LIVE SOCKET & PACKET FLOW SNIFFER"));
+        assert!(out.contains("api.github.com:443"));
+        assert!(out.contains("curl"));
     }
 }
