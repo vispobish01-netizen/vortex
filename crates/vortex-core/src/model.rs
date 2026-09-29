@@ -212,6 +212,13 @@ pub struct ProbeResult {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct LeakCheckItem {
+    pub name: String,
+    pub passed: bool,
+    pub details: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct LeakReport {
     pub real_ip: String,
     pub exit_ip: String,
@@ -219,6 +226,8 @@ pub struct LeakReport {
     pub ipv6_leak: bool,
     pub is_secure: bool,
     pub details: String,
+    #[serde(default)]
+    pub checks: Vec<LeakCheckItem>,
 }
 
 /// Helper function to redact secrets from URLs, configs, or auth credentials for safe logging.

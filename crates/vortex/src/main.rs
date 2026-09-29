@@ -18,6 +18,7 @@ vortex — elite cyber warfare VPN & proxy manager for Omarchy
   vortex conf [n|name] show full config text (--copy to clipboard, --export to file)
   vortex proxy [env]   manage local SOCKS5/HTTP proxy bridge (:1080) for tools
   vortex shield [on|off] stealth kill switch & anti-leak shield (alias: killswitch)
+  vortex leaks         comprehensive leak audit (IP, DNS, IPv6, WebRTC/STUN)
   vortex recon [n|name] deep node reconnaissance (ASN, GeoIP, TLS cert, jitter)
   vortex speed         measure live throughput & bandwidth under load
   vortex flows         live socket & traffic sniffer (active connections)
@@ -664,6 +665,45 @@ fn main() -> Result<()> {
                     rep.exit_colo.unwrap_or_default()
                 );
             }
+            Ok(())
+        }
+        Some("leaks") | Some("leak") => {
+            println!("\x1b[1;36m🛡 VORTEX // EXECUTING LEAK INTEGRITY SUITE...\x1b[0m\n");
+            let sess = tunnel::load_session();
+            let is_sec = sess.is_some();
+            let srv = sess.as_ref().map(|s| s.server.as_str());
+            let exit_ip = sess.as_ref().map(|_| tunnel::public_ip());
+
+            let rep = tokio::runtime::Runtime::new()?.block_on(vortex_core::leak::run_leak_suite(
+                is_sec,
+                srv,
+                exit_ip.as_deref(),
+            ));
+
+            println!(
+                "  \x1b[1mStatus:\x1b[0m       {}",
+                if rep.is_secure {
+                    "\x1b[1;32m[PASS] SECURE\x1b[0m"
+                } else {
+                    "\x1b[1;31m[FAIL] LEAK DETECTED\x1b[0m"
+                }
+            );
+            println!("  \x1b[1mOrigin IP:\x1b[0m    {}", rep.real_ip);
+            println!("  \x1b[1mExit IP:\x1b[0m      {}", rep.exit_ip);
+            println!(
+                "  \x1b[1mResolvers:\x1b[0m    {}",
+                rep.dns_resolvers.join(", ")
+            );
+            println!("\n\x1b[1;32m[+] PERIMETER AUDIT\x1b[0m");
+            for chk in &rep.checks {
+                let badge = if chk.passed {
+                    "\x1b[1;32m[PASS]\x1b[0m"
+                } else {
+                    "\x1b[1;31m[FAIL]\x1b[0m"
+                };
+                println!("    {badge} {:<24} : {}", chk.name, chk.details);
+            }
+            println!("\n  \x1b[2mSummary: {}\x1b[0m\n", rep.details);
             Ok(())
         }
         Some("speed") | Some("benchmark") => handle_speed(),

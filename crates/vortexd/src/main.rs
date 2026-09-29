@@ -87,6 +87,10 @@ async fn main() -> Result<()> {
 
     info!("Starting Vortex Daemon v{}", env!("CARGO_PKG_VERSION"));
 
+    // Crash safety: clean any leftover firewall rules or stale routes
+    info!("Running crash recovery: cleaning stale firewall rules...");
+    let _ = shield::cleanup_stale_rules();
+
     let sock_path = default_socket_path();
     if let Some(parent) = sock_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -240,7 +244,8 @@ async fn main() -> Result<()> {
     let shutdown_sock = sock_path.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        info!("Received shutdown signal, cleaning up socket...");
+        info!("Received shutdown signal, cleaning up socket and firewall...");
+        let _ = shield::cleanup_stale_rules();
         let _ = std::fs::remove_file(&shutdown_sock);
         std::process::exit(0);
     });
@@ -460,22 +465,22 @@ async fn process_request(
             }
         }
         IpcRequest::RunLeakTest => {
-            let real_ip = tunnel::public_ip();
-            let sess = tunnel::load_session();
-            let is_sec = sess.is_some();
-            Some(IpcResponse::Leak(LeakReport {
-                real_ip: real_ip.clone(),
-                exit_ip: real_ip,
-                dns_resolvers: vec!["1.1.1.1".into()],
-                ipv6_leak: false,
-                is_secure: is_sec,
-                details: if is_sec {
-                    "Encrypted tunnel engaged"
-                } else {
-                    "Cleartext direct path"
-                }
-                .into(),
-            }))
+            let (is_connected, srv_endpoint, exit_ip) = {
+                let mut st = state.lock().await;
+                st.refresh_status();
+                (
+                    st.status.connected,
+                    st.status.server_endpoint.clone(),
+                    st.status.exit_ip.clone(),
+                )
+            };
+            let report = vortex_core::leak::run_leak_suite(
+                is_connected,
+                srv_endpoint.as_deref(),
+                exit_ip.as_deref(),
+            )
+            .await;
+            Some(IpcResponse::Leak(report))
         }
         IpcRequest::GetFlows => {
             let flows = tunnel::active_flows();

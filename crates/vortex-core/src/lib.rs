@@ -2,6 +2,7 @@ pub mod benchmark;
 pub mod crypto;
 pub mod error;
 pub mod ipc;
+pub mod leak;
 pub mod model;
 pub mod parser;
 pub mod ping;
