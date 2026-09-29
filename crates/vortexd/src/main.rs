@@ -498,6 +498,33 @@ async fn process_request(
             Ok(_) => Some(IpcResponse::Routing(cfg)),
             Err(e) => Some(IpcResponse::Error(format!("Save routing failed: {e:#}"))),
         },
+        IpcRequest::GetRulesConfig => {
+            let cfg = vortex_core::routing::RulesConfig::load();
+            Some(IpcResponse::RulesConfig(cfg))
+        }
+        IpcRequest::SetRulesConfig(cfg) => match cfg.save() {
+            Ok(_) => {
+                let st = state.lock().await;
+                let _ = st.subscribers.send(DaemonEvent::RoutingReloaded);
+                Some(IpcResponse::RulesConfig(cfg))
+            }
+            Err(e) => Some(IpcResponse::Error(format!("Save rules failed: {e:#}"))),
+        },
+        IpcRequest::ExplainRoute {
+            target,
+            protocol,
+            port,
+            process,
+        } => {
+            let cfg = vortex_core::routing::RulesConfig::load();
+            let res = cfg.explain(&target, protocol.as_deref(), port, process.as_deref());
+            Some(IpcResponse::ExplainRoute(res))
+        }
+        IpcRequest::ReloadRouting => {
+            let st = state.lock().await;
+            let _ = st.subscribers.send(DaemonEvent::RoutingReloaded);
+            Some(IpcResponse::Ok)
+        }
         IpcRequest::SetSelectionMode { mode } => {
             let mut st = state.lock().await;
             st.selection_mode = mode;

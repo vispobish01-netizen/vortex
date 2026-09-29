@@ -23,6 +23,7 @@ pub enum Mode {
     Subs,
     Recon,
     Speed,
+    Rules,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,11 +92,15 @@ pub enum Action {
     DeleteSub,
     RetryProbe,
     RetrySpeedTest,
+    ManageRules,
+    ToggleRule,
 }
 
 impl Action {
     pub fn as_snake_case(&self) -> &'static str {
         match self {
+            Action::ManageRules => "manage_rules",
+            Action::ToggleRule => "toggle_rule",
             Action::NextNode => "next_node",
             Action::PrevNode => "prev_node",
             Action::FirstNode => "first_node",
@@ -195,6 +200,8 @@ impl Action {
             "delete_sub" => Some(Action::DeleteSub),
             "retry_probe" => Some(Action::RetryProbe),
             "retry_speed_test" => Some(Action::RetrySpeedTest),
+            "manage_rules" | "rules" => Some(Action::ManageRules),
+            "toggle_rule" => Some(Action::ToggleRule),
             _ => None,
         }
     }
@@ -575,6 +582,8 @@ pub fn map_key(mode: &Mode, key: KeyEvent) -> Option<Action> {
                 KeyCode::Enter => Some(Action::ConnectSelected),
                 KeyCode::Char(' ') => Some(Action::ToggleConnection),
                 KeyCode::Char('r') if !shift => Some(Action::Reconnect),
+                KeyCode::Char('R') => Some(Action::ManageRules),
+                KeyCode::Char('r') if shift => Some(Action::ManageRules),
                 KeyCode::Char('K') => Some(Action::ToggleShield),
                 KeyCode::Char('k') if shift => Some(Action::ToggleShield),
                 KeyCode::Char('a') if !shift => Some(Action::AddNode),
@@ -683,6 +692,13 @@ pub fn map_key(mode: &Mode, key: KeyEvent) -> Option<Action> {
             }
             _ => None,
         },
+        Mode::Rules => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
+            KeyCode::Char('j') | KeyCode::Down => Some(Action::NextNode),
+            KeyCode::Char('k') | KeyCode::Up => Some(Action::PrevNode),
+            KeyCode::Char(' ') | KeyCode::Enter => Some(Action::ToggleRule),
+            _ => None,
+        },
     }
 }
 
@@ -726,6 +742,7 @@ mod tests {
             Mode::Subs,
             Mode::Recon,
             Mode::Speed,
+            Mode::Rules,
         ];
         for mode in &modes {
             assert_eq!(

@@ -446,27 +446,20 @@ fn up_singbox(p: &Profile) -> Result<Session> {
     need("sing-box", "sing-box (pacman -S sing-box)")?;
     let (_, ob, _, _) = outbound(&p.data)?;
     let logp = format!("{RUN}/core.log");
-    let routing = load_routing();
+    let rules_cfg = crate::routing::RulesConfig::load();
+    let mut rules = rules_cfg.to_singbox_rules();
 
-    let mut rules = vec![
-        json!({"action": "sniff"}),
-        json!({"protocol": "dns", "action": "hijack-dns"}),
-    ];
-
-    if !routing.blocked_domains.is_empty() {
+    let legacy_routing = load_routing();
+    if !legacy_routing.blocked_domains.is_empty() {
         rules.push(json!({
-            "domain_suffix": routing.blocked_domains,
+            "domain_suffix": legacy_routing.blocked_domains,
             "action": "reject"
         }));
     }
 
-    if routing.bypass_lan {
-        rules.push(json!({"ip_is_private": true, "outbound": "direct"}));
-    }
-
-    if !routing.direct_domains.is_empty() {
+    if !legacy_routing.direct_domains.is_empty() {
         rules.push(json!({
-            "domain_suffix": routing.direct_domains,
+            "domain_suffix": legacy_routing.direct_domains,
             "outbound": "direct"
         }));
     }

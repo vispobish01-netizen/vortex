@@ -8,6 +8,7 @@ pub mod parser;
 pub mod ping;
 pub mod probe;
 pub mod recon;
+pub mod routing;
 pub mod shield;
 pub mod storage;
 pub mod store;

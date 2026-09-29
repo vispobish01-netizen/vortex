@@ -93,6 +93,8 @@ struct App {
     qr_exported: Option<String>,
     subs: Vec<store::Subscription>,
     subs_list: ListState,
+    rules_cfg: vortex_core::routing::RulesConfig,
+    rules_list: ListState,
     recon_report: Option<Result<ReconReport, String>>,
     speed_result: Option<SpeedResult>,
     speed_running: bool,
@@ -146,6 +148,8 @@ impl App {
             qr_exported: None,
             subs: vec![],
             subs_list: ListState::default(),
+            rules_cfg: vortex_core::routing::RulesConfig::default(),
+            rules_list: ListState::default(),
             recon_report: None,
             speed_result: None,
             speed_running: false,
@@ -777,8 +781,36 @@ impl App {
                     self.toast = None;
                 }
             },
-            Action::NextNode => self.mv(1),
-            Action::PrevNode => self.mv(-1),
+            Action::NextNode => {
+                if self.mode == Mode::Rules {
+                    let len = self.rules_cfg.custom_rules.len();
+                    if len > 0 {
+                        let next = self
+                            .rules_list
+                            .selected()
+                            .map(|i| (i + 1) % len)
+                            .unwrap_or(0);
+                        self.rules_list.select(Some(next));
+                    }
+                } else {
+                    self.mv(1);
+                }
+            }
+            Action::PrevNode => {
+                if self.mode == Mode::Rules {
+                    let len = self.rules_cfg.custom_rules.len();
+                    if len > 0 {
+                        let prev = self
+                            .rules_list
+                            .selected()
+                            .map(|i| if i == 0 { len - 1 } else { i - 1 })
+                            .unwrap_or(0);
+                        self.rules_list.select(Some(prev));
+                    }
+                } else {
+                    self.mv(-1);
+                }
+            }
             Action::FirstNode => {
                 if !self.view.is_empty() {
                     self.list.select(Some(0));
@@ -891,6 +923,24 @@ impl App {
                     self.subs_list.select(Some(0));
                 }
                 self.mode = Mode::Subs;
+            }
+            Action::ManageRules => {
+                self.rules_cfg = vortex_core::routing::RulesConfig::load();
+                self.rules_list = ListState::default();
+                if !self.rules_cfg.custom_rules.is_empty() {
+                    self.rules_list.select(Some(0));
+                }
+                self.mode = Mode::Rules;
+            }
+            Action::ToggleRule => {
+                if let Some(idx) = self.rules_list.selected() {
+                    if idx < self.rules_cfg.custom_rules.len() {
+                        self.rules_cfg.custom_rules[idx].enabled =
+                            !self.rules_cfg.custom_rules[idx].enabled;
+                        let _ = self.rules_cfg.save();
+                        self.toast("ROUTING RULE STATUS TOGGLED", true);
+                    }
+                }
             }
             Action::ToggleFlows => {
                 self.show_flows = !self.show_flows;
@@ -1267,6 +1317,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             }
         }
         Mode::Speed => speed_popup(f, area, app.speed_result.as_ref(), app.speed_running),
+        Mode::Rules => rules_popup(f, area, &app.rules_cfg, &mut app.rules_list),
         _ => {}
     }
 }
@@ -2515,6 +2566,187 @@ fn subs_popup(f: &mut Frame, area: Rect, list: &mut ListState, subs: &[store::Su
         Span::styled("CLOSE", Style::new().fg(FG_DIM)),
     ]);
     f.render_widget(Paragraph::new(vec![Line::from(""), controls]), rows[2]);
+}
+
+fn rules_popup(
+    f: &mut Frame,
+    area: Rect,
+    cfg: &vortex_core::routing::RulesConfig,
+    state: &mut ListState,
+) {
+    let w = (area.width.saturating_sub(4)).min(94);
+    let h = (area.height.saturating_sub(4)).min(24);
+    let r = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let blk = block("0xRT // SPLIT TUNNELING & POLICY ROUTING RULES", true);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+
+    let rows = Layout::vertical([
+        Constraint::Length(3), // Presets line
+        Constraint::Length(2), // Table column header
+        Constraint::Min(4),    // Custom rules list
+        Constraint::Length(2), // Bottom hints
+    ])
+    .split(inner);
+
+    // 1. Presets status
+    let p_lan = if cfg.presets.bypass_lan {
+        "[●] BYPASS LAN"
+    } else {
+        "[○] BYPASS LAN"
+    };
+    let p_ads = if cfg.presets.block_ads {
+        "[●] BLOCK ADS"
+    } else {
+        "[○] BLOCK ADS"
+    };
+    let p_geo = if cfg.presets.direct_domestic {
+        "[●] DOMESTIC GEOIP"
+    } else {
+        "[○] DOMESTIC GEOIP"
+    };
+    let p_all = if cfg.presets.proxy_all {
+        "[●] GLOBAL PROXY"
+    } else {
+        "[○] GLOBAL PROXY"
+    };
+
+    let preset_line = Line::from(vec![
+        Span::styled(" PRESETS: ", Style::new().fg(BORDER).bold()),
+        Span::styled(
+            format!("{p_lan}  "),
+            Style::new()
+                .fg(if cfg.presets.bypass_lan {
+                    GREEN
+                } else {
+                    FG_DIM
+                })
+                .bold(),
+        ),
+        Span::styled(
+            format!("{p_ads}  "),
+            Style::new()
+                .fg(if cfg.presets.block_ads { RED } else { FG_DIM })
+                .bold(),
+        ),
+        Span::styled(
+            format!("{p_geo}  "),
+            Style::new()
+                .fg(if cfg.presets.direct_domestic {
+                    CYAN
+                } else {
+                    FG_DIM
+                })
+                .bold(),
+        ),
+        Span::styled(
+            p_all,
+            Style::new()
+                .fg(if cfg.presets.proxy_all {
+                    PURPLE
+                } else {
+                    FG_DIM
+                })
+                .bold(),
+        ),
+    ]);
+    let preset_sep = Line::from(Span::styled(
+        " ─────────────────────────────────────────────────────────────────────────────",
+        Style::new().fg(BORDER),
+    ));
+    f.render_widget(Paragraph::new(vec![preset_line, preset_sep]), rows[0]);
+
+    // 2. Table header
+    let header_line = Line::from(vec![
+        Span::styled("  ST  #  ", Style::new().fg(CYAN).bold()),
+        Span::styled("RULE IDENTIFIER     ", Style::new().fg(CYAN).bold()),
+        Span::styled("ACTION     ", Style::new().fg(CYAN).bold()),
+        Span::styled("POLICY CRITERIA & TARGET", Style::new().fg(CYAN).bold()),
+    ]);
+    let col_sep = Line::from(Span::styled(
+        " ─────────────────────────────────────────────────────────────────────────────",
+        Style::new().fg(BORDER),
+    ));
+    f.render_widget(Paragraph::new(vec![header_line, col_sep]), rows[1]);
+
+    // 3. Custom rules list
+    if cfg.custom_rules.is_empty() {
+        let empty_msg = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  [!] NO CUSTOM POLICY RULES CONFIGURED",
+                Style::new().fg(YELLOW).bold(),
+            )),
+            Line::from(Span::styled(
+                "  EDIT ~/.config/vortex/rules.toml TO INJECT PROCESS / DOMAIN / CIDR RULES",
+                Style::new().fg(FG_DIM),
+            )),
+        ];
+        f.render_widget(Paragraph::new(empty_msg), rows[2]);
+    } else {
+        let items: Vec<ListItem> = cfg
+            .custom_rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let st_marker = if r.enabled { "[●]" } else { "[○]" };
+                let st_col = if r.enabled { GREEN } else { FG_DIM };
+                let num = format!("{:02} ", i + 1);
+
+                let (act_name, act_col) = match r.action {
+                    vortex_core::routing::RuleAction::Proxy => ("PROXY ", CYAN),
+                    vortex_core::routing::RuleAction::Direct => ("DIRECT", GREEN),
+                    vortex_core::routing::RuleAction::Block => ("BLOCK ", RED),
+                    vortex_core::routing::RuleAction::ProxyGroup => ("GROUP ", PURPLE),
+                };
+
+                let desc = r
+                    .description
+                    .as_deref()
+                    .unwrap_or(if !r.domains.is_empty() {
+                        "Domain matching policy"
+                    } else if !r.ip_cidrs.is_empty() {
+                        "IP/CIDR matching policy"
+                    } else {
+                        "Traffic criteria policy"
+                    });
+
+                let line = Line::from(vec![
+                    Span::styled(format!(" {st_marker} "), Style::new().fg(st_col).bold()),
+                    Span::styled(num, Style::new().fg(FG_DIM)),
+                    Span::styled(
+                        format!("{:<19} ", trunc(&r.id, 19)),
+                        Style::new().fg(FG).bold(),
+                    ),
+                    Span::styled(format!("[{act_name}]   "), Style::new().fg(act_col).bold()),
+                    Span::styled(desc.to_string(), Style::new().fg(FG_DIM)),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+
+        let list_widget = List::new(items)
+            .highlight_style(Style::new().bg(Color::Rgb(0x18, 0x28, 0x38)).bold())
+            .highlight_symbol("▶ ");
+        f.render_stateful_widget(list_widget, rows[2], state);
+    }
+
+    // 4. Footer hints
+    let hints = Line::from(vec![
+        Span::styled(" [SPACE] ", Style::new().fg(CYAN).bold()),
+        Span::styled("TOGGLE RULE   ", Style::new().fg(FG_DIM)),
+        Span::styled("[J / K] ", Style::new().fg(CYAN).bold()),
+        Span::styled("NAVIGATE   ", Style::new().fg(FG_DIM)),
+        Span::styled("[ESC / Q] ", Style::new().fg(RED).bold()),
+        Span::styled("DISMISS ROUTING MODAL", Style::new().fg(FG_DIM)),
+    ]);
+    f.render_widget(Paragraph::new(vec![hints]), rows[3]);
 }
 
 fn recon_popup(f: &mut Frame, area: Rect, report_res: &Result<ReconReport, String>) {

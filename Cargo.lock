@@ -3637,6 +3637,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "qrcode",
+ "regex",
  "rqrr",
  "serde",
  "serde_json",

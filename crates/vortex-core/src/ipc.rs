@@ -20,6 +20,7 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 use crate::probe::{NodeMetrics, SelectionMode};
+use crate::routing::{ExplainResult, RulesConfig};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "action", content = "payload")]
@@ -28,21 +29,49 @@ pub enum IpcRequest {
     Version,
     GetStatus,
     GetProfiles,
-    Connect { profile_id: String },
+    Connect {
+        profile_id: String,
+    },
     Disconnect,
-    ToggleShield { enable: Option<bool> },
-    AddProfile { raw: String },
-    RemoveProfile { id: String },
-    RenameProfile { id: String, new_name: String },
-    UpdateSubscriptions { target: Option<String> },
-    RunProbe { profile_id: Option<String> },
+    ToggleShield {
+        enable: Option<bool>,
+    },
+    AddProfile {
+        raw: String,
+    },
+    RemoveProfile {
+        id: String,
+    },
+    RenameProfile {
+        id: String,
+        new_name: String,
+    },
+    UpdateSubscriptions {
+        target: Option<String>,
+    },
+    RunProbe {
+        profile_id: Option<String>,
+    },
     RunSpeedTest,
     RunLeakTest,
     GetFlows,
-    GetLogs { lines: usize },
+    GetLogs {
+        lines: usize,
+    },
     GetRouting,
     SetRouting(RoutingConfig),
-    SetSelectionMode { mode: SelectionMode },
+    GetRulesConfig,
+    SetRulesConfig(RulesConfig),
+    ExplainRoute {
+        target: String,
+        protocol: Option<String>,
+        port: Option<u16>,
+        process: Option<String>,
+    },
+    ReloadRouting,
+    SetSelectionMode {
+        mode: SelectionMode,
+    },
     GetSelectionMode,
     GetNodeMetrics,
     SubscribeEvents,
@@ -64,6 +93,8 @@ pub enum IpcResponse {
     Probe(Vec<ProbeResult>),
     Leak(LeakReport),
     Routing(RoutingConfig),
+    RulesConfig(RulesConfig),
+    ExplainRoute(ExplainResult),
     SelectionMode(SelectionMode),
     NodeMetrics(std::collections::HashMap<String, NodeMetrics>),
 }
@@ -92,6 +123,7 @@ pub enum DaemonEvent {
         to_id: String,
         reason: String,
     },
+    RoutingReloaded,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
