@@ -42,6 +42,7 @@ enum Msg {
     Connected(Result<Session, String>),
     Disconnected(Result<(), String>),
     Imported(Result<usize, String>),
+    SubsUpdated(Result<usize, String>),
     Ip(String),
     Ping(String, Ping),
     Rtt(Option<u32>),
@@ -54,6 +55,15 @@ enum Mode {
     Rename(String),
     Confirm,
     Help,
+    Qr {
+        profile: Profile,
+        qr: Result<String, String>,
+        exported: Option<String>,
+    },
+    Subs {
+        list: ListState,
+        subs: Vec<store::Subscription>,
+    },
 }
 
 struct App {
@@ -378,11 +388,68 @@ impl App {
         }
     }
 
+    fn sync_subs(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.start("syncing subscriptions");
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let r = store::update_all_subs().map(|results| {
+                let total: usize = results.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
+                total
+            }).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::SubsUpdated(r));
+        });
+    }
+
+    fn sync_single_sub(&mut self, id: String) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.start("updating sub");
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let r = store::update_sub(&id).map(|(_, count)| count).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::SubsUpdated(r));
+        });
+    }
+
     fn paste_clip(&mut self) {
-        let out = Command::new("wl-paste").arg("-n").output().ok().filter(|o| o.status.success());
-        match out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()) {
-            Some(s) if !s.trim().is_empty() => self.import(s),
-            _ => self.toast("clipboard empty — or paste with ctrl+shift+v", false),
+        let get_text = || -> Option<String> {
+            if let Ok(u) = std::env::var("SUDO_USER") {
+                if !u.is_empty() && u != "root" {
+                    if let Ok(o) = Command::new("sudo").args(["-u", &u, "wl-paste", "-n"]).output() {
+                        if o.status.success() {
+                            let s = String::from_utf8_lossy(&o.stdout).to_string();
+                            if !s.trim().is_empty() {
+                                return Some(s);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(o) = Command::new("wl-paste").arg("-n").output() {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).to_string();
+                    if !s.trim().is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+            None
+        };
+
+        if let Some(s) = get_text() {
+            return self.import(s);
+        }
+
+        match store::scan_clipboard_qr() {
+            Ok(s) => {
+                self.toast("DECODED QR PAYLOAD FROM CLIPBOARD IMAGE", true);
+                self.import(s);
+            }
+            Err(_) => self.toast("clipboard empty — or paste with ctrl+shift+v", false),
         }
     }
 
@@ -457,6 +524,16 @@ impl App {
                 Msg::Imported(Err(e)) => {
                     self.busy = None;
                     self.toast(format!("PAYLOAD REJECTED: {e}"), false);
+                }
+                Msg::SubsUpdated(Ok(n)) => {
+                    self.busy = None;
+                    self.reload();
+                    self.toast(format!("SUBSCRIPTIONS SYNCED // {n} NODE(S) UPDATED"), true);
+                    self.test(false);
+                }
+                Msg::SubsUpdated(Err(e)) => {
+                    self.busy = None;
+                    self.toast(format!("SUBSCRIPTION SYNC FAIL: {e}"), false);
                 }
                 Msg::Ip(s) => self.ip = s,
                 Msg::Ping(id, r) => {
@@ -588,6 +665,86 @@ impl App {
                 return false;
             }
             Mode::Help => return false,
+            Mode::Qr { profile, qr, mut exported } => {
+                match k.code {
+                    Esc | Char('q') => {}
+                    Char('c') | Char('C') | Char('y') => {
+                        match store::copy_to_clipboard(&profile.data) {
+                            Ok(()) => self.toast("PAYLOAD COPIED TO SYSTEM CLIPBOARD", true),
+                            Err(e) => self.toast(format!("CLIPBOARD COPY FAILED: {e}"), false),
+                        }
+                        self.mode = Mode::Qr { profile, qr, exported };
+                    }
+                    Char('s') | Char('S') | Char('e') => {
+                        match store::export_to_file(&profile) {
+                            Ok(path) => {
+                                let p_str = path.display().to_string();
+                                self.toast(format!("EXPORTED TO {p_str}"), true);
+                                exported = Some(p_str);
+                            }
+                            Err(e) => self.toast(format!("EXPORT FAILED: {e}"), false),
+                        }
+                        self.mode = Mode::Qr { profile, qr, exported };
+                    }
+                    _ => {
+                        self.mode = Mode::Qr { profile, qr, exported };
+                    }
+                }
+                return false;
+            }
+            Mode::Subs { mut list, mut subs } => {
+                match k.code {
+                    Esc | Char('q') => {}
+                    Char('j') | Down => {
+                        let n = subs.len();
+                        if n > 0 {
+                            let cur = list.selected().unwrap_or(0);
+                            list.select(Some((cur + 1).rem_euclid(n)));
+                        }
+                        self.mode = Mode::Subs { list, subs };
+                    }
+                    Char('k') | Up => {
+                        let n = subs.len();
+                        if n > 0 {
+                            let cur = list.selected().unwrap_or(0) as i32;
+                            list.select(Some((cur - 1).rem_euclid(n as i32) as usize));
+                        }
+                        self.mode = Mode::Subs { list, subs };
+                    }
+                    Enter | Char('u') => {
+                        if let Some(i) = list.selected().and_then(|i| subs.get(i)) {
+                            let id = i.id.clone();
+                            self.sync_single_sub(id);
+                        }
+                    }
+                    Char('s') | Char('S') => {
+                        self.sync_subs();
+                    }
+                    Char('a') => {
+                        self.mode = Mode::Add(String::new());
+                    }
+                    Char('d') => {
+                        if let Some(i) = list.selected() {
+                            if i < subs.len() {
+                                let sub = subs.remove(i);
+                                let _ = store::remove_sub(&sub.id, true);
+                                self.reload();
+                                if !subs.is_empty() {
+                                    list.select(Some(i.min(subs.len() - 1)));
+                                } else {
+                                    list.select(None);
+                                }
+                                self.toast(format!("PURGED SUBSCRIPTION [{}]", sub.name), true);
+                            }
+                        }
+                        self.mode = Mode::Subs { list, subs };
+                    }
+                    _ => {
+                        self.mode = Mode::Subs { list, subs };
+                    }
+                }
+                return false;
+            }
             Mode::Normal => {}
         }
         match k.code {
@@ -626,7 +783,22 @@ impl App {
                 }
             }
             Char(' ') | Char('s') => self.disconnect(),
+            Char('S') => self.sync_subs(),
             Char('a') => self.mode = Mode::Add(String::new()),
+            Char('c') | Char('C') => {
+                if let Some(p) = self.cur().cloned() {
+                    let qr = store::generate_qr(&p.data).map_err(|e| format!("{e}"));
+                    self.mode = Mode::Qr { profile: p, qr, exported: None };
+                }
+            }
+            Char('b') | Char('B') => {
+                let subs = store::load_subs();
+                let mut list = ListState::default();
+                if !subs.is_empty() {
+                    list.select(Some(0));
+                }
+                self.mode = Mode::Subs { list, subs };
+            }
             Char('u') => self.manage_auth(),
             Char('v') => self.paste_clip(),
             Char('/') => self.mode = Mode::Filter(self.filter.clone()),
@@ -849,11 +1021,13 @@ fn draw(f: &mut Frame, app: &mut App) {
     if footer_h > 0 {
         footer(f, rows[2], app);
     }
-    match &app.mode {
+    match &mut app.mode {
         Mode::Add(s) => popup(f, area, "0xIN // INJECT CONFIGURATION PAYLOAD", "VLESS · VMESS · TROJAN · SS · HY2 · TUIC · WG · AWG · OVPN · SUB URL", s),
         Mode::Rename(s) => popup(f, area, "0xRN // MUTATE TARGET IDENTIFIER", "enter new cryptographic profile alias", s),
         Mode::Confirm => confirm_popup(f, area, app),
         Mode::Help => help(f, area),
+        Mode::Qr { profile, qr, exported } => qr_popup(f, area, profile, qr, exported.as_deref()),
+        Mode::Subs { list, subs } => subs_popup(f, area, list, subs),
         _ => {}
     }
 }
@@ -1325,6 +1499,9 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
         ("RET", "ENGAGE"),
         ("SPC", "SEVER"),
         ("A", "INJECT"),
+        ("C", "QR/CONF"),
+        ("B", "SUBS"),
+        ("S", "SYNC"),
         ("T", "PROBE"),
         ("U", "AUTH"),
         ("/", "SCAN"),
@@ -1413,8 +1590,226 @@ fn confirm_popup(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn time_ago(ts: Option<u64>) -> String {
+    let Some(ts) = ts else { return "never".to_string() };
+    let diff = crate::tunnel::now().saturating_sub(ts);
+    if diff < 60 {
+        format!("{diff}s ago")
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
+}
+
+fn qr_popup(f: &mut Frame, area: Rect, p: &Profile, qr: &Result<String, String>, exported: Option<&str>) {
+    let w = (area.width.saturating_sub(2)).min(94);
+    let h = (area.height.saturating_sub(2)).min(32);
+    let r = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let blk = block("0xQR // CONFIGURATION & QR EXPORT MATRIX", true);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+
+    let qr_req_w = 54;
+    let chunks = if inner.width >= 75 {
+        Layout::horizontal([
+            Constraint::Length(qr_req_w.min(inner.width * 55 / 100)),
+            Constraint::Min(20),
+        ])
+        .split(inner)
+    } else {
+        Layout::vertical([
+            Constraint::Percentage(55),
+            Constraint::Percentage(45),
+        ])
+        .split(inner)
+    };
+
+    let qr_blk = Block::bordered()
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(BORDER))
+        .title(Line::from(vec![
+            Span::styled(" ◈ [ ", Style::new().fg(BORDER)),
+            Span::styled("TERMINAL QR CODE", Style::new().fg(CYAN).bold()),
+            Span::styled(" ] ", Style::new().fg(BORDER)),
+        ]));
+    let qr_inner = qr_blk.inner(chunks[0]);
+    f.render_widget(qr_blk, chunks[0]);
+
+    match qr {
+        Ok(code) => {
+            let lines: Vec<Line> = code
+                .lines()
+                .map(|l| Line::from(Span::styled(l, Style::new().fg(FG).bold())))
+                .collect();
+            f.render_widget(Paragraph::new(lines), qr_inner);
+        }
+        Err(e) => {
+            let warn = vec![
+                Line::from(""),
+                Line::from(Span::styled("[!] QR CODE PAYLOAD LIMIT EXCEEDED", Style::new().fg(YELLOW).bold())),
+                Line::from(""),
+                Line::from(Span::styled(e.clone(), Style::new().fg(FG_DIM))),
+                Line::from(""),
+                Line::from(Span::styled("Use [C] to copy raw config to clipboard,", Style::new().fg(FG))),
+                Line::from(Span::styled("or [S] to export directly to disk.", Style::new().fg(FG))),
+            ];
+            f.render_widget(Paragraph::new(warn), qr_inner);
+        }
+    }
+
+    let det_blk = Block::bordered()
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(BORDER))
+        .title(Line::from(vec![
+            Span::styled(" ◈ [ ", Style::new().fg(BORDER)),
+            Span::styled("NODE TELEMETRY & CREDENTIALS", Style::new().fg(CYAN).bold()),
+            Span::styled(" ] ", Style::new().fg(BORDER)),
+        ]));
+    let det_inner = det_blk.inner(chunks[1]);
+    f.render_widget(det_blk, chunks[1]);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" IDENTIFIER : ", Style::new().fg(CYAN).bold()),
+            Span::styled(trunc(&p.name, (det_inner.width as usize).saturating_sub(15)), Style::new().fg(FG).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled(" PROTOCOL   : ", Style::new().fg(CYAN).bold()),
+            Span::styled(format!("{} ", p.kind.tag()), Style::new().fg(kind_color(p.kind)).bold()),
+            Span::styled(format!("({})", p.id), Style::new().fg(FG_DIM)),
+        ]),
+        Line::from(vec![
+            Span::styled(" ENDPOINT   : ", Style::new().fg(CYAN).bold()),
+            Span::styled(&p.server, Style::new().fg(FG).bold()),
+        ]),
+    ];
+
+    for (k, v) in store::details(p) {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<11}: ", k.to_uppercase()), Style::new().fg(FG_DIM)),
+            Span::styled(v, Style::new().fg(FG)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    let exp_status = if let Some(path) = exported {
+        Line::from(vec![
+            Span::styled(" EXPORT FILE: ", Style::new().fg(GREEN).bold()),
+            Span::styled(trunc(path, (det_inner.width as usize).saturating_sub(15)), Style::new().fg(GREEN)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" EXPORT FILE: ", Style::new().fg(BORDER)),
+            Span::styled("NOT SAVED TO DISK", Style::new().fg(FG_DIM)),
+        ])
+    };
+    lines.push(exp_status);
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" ── ACTION CONTROLS ─────────────────", Style::new().fg(BORDER))));
+    lines.push(Line::from(vec![
+        Span::styled(" [C] ", Style::new().fg(CYAN).bold()),
+        Span::styled("COPY FULL PAYLOAD TO CLIPBOARD", Style::new().fg(FG)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" [S] ", Style::new().fg(GREEN).bold()),
+        Span::styled("EXPORT CONFIG FILE (~/vortex-*.conf)", Style::new().fg(FG)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" [ESC] ", Style::new().fg(RED).bold()),
+        Span::styled("DISMISS MATRIX", Style::new().fg(FG_DIM)),
+    ]));
+
+    f.render_widget(Paragraph::new(lines), det_inner);
+}
+
+fn subs_popup(f: &mut Frame, area: Rect, list: &mut ListState, subs: &[store::Subscription]) {
+    let w = (area.width.saturating_sub(4)).min(88);
+    let h = (area.height.saturating_sub(4)).min(20);
+    let r = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let blk = block("0xSUB // SUBSCRIPTION REGISTRY & SYNC MANAGER", true);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+
+    let rows = Layout::vertical([
+        Constraint::Length(2), // Table header
+        Constraint::Min(3),    // List of subs
+        Constraint::Length(2), // Bottom hints
+    ])
+    .split(inner);
+
+    let header_line = Line::from(vec![
+        Span::styled("  #  ", Style::new().fg(CYAN).bold()),
+        Span::styled("ALIAS / NAME            ", Style::new().fg(CYAN).bold()),
+        Span::styled("NODES   ", Style::new().fg(CYAN).bold()),
+        Span::styled("LAST SYNC     ", Style::new().fg(CYAN).bold()),
+        Span::styled("ENDPOINT URL", Style::new().fg(CYAN).bold()),
+    ]);
+    let sep = Line::from(Span::styled(" ─────────────────────────────────────────────────────────────────────────────", Style::new().fg(BORDER)));
+    f.render_widget(Paragraph::new(vec![header_line, sep]), rows[0]);
+
+    if subs.is_empty() {
+        let empty_msg = vec![
+            Line::from(""),
+            Line::from(Span::styled("  [!] NO REMOTE SUBSCRIPTIONS REGISTERED", Style::new().fg(YELLOW).bold())),
+            Line::from(Span::styled("  PRESS [A] TO INJECT A SUBSCRIPTION URL (e.g. https://...)", Style::new().fg(FG_DIM))),
+        ];
+        f.render_widget(Paragraph::new(empty_msg), rows[1]);
+    } else {
+        let items: Vec<ListItem> = subs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let up = time_ago(s.updated);
+                let line = Line::from(vec![
+                    Span::styled(format!(" {:>2}  ", i + 1), Style::new().fg(BORDER)),
+                    Span::styled(format!("{:<24} ", trunc(&s.name, 23)), Style::new().fg(FG).bold()),
+                    Span::styled(format!("{:>4} nodes  ", s.count), Style::new().fg(GREEN)),
+                    Span::styled(format!("{:<13} ", up), Style::new().fg(FG_DIM)),
+                    Span::styled(trunc(&s.url, 26), Style::new().fg(BLUE)),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+
+        let list_widget = List::new(items)
+            .highlight_style(Style::new().bg(SEL_BG).fg(SEL_FG).bold())
+            .highlight_symbol("▶ ");
+        f.render_stateful_widget(list_widget, rows[1], list);
+    }
+
+    let controls = Line::from(vec![
+        Span::styled(" [RET/U] ", Style::new().fg(GREEN).bold()),
+        Span::styled("SYNC SELECTED  ", Style::new().fg(FG_DIM)),
+        Span::styled("[S] ", Style::new().fg(CYAN).bold()),
+        Span::styled("SYNC ALL  ", Style::new().fg(FG_DIM)),
+        Span::styled("[A] ", Style::new().fg(YELLOW).bold()),
+        Span::styled("ADD SUB  ", Style::new().fg(FG_DIM)),
+        Span::styled("[D] ", Style::new().fg(RED).bold()),
+        Span::styled("PURGE  ", Style::new().fg(FG_DIM)),
+        Span::styled("[ESC] ", Style::new().fg(FG_DIM).bold()),
+        Span::styled("CLOSE", Style::new().fg(FG_DIM)),
+    ]);
+    f.render_widget(Paragraph::new(vec![Line::from(""), controls]), rows[2]);
+}
+
 fn help(f: &mut Frame, area: Rect) {
-    let rows: [(&str, &str, &str); 17] = [
+    let rows: [(&str, &str, &str); 20] = [
         ("TUNNEL CONTROL", "RET / ENTER", "ENGAGE SELECTED TARGET NODE"),
         ("TUNNEL CONTROL", "SPC / S", "SEVER / ABORT ACTIVE TUNNEL"),
         ("TUNNEL CONTROL", "J K ↑ ↓", "NAVIGATE TARGET NODE MATRIX"),
@@ -1424,11 +1819,14 @@ fn help(f: &mut Frame, area: Rect) {
         ("RECON & PROBE", "O", "CYCLE SORT ORDER (RTT SPEED ⇄ ID)"),
         ("RECON & PROBE", "/", "PATTERN SCAN & GREP FILTER"),
         ("RECON & PROBE", "I", "PROBE LIVE PUBLIC EXIT IP"),
-        ("PAYLOAD & AUTH", "A", "INJECT LINK / SUBSCRIPTION / FILE"),
-        ("PAYLOAD & AUTH", "V", "INJECT VECTOR FROM CLIPBOARD"),
+        ("PAYLOAD & AUTH", "C", "RENDER QR CODE & CONFIGURATION INSPECTOR"),
+        ("PAYLOAD & AUTH", "A", "INJECT LINK / SUBSCRIPTION / FILE / QR IMAGE"),
+        ("PAYLOAD & AUTH", "V", "INJECT VECTOR / QR SCREENSHOT FROM CLIPBOARD"),
         ("PAYLOAD & AUTH", "U", "CONFIGURE OPENVPN CREDENTIAL VAULT"),
         ("PAYLOAD & AUTH", "R", "MUTATE TARGET IDENTIFIER (RENAME)"),
         ("PAYLOAD & AUTH", "D", "PURGE TARGET VECTOR FROM KEYSTORE"),
+        ("SUBSCRIPTION", "B", "OPEN SUBSCRIPTION REGISTRY MANAGER"),
+        ("SUBSCRIPTION", "SHIFT+S", "EXECUTE RECURSIVE SYNC ON ALL SUBS"),
         ("SYSTEM OPS", "L", "TOGGLE KERNEL AUDIT & LIVE LOGS"),
         ("SYSTEM OPS", "ESC", "DISMISS / CLEAR FILTER / ABORT"),
         ("SYSTEM OPS", "Q / SHIFT+Q", "DETACH CONSOLE / TERMINATE ALL"),
@@ -1467,7 +1865,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn prof(id: &str, name: &str, kind: Kind, data: &str) -> Profile {
-        Profile { id: id.into(), name: name.into(), kind, server: "203.0.113.7:443".into(), data: data.into(), auth: None }
+        Profile { id: id.into(), name: name.into(), kind, server: "203.0.113.7:443".into(), data: data.into(), auth: None, sub_id: None }
     }
 
     fn render(w: u16, h: u16, app: &mut App) -> String {
@@ -1547,5 +1945,76 @@ mod tests {
         assert!(out.contains("LINK ENGAGED"));
         assert!(out.contains("CHACHA20"));
         assert!(out.contains("PACKET FLOW & SPECTRUM ANALYZER"));
+    }
+
+    #[test]
+    fn test_qr_generation() {
+        use qrcode::QrCode;
+        use qrcode::render::unicode;
+        let link = "vless://b6a03649-61f4-41aa-a51b-402c3cc6c547@203.0.113.7:443?security=reality&sni=example.com&pbk=1234567890abcdef1234567890abcdef1234567890a&type=grpc&serviceName=grpc-test#Frankfurt";
+        let code = QrCode::new(link).unwrap();
+        let qr_str = code.render::<unicode::Dense1x2>().quiet_zone(false).build();
+        let lines: Vec<&str> = qr_str.lines().collect();
+        println!("QR (no quiet zone) lines: {}, width: {}", lines.len(), lines.first().map(|l| l.chars().count()).unwrap_or(0));
+        println!("\n{qr_str}\n");
+    }
+
+    #[test]
+    fn test_qr_modal_render() {
+        let mut app = App::new();
+        let p = prof("test-qr", "Frankfurt QR", Kind::Vless, "vless://u@example.com:443?security=reality#Frankfurt");
+        let qr = store::generate_qr(&p.data).map_err(|e| format!("{e}"));
+        app.mode = Mode::Qr { profile: p, qr, exported: Some("~/vortex-test-qr.conf".into()) };
+        let out = render(100, 30, &mut app);
+        assert!(out.contains("0xQR // CONFIGURATION & QR EXPORT MATRIX"));
+        assert!(out.contains("NODE TELEMETRY & CREDENTIALS"));
+        assert!(out.contains("Frankfurt QR"));
+        assert!(out.contains("EXPORT FILE"));
+    }
+
+    #[test]
+    fn test_subs_modal_render() {
+        let mut app = App::new();
+        let mut list = ListState::default();
+        list.select(Some(0));
+        let subs = vec![
+            store::Subscription {
+                id: "vip-node".into(),
+                name: "VIP Dedicated Nodes".into(),
+                url: "https://example.com/sub/token".into(),
+                count: 12,
+                updated: Some(1720000000),
+            },
+        ];
+        app.mode = Mode::Subs { list, subs };
+        let out = render(100, 30, &mut app);
+        assert!(out.contains("0xSUB // SUBSCRIPTION REGISTRY & SYNC MANAGER"));
+        assert!(out.contains("VIP Dedicated Nodes"));
+        assert!(out.contains("12 nodes"));
+    }
+
+    #[test]
+    fn test_ui_hotkeys_navigation() {
+        let mut app = App::new();
+        let p = prof("test-hk", "HotKey Node", Kind::Vless, "vless://u@example.com:443#HotKey");
+        app.profiles = vec![p];
+        app.rebuild();
+        assert_eq!(app.view.len(), 1);
+
+        // Press 'c' to open QR modal
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Qr { .. }));
+
+        // Press Esc to dismiss QR modal
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // Press 'b' to open Subs modal
+        app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Subs { .. }));
+
+        // Press Esc to dismiss Subs modal
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Normal));
     }
 }

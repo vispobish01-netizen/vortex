@@ -14,6 +14,7 @@ use url::Url;
 
 pub const ROOT: &str = "/etc/vortex";
 pub const STORE: &str = "/etc/vortex/profiles";
+pub const SUBS_FILE: &str = "/etc/vortex/subscriptions.json";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -75,6 +76,16 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Subscription {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<u64>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Profile {
     pub id: String,
@@ -85,6 +96,8 @@ pub struct Profile {
     pub data: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_id: Option<String>,
 }
 
 // ───────────────────────── storage ─────────────────────────
@@ -150,9 +163,322 @@ fn slug(s: &str) -> String {
     o
 }
 
-/// Import anything the user can paste: link(s), subscription URL, config file path.
+// ───────────────────────── subscriptions ─────────────────────────
+
+pub fn load_subs() -> Vec<Subscription> {
+    fs::read_to_string(SUBS_FILE)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_subs(subs: &[Subscription]) -> Result<()> {
+    let path = Path::new(SUBS_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(path, serde_json::to_string_pretty(subs)?)?;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+pub fn sub_name_from_url(url_str: &str) -> (String, String) {
+    let parsed = Url::parse(url_str).ok();
+    let fragment = parsed.as_ref().and_then(|u| u.fragment()).map(pdec).filter(|s| !s.trim().is_empty());
+    let host = parsed.as_ref().and_then(|u| u.host_str()).map(String::from).unwrap_or_else(|| "subscription".into());
+    let name = fragment.unwrap_or_else(|| host.clone());
+    let mut base_id = slug(&name);
+    if base_id.is_empty() {
+        base_id = slug(&host);
+    }
+    (base_id, name)
+}
+
+fn save_sub_profiles(sub_id: &str, profiles: Vec<Profile>) -> Result<usize> {
+    let existing = load_all();
+    let active_id = crate::tunnel::load_session().map(|s| s.id);
+    for p in &existing {
+        if p.sub_id.as_deref() == Some(sub_id) {
+            if active_id.as_deref() != Some(&p.id) {
+                let _ = remove(&p.id);
+            }
+        }
+    }
+    let remaining = load_all();
+    let mut ids: HashSet<String> = remaining.iter().map(|p| p.id.clone()).collect();
+    let mut data_set: HashSet<String> = remaining.iter().map(|p| p.data.clone()).collect();
+    let mut count = 0;
+    for mut p in profiles {
+        if data_set.contains(&p.data) {
+            continue;
+        }
+        let base = slug(&p.name);
+        let mut id = base.clone();
+        let mut i = 2;
+        while ids.contains(&id) {
+            id = format!("{base}-{i}");
+            i += 1;
+        }
+        ids.insert(id.clone());
+        data_set.insert(p.data.clone());
+        p.id = id;
+        p.sub_id = Some(sub_id.to_string());
+        save(&p)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+pub fn add_sub(url: &str, name_hint: Option<&str>) -> Result<(Subscription, usize)> {
+    let mut subs = load_subs();
+    let (mut id, mut name) = sub_name_from_url(url);
+    if let Some(h) = name_hint.filter(|s| !s.trim().is_empty()) {
+        name = h.trim().to_string();
+        id = slug(&name);
+    }
+
+    let existing_pos = subs.iter().position(|s| s.url == url);
+    let sub_id = if let Some(pos) = existing_pos {
+        subs[pos].id.clone()
+    } else {
+        let base = id.clone();
+        let mut i = 2;
+        while subs.iter().any(|s| s.id == id) {
+            id = format!("{base}-{i}");
+            i += 1;
+        }
+        id
+    };
+
+    let profiles = import_sub(url)?;
+    let count = save_sub_profiles(&sub_id, profiles)?;
+    let now_ts = crate::tunnel::now();
+    let sub = Subscription {
+        id: sub_id,
+        name,
+        url: url.to_string(),
+        count,
+        updated: Some(now_ts),
+    };
+
+    if let Some(pos) = existing_pos {
+        subs[pos] = sub.clone();
+    } else {
+        subs.push(sub.clone());
+    }
+    save_subs(&subs)?;
+    Ok((sub, count))
+}
+
+pub fn update_sub(id_or_url: &str) -> Result<(Subscription, usize)> {
+    let subs = load_subs();
+    let sub = subs.iter()
+        .find(|s| s.id == id_or_url || s.url == id_or_url)
+        .cloned()
+        .ok_or_else(|| anyhow!("subscription '{id_or_url}' not found"))?;
+
+    let profiles = import_sub(&sub.url)?;
+    let count = save_sub_profiles(&sub.id, profiles)?;
+
+    let mut subs = load_subs();
+    let mut updated_sub = sub;
+    updated_sub.count = count;
+    updated_sub.updated = Some(crate::tunnel::now());
+    if let Some(pos) = subs.iter().position(|s| s.id == updated_sub.id) {
+        subs[pos] = updated_sub.clone();
+    }
+    save_subs(&subs)?;
+    Ok((updated_sub, count))
+}
+
+pub fn update_all_subs() -> Result<Vec<(String, Result<usize>)>> {
+    let subs = load_subs();
+    if subs.is_empty() {
+        bail!("no subscriptions configured — use `vortex sub add <url>`");
+    }
+    let mut results = vec![];
+    for sub in subs {
+        match import_sub(&sub.url) {
+            Ok(profs) => match save_sub_profiles(&sub.id, profs) {
+                Ok(count) => {
+                    let mut all_subs = load_subs();
+                    if let Some(pos) = all_subs.iter().position(|s| s.id == sub.id) {
+                        all_subs[pos].count = count;
+                        all_subs[pos].updated = Some(crate::tunnel::now());
+                        let _ = save_subs(&all_subs);
+                    }
+                    results.push((sub.name, Ok(count)));
+                }
+                Err(e) => results.push((sub.name, Err(e))),
+            },
+            Err(e) => results.push((sub.name, Err(e))),
+        }
+    }
+    Ok(results)
+}
+
+pub fn remove_sub(id_or_url: &str, purge_nodes: bool) -> Result<usize> {
+    let mut subs = load_subs();
+    let pos = subs.iter()
+        .position(|s| s.id == id_or_url || s.url == id_or_url)
+        .ok_or_else(|| anyhow!("subscription '{id_or_url}' not found"))?;
+    let sub = subs.remove(pos);
+    save_subs(&subs)?;
+
+    let mut removed_count = 0;
+    if purge_nodes {
+        let all = load_all();
+        let active_id = crate::tunnel::load_session().map(|s| s.id);
+        for p in all {
+            if p.sub_id.as_deref() == Some(&sub.id) {
+                if active_id.as_deref() == Some(&p.id) {
+                    continue;
+                }
+                if remove(&p.id).is_ok() {
+                    removed_count += 1;
+                }
+            }
+        }
+    }
+    Ok(removed_count)
+}
+
+// ───────────────────────── QR & export ─────────────────────────
+
+pub fn generate_qr(data: &str) -> Result<String> {
+    use qrcode::QrCode;
+    use qrcode::render::unicode;
+    let code = QrCode::new(data.as_bytes()).map_err(|e| anyhow!("QR generation failed: {e}"))?;
+    Ok(code.render::<unicode::Dense1x2>().quiet_zone(false).build())
+}
+
+pub fn export_to_file(p: &Profile) -> Result<PathBuf> {
+    let ext = match p.kind {
+        Kind::Ovpn => "ovpn",
+        Kind::Wg | Kind::Awg => "conf",
+        _ => "txt",
+    };
+    let filename = format!("vortex-{}.{}", p.id, ext);
+    let target = user_home().join(&filename);
+
+    let content = if p.kind.is_singbox() {
+        if let Ok((_, ob, _, _)) = outbound(&p.data) {
+            format!("{}\n\n// sing-box outbound configuration:\n{}\n", p.data, serde_json::to_string_pretty(&ob)?)
+        } else {
+            p.data.clone()
+        }
+    } else {
+        p.data.clone()
+    };
+
+    fs::write(&target, content)?;
+    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
+    Ok(target)
+}
+
+pub fn copy_to_clipboard(text: &str) -> Result<()> {
+    let try_cmd = |mut cmd: Command| -> Result<()> {
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(text.as_bytes())?;
+        }
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("clipboard command failed")
+        }
+    };
+
+    if let Ok(u) = std::env::var("SUDO_USER") {
+        if !u.is_empty() && u != "root" {
+            let mut cmd = Command::new("sudo");
+            cmd.args(["-u", &u, "wl-copy"]);
+            if try_cmd(cmd).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    if try_cmd(Command::new("wl-copy")).is_ok() {
+        return Ok(());
+    }
+
+    let mut cmd = Command::new("xclip");
+    cmd.args(["-selection", "clipboard"]);
+    if try_cmd(cmd).is_ok() {
+        return Ok(());
+    }
+
+    bail!("could not copy to clipboard (wl-copy or xclip needed)")
+}
+
+fn is_image_path(p: &Path) -> bool {
+    let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "pbm" | "pgm" | "ppm" | "tiff")
+}
+
+pub fn scan_qr_file(path: &Path) -> Result<String> {
+    let out = Command::new("zbarimg")
+        .args(["-q", "--raw"])
+        .arg(path)
+        .output()
+        .context("zbarimg failed to execute — make sure zbar is installed")?;
+    if !out.status.success() {
+        bail!("no QR code or barcode found in {}", path.display());
+    }
+    let res = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if res.is_empty() {
+        bail!("empty QR payload");
+    }
+    Ok(res)
+}
+
+pub fn scan_clipboard_qr() -> Result<String> {
+    let get_img = || -> Option<Vec<u8>> {
+        if let Ok(u) = std::env::var("SUDO_USER") {
+            if !u.is_empty() && u != "root" {
+                if let Ok(o) = Command::new("sudo").args(["-u", &u, "wl-paste", "--type", "image/png"]).output() {
+                    if o.status.success() && !o.stdout.is_empty() {
+                        return Some(o.stdout);
+                    }
+                }
+            }
+        }
+        if let Ok(o) = Command::new("wl-paste").args(["--type", "image/png"]).output() {
+            if o.status.success() && !o.stdout.is_empty() {
+                return Some(o.stdout);
+            }
+        }
+        None
+    };
+
+    let bytes = get_img().ok_or_else(|| anyhow!("no image in clipboard"))?;
+    let tmp = std::env::temp_dir().join(format!("vortex_clip_{}.png", std::process::id()));
+    fs::write(&tmp, &bytes)?;
+    let res = scan_qr_file(&tmp);
+    let _ = fs::remove_file(&tmp);
+    res
+}
+
+// ───────────────────────── import ─────────────────────────
+
+/// Import anything the user can paste: link(s), subscription URL, config file path, QR code image.
 /// Returns how many *new* profiles were stored.
 pub fn import(input: &str) -> Result<usize> {
+    let s = input.trim().trim_matches(|c| c == '"' || c == '\'');
+    if s.is_empty() {
+        bail!("nothing to import");
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        let (_, count) = add_sub(s, None)?;
+        return Ok(count);
+    }
     let found = parse_any(input)?;
     let existing = load_all();
     let mut ids: HashSet<String> = existing.iter().map(|p| p.id.clone()).collect();
@@ -186,6 +512,22 @@ fn parse_any(input: &str) -> Result<Vec<Profile>> {
     if s.starts_with("http://") || s.starts_with("https://") {
         return import_sub(s);
     }
+    let p = expand(s);
+    if p.is_file() {
+        if is_image_path(&p) {
+            let qr_text = scan_qr_file(&p)?;
+            return parse_any(&qr_text);
+        }
+        match import_file(s) {
+            Ok(prof) => return Ok(vec![prof]),
+            Err(e) => {
+                if let Ok(qr_text) = scan_qr_file(&p) {
+                    return parse_any(&qr_text);
+                }
+                return Err(e);
+            }
+        }
+    }
     if s.contains("://") {
         let mut v = vec![];
         let mut first_err = None;
@@ -204,7 +546,39 @@ fn parse_any(input: &str) -> Result<Vec<Profile>> {
         }
         return Ok(v);
     }
+    if s.contains("[Interface]") || s.contains("remote ") {
+        return parse_raw_config(s);
+    }
     Ok(vec![import_file(s)?])
+}
+
+fn parse_raw_config(text: &str) -> Result<Vec<Profile>> {
+    if text.contains("[Interface]") {
+        let awg = AWG_KEYS.iter().any(|k| kv_find(text, k).is_some());
+        let server = kv_find(text, "Endpoint").unwrap_or_default();
+        let name = format!("Config · {}", if awg { "AWG" } else { "WireGuard" });
+        return Ok(vec![Profile {
+            id: String::new(),
+            name,
+            kind: if awg { Kind::Awg } else { Kind::Wg },
+            server,
+            data: text.to_string(),
+            auth: None,
+            sub_id: None,
+        }]);
+    }
+    if text.lines().any(|l| l.trim_start().starts_with("remote ")) {
+        return Ok(vec![Profile {
+            id: String::new(),
+            name: "Config · OpenVPN".to_string(),
+            kind: Kind::Ovpn,
+            server: ovpn_server(text),
+            data: text.to_string(),
+            auth: None,
+            sub_id: None,
+        }]);
+    }
+    bail!("unrecognized raw config")
 }
 
 // ───────────────────────── helpers ─────────────────────────
@@ -522,7 +896,7 @@ fn parse_link(l: &str) -> Result<Vec<Profile>> {
         return amnezia(l);
     }
     let (k, _, name, server) = outbound(l)?;
-    Ok(vec![Profile { id: String::new(), name, kind: k, server, data: l.to_string(), auth: None }])
+    Ok(vec![Profile { id: String::new(), name, kind: k, server, data: l.to_string(), auth: None, sub_id: None }])
 }
 
 
@@ -707,12 +1081,13 @@ fn import_file(s: &str) -> Result<Profile> {
             server: kv_find(&text, "Endpoint").unwrap_or_default(),
             data: text,
             auth: None,
+            sub_id: None,
         });
     }
     if text.lines().any(|l| l.trim_start().starts_with("remote ")) {
         let dir = p.parent().unwrap_or(Path::new("."));
         let data = inline_ovpn(&text, dir);
-        return Ok(Profile { id: String::new(), name, kind: Kind::Ovpn, server: ovpn_server(&data), data, auth: None });
+        return Ok(Profile { id: String::new(), name, kind: Kind::Ovpn, server: ovpn_server(&data), data, auth: None, sub_id: None });
     }
     bail!("unrecognized file (expected WireGuard, AmneziaWG or OpenVPN config)")
 }
@@ -753,6 +1128,7 @@ fn amnezia(l: &str) -> Result<Vec<Profile>> {
                 server,
                 data: cfg,
                 auth: None,
+                sub_id: None,
             });
         }
     }
@@ -881,5 +1257,75 @@ mod tests {
         assert_eq!(a.password, "secret");
         assert!(a.save);
         assert!(crate::tunnel::ovpn_needs_auth(&p2));
+    }
+
+    #[test]
+    fn test_generate_qr() {
+        let link = "vless://u@example.com:443?security=reality#Frankfurt";
+        let qr = generate_qr(link).unwrap();
+        assert!(!qr.is_empty());
+        assert!(qr.lines().count() > 10);
+    }
+
+    #[test]
+    fn test_sub_name_from_url() {
+        let (id1, name1) = sub_name_from_url("https://sub.provider.com/api/v1?token=123#MyVip");
+        assert_eq!(name1, "MyVip");
+        assert_eq!(id1, "myvip");
+
+        let (id2, name2) = sub_name_from_url("https://vpn.fastnode.org/subscribe?t=xyz");
+        assert_eq!(name2, "vpn.fastnode.org");
+        assert_eq!(id2, "vpn-fastnode-org");
+    }
+
+    #[test]
+    fn test_subscription_json_roundtrip() {
+        let sub = Subscription {
+            id: "sub-1".into(),
+            name: "Super Fast Sub".into(),
+            url: "https://example.com/sub".into(),
+            count: 42,
+            updated: Some(1720000000),
+        };
+        let js = serde_json::to_string(&sub).unwrap();
+        let sub2: Subscription = serde_json::from_str(&js).unwrap();
+        assert_eq!(sub, sub2);
+    }
+
+    #[test]
+    fn test_raw_config_parsing() {
+        let wg_text = "[Interface]\nPrivateKey = a=\nAddress = 10.0.0.2/24\n[Peer]\nEndpoint = 198.51.100.1:51820\nPublicKey = b=\n";
+        let profs = parse_raw_config(wg_text).unwrap();
+        assert_eq!(profs.len(), 1);
+        assert_eq!(profs[0].kind, Kind::Wg);
+        assert_eq!(profs[0].server, "198.51.100.1:51820");
+
+        let awg_text = "[Interface]\nPrivateKey = a=\nJc = 4\n[Peer]\nEndpoint = 198.51.100.2:51820\nPublicKey = b=\n";
+        let profs2 = parse_raw_config(awg_text).unwrap();
+        assert_eq!(profs2[0].kind, Kind::Awg);
+
+        let ovpn_text = "client\ndev tun\nremote 198.51.100.3 1194\n";
+        let profs3 = parse_raw_config(ovpn_text).unwrap();
+        assert_eq!(profs3[0].kind, Kind::Ovpn);
+        assert_eq!(profs3[0].server, "198.51.100.3:1194");
+    }
+
+    #[test]
+    fn test_export_to_file() {
+        let dir = std::env::temp_dir();
+        let p = Profile {
+            id: "test-export-node".into(),
+            name: "Test Export".into(),
+            kind: Kind::Wg,
+            server: "1.2.3.4:51820".into(),
+            data: "[Interface]\nPrivateKey = x\n[Peer]\nEndpoint = 1.2.3.4:51820\n".into(),
+            auth: None,
+            sub_id: None,
+        };
+        let export_path = dir.join(format!("vortex-{}.conf", p.id));
+        fs::write(&export_path, &p.data).unwrap();
+        let read = fs::read_to_string(&export_path).unwrap();
+        assert_eq!(read, p.data);
+        let _ = fs::remove_file(export_path);
     }
 }

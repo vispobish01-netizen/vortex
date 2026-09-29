@@ -10,11 +10,18 @@ const HELP: &str = "\
 vortex — minimal VPN/proxy manager for Omarchy
 
   vortex               open the TUI
-  vortex add <x>       import a share link, subscription URL, or .conf/.ovpn file
+  vortex add <x>       import share link, sub URL, QR image (.png), or .conf/.ovpn
   vortex list          list profiles
   vortex up [n|name]   connect (number from `list`, or part of the name; no arg = last used)
   vortex best          test every server, connect to the fastest
   vortex ping          test latency of every profile
+  vortex qr [n|name]   render compact terminal QR code for mobile scanning
+  vortex conf [n|name] show full config text (--copy to clipboard, --export to file)
+  vortex sub list      list tracked subscriptions
+  vortex sub add <url> add subscription and import nodes
+  vortex sub update    update subscriptions from remote endpoints
+  vortex sub rm <id>   remove a tracked subscription
+  vortex update        sync all subscriptions
   vortex auth <n|name> [--clear]  manage OpenVPN username & password (with save mode)
   vortex rename <n|name> <new name>
   vortex rm <n|name>   delete a profile
@@ -82,6 +89,16 @@ fn fmt_ping(r: ping::Ping) -> String {
     }
 }
 
+fn trunc_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
@@ -135,6 +152,121 @@ fn main() -> Result<()> {
                 Some((p, _)) => connect_cli(&p),
                 None => bail!("no reachable profile"),
             }
+        }
+        Some("qr") => {
+            let q = args[1..].join(" ");
+            let p = find(&q)?;
+            match store::generate_qr(&p.data) {
+                Ok(code) => {
+                    println!("\x1b[1;36m◈ 0xQR // {} ({})\x1b[0m", p.name, p.kind.tag());
+                    println!("{code}");
+                    println!("\x1b[1;32mEndpoint:\x1b[0m {}", p.server);
+                    if p.kind.is_singbox() {
+                        println!("\x1b[1;32mPayload:\x1b[0m  {}", p.data);
+                    }
+                    println!("\x1b[2mScan with your mobile VPN client (v2rayNG, Streisand, Sing-box, WireGuard, Shadowrocket)\x1b[0m");
+                }
+                Err(e) => bail!("could not generate QR code: {e}"),
+            }
+            Ok(())
+        }
+        Some("conf") | Some("config") => {
+            let mut copy = false;
+            let mut export = false;
+            let mut query = vec![];
+            for a in &args[1..] {
+                if a == "--copy" || a == "-c" {
+                    copy = true;
+                } else if a == "--export" || a == "-e" {
+                    export = true;
+                } else {
+                    query.push(a.as_str());
+                }
+            }
+            let p = find(&query.join(" "))?;
+            if copy {
+                store::copy_to_clipboard(&p.data)?;
+                println!("copied configuration for '{}' to clipboard", p.name);
+                return Ok(());
+            }
+            if export {
+                let path = store::export_to_file(&p)?;
+                println!("exported configuration to {}", path.display());
+                return Ok(());
+            }
+            println!("\x1b[1;36m# Configuration for {} ({})\x1b[0m", p.name, p.kind.tag());
+            println!("{}", p.data);
+            if p.kind.is_singbox() {
+                if let Ok((_, ob, _, _)) = store::outbound(&p.data) {
+                    println!("\n\x1b[1;36m# Sing-box Outbound JSON:\x1b[0m");
+                    println!("{}", serde_json::to_string_pretty(&ob)?);
+                }
+            }
+            Ok(())
+        }
+        Some("sub") | Some("subs") => {
+            let subcmd = args.get(1).map(String::as_str).unwrap_or("list");
+            match subcmd {
+                "list" | "ls" => {
+                    let subs = store::load_subs();
+                    if subs.is_empty() {
+                        println!("no subscriptions configured — use `vortex sub add <url>`");
+                        return Ok(());
+                    }
+                    println!("{:<3} {:<16} {:<24} {:<8} {:<12} {}", "#", "ID", "NAME", "NODES", "UPDATED", "URL");
+                    for (i, s) in subs.iter().enumerate() {
+                        let updated = s.updated.map(|ts| {
+                            let diff = tunnel::now().saturating_sub(ts);
+                            if diff < 60 { format!("{diff}s ago") }
+                            else if diff < 3600 { format!("{}m ago", diff / 60) }
+                            else if diff < 86400 { format!("{}h ago", diff / 3600) }
+                            else { format!("{}d ago", diff / 86400) }
+                        }).unwrap_or_else(|| "never".into());
+                        println!("{:>2}  {:<16} {:<24} {:<8} {:<12} {}", i + 1, s.id, trunc_str(&s.name, 24), s.count, updated, s.url);
+                    }
+                    Ok(())
+                }
+                "add" => {
+                    let url = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: vortex sub add <url> [name]"))?;
+                    let name = args.get(3).map(String::as_str);
+                    let (sub, count) = store::add_sub(url, name)?;
+                    println!("added subscription '{}' ({}) with {} node(s)", sub.name, sub.id, count);
+                    Ok(())
+                }
+                "update" | "up" | "sync" => {
+                    let target = args.get(2).map(String::as_str).unwrap_or("all");
+                    if target == "all" {
+                        let results = store::update_all_subs()?;
+                        for (name, r) in results {
+                            match r {
+                                Ok(n) => println!("✔ {name}: updated ({n} nodes)"),
+                                Err(e) => println!("✕ {name}: failed ({e})"),
+                            }
+                        }
+                    } else {
+                        let (sub, count) = store::update_sub(target)?;
+                        println!("✔ {}: updated ({count} nodes)", sub.name);
+                    }
+                    Ok(())
+                }
+                "rm" | "remove" | "del" => {
+                    let target = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: vortex sub rm <id>"))?;
+                    let removed = store::remove_sub(target, true)?;
+                    println!("removed subscription and cleaned up {removed} profile(s)");
+                    Ok(())
+                }
+                other => bail!("unknown subscription command '{other}' — try list, add, update, rm"),
+            }
+        }
+        Some("update") | Some("sync") => {
+            let results = store::update_all_subs()?;
+            for (name, r) in results {
+                match r {
+                    Ok(n) => println!("✔ {name}: updated ({n} nodes)"),
+                    Err(e) => println!("✕ {name}: failed ({e})"),
+                }
+            }
+            Ok(())
         }
         Some("auth") => {
             let q = args.get(1).map(String::as_str).unwrap_or("");
