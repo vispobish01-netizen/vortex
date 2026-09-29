@@ -198,10 +198,8 @@ fn save_sub_profiles(sub_id: &str, profiles: Vec<Profile>) -> Result<usize> {
     let existing = load_all();
     let active_id = crate::tunnel::load_session().map(|s| s.id);
     for p in &existing {
-        if p.sub_id.as_deref() == Some(sub_id) {
-            if active_id.as_deref() != Some(&p.id) {
-                let _ = remove(&p.id);
-            }
+        if p.sub_id.as_deref() == Some(sub_id) && active_id.as_deref() != Some(&p.id) {
+            let _ = remove(&p.id);
         }
     }
     let remaining = load_all();
@@ -1043,7 +1041,7 @@ fn ovpn_server(text: &str) -> String {
 fn inline_ovpn(text: &str, dir: &Path) -> String {
     let mut out = String::new();
     for line in text.lines() {
-        let mut it = line.trim().split_whitespace();
+        let mut it = line.split_whitespace();
         let key = it.next().unwrap_or("");
         let tag = match key {
             "ca" | "cert" | "key" | "tls-crypt" | "tls-auth" | "crl-verify" => key,

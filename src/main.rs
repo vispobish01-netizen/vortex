@@ -1,4 +1,5 @@
 mod benchmark;
+mod keymap;
 mod ping;
 mod recon;
 mod shield;
@@ -334,7 +335,7 @@ fn main() -> Result<()> {
                         println!("no subscriptions configured — use `vortex sub add <url>`");
                         return Ok(());
                     }
-                    println!("{:<3} {:<16} {:<24} {:<8} {:<12} {}", "#", "ID", "NAME", "NODES", "UPDATED", "URL");
+                    println!("{:<3} {:<16} {:<24} {:<8} {:<12} URL", "#", "ID", "NAME", "NODES", "UPDATED");
                     for (i, s) in subs.iter().enumerate() {
                         let updated = s.updated.map(|ts| {
                             let diff = tunnel::now().saturating_sub(ts);

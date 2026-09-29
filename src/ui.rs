@@ -1,4 +1,5 @@
 use crate::benchmark::{self, SpeedResult};
+use crate::keymap::{self, Action, ConfirmKind, Mode};
 use crate::ping::{self, Ping};
 use crate::recon::{self, ReconReport};
 use crate::shield;
@@ -6,7 +7,7 @@ use crate::store::{self, Kind, Profile};
 use crate::tunnel::{self, ActiveFlow, Session};
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -41,6 +42,7 @@ const SEL_FG: Color = Color::Rgb(0x00, 0xff, 0xcc);     // Highlight Active
 const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const HIST: usize = 240;
 
+#[allow(clippy::large_enum_variant)]
 enum Msg {
     Connected(Result<Session, String>),
     Disconnected(Result<(), String>),
@@ -54,29 +56,6 @@ enum Msg {
     Flows(Vec<ActiveFlow>),
 }
 
-enum Mode {
-    Normal,
-    Add(String),
-    Filter(String),
-    Rename(String),
-    Confirm,
-    Help,
-    Qr {
-        profile: Profile,
-        qr: Result<String, String>,
-        exported: Option<String>,
-    },
-    Subs {
-        list: ListState,
-        subs: Vec<store::Subscription>,
-    },
-    Recon(Result<ReconReport, String>),
-    Speed {
-        result: Option<SpeedResult>,
-        running: bool,
-    },
-}
-
 struct App {
     profiles: Vec<Profile>,
     /// indices into `profiles` after filter + sort
@@ -85,6 +64,7 @@ struct App {
     filter: String,
     sort_ping: bool,
     mode: Mode,
+    focused_panel: usize,
     session: Option<Session>,
     busy: Option<&'static str>,
     busy_since: Instant,
@@ -108,6 +88,14 @@ struct App {
     ip: String,
     pings: HashMap<String, Ping>,
     pending: HashSet<String>,
+    qr_profile: Option<Profile>,
+    qr_code: Option<Result<String, String>>,
+    qr_exported: Option<String>,
+    subs: Vec<store::Subscription>,
+    subs_list: ListState,
+    recon_report: Option<Result<ReconReport, String>>,
+    speed_result: Option<SpeedResult>,
+    speed_running: bool,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -116,34 +104,6 @@ fn push(v: &mut Vec<u64>, x: u64) {
     v.push(x);
     if v.len() > HIST {
         v.remove(0);
-    }
-}
-
-/// shared text-editing keys for the single-line inputs; returns true if the key was consumed
-fn edit(s: &mut String, k: &KeyEvent) -> bool {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    match k.code {
-        KeyCode::Backspace => {
-            s.pop();
-            true
-        }
-        KeyCode::Char('u') if ctrl => {
-            s.clear();
-            true
-        }
-        KeyCode::Char('w') if ctrl => {
-            let t = s.trim_end().len();
-            s.truncate(t);
-            while s.chars().last().map(|c| !c.is_whitespace()).unwrap_or(false) {
-                s.pop();
-            }
-            true
-        }
-        KeyCode::Char(c) if !ctrl => {
-            s.push(c);
-            true
-        }
-        _ => false,
     }
 }
 
@@ -157,6 +117,7 @@ impl App {
             filter: String::new(),
             sort_ping: false,
             mode: Mode::Normal,
+            focused_panel: 1,
             session: tunnel::load_session(),
             busy: None,
             busy_since: Instant::now(),
@@ -180,6 +141,14 @@ impl App {
             ip: String::new(),
             pings: HashMap::new(),
             pending: HashSet::new(),
+            qr_profile: None,
+            qr_code: None,
+            qr_exported: None,
+            subs: vec![],
+            subs_list: ListState::default(),
+            recon_report: None,
+            speed_result: None,
+            speed_running: false,
             tx,
             rx,
         };
@@ -475,8 +444,8 @@ impl App {
     /// bracketed paste from the terminal
     fn paste(&mut self, s: String) {
         match &mut self.mode {
-            Mode::Add(i) | Mode::Rename(i) => i.push_str(s.trim()),
-            Mode::Filter(i) => {
+            Mode::Add(i) | Mode::Edit(i) => i.push_str(s.trim()),
+            Mode::Search(i) => {
                 i.push_str(s.trim());
                 self.filter = i.clone();
                 self.rebuild();
@@ -574,23 +543,22 @@ impl App {
                 }
                 Msg::ReconDone(res) => {
                     self.busy = None;
-                    self.mode = Mode::Recon(res);
+                    self.recon_report = Some(res);
+                    self.mode = Mode::Recon;
                 }
                 Msg::SpeedDone(res) => {
                     self.busy = None;
                     match res {
                         Ok(res) => {
-                            self.mode = Mode::Speed {
-                                result: Some(res),
-                                running: false,
-                            };
+                            self.speed_result = Some(res);
+                            self.speed_running = false;
+                            self.mode = Mode::Speed;
                             self.toast("BENCHMARK SATURATION COMPLETE", true);
                         }
                         Err(e) => {
-                            self.mode = Mode::Speed {
-                                result: None,
-                                running: false,
-                            };
+                            self.speed_result = None;
+                            self.speed_running = false;
+                            self.mode = Mode::Speed;
                             self.toast(format!("BENCHMARK FAILED: {e}"), false);
                         }
                     }
@@ -660,214 +628,130 @@ impl App {
         changed
     }
 
-    /// returns true to quit
-    fn key(&mut self, k: KeyEvent) -> bool {
-        use KeyCode::*;
-        if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == Char('c') {
-            return true;
+    fn reconnect(&mut self) {
+        if self.busy.is_some() {
+            return;
         }
-        match std::mem::replace(&mut self.mode, Mode::Normal) {
-            Mode::Add(mut s) => {
-                match k.code {
-                    Esc => {}
-                    Enter => {
-                        if !s.trim().is_empty() {
-                            self.import(s);
-                        }
-                    }
-                    _ => {
-                        edit(&mut s, &k);
-                        self.mode = Mode::Add(s);
-                    }
-                }
-                return false;
+        if let Some(s) = &self.session {
+            let sid = s.id.clone();
+            if let Some(i) = self.view.iter().position(|&idx| self.profiles[idx].id == sid) {
+                self.list.select(Some(i));
             }
-            Mode::Rename(mut s) => {
-                match k.code {
-                    Esc => {}
-                    Enter => self.rename(s),
-                    _ => {
-                        edit(&mut s, &k);
-                        self.mode = Mode::Rename(s);
-                    }
-                }
-                return false;
-            }
-            Mode::Filter(mut s) => {
-                match k.code {
-                    Esc => {
-                        self.filter.clear();
-                        self.rebuild();
-                    }
-                    Enter => {}
-                    _ => {
-                        if edit(&mut s, &k) {
-                            self.filter = s.clone();
-                            self.rebuild();
-                        }
-                        self.mode = Mode::Filter(s);
-                    }
-                }
-                return false;
-            }
-            Mode::Confirm => {
-                self.toast = None;
-                if k.code == Char('y') || k.code == Char('Y') {
-                    self.delete();
-                }
-                return false;
-            }
-            Mode::Help => return false,
-            Mode::Qr { profile, qr, mut exported } => {
-                match k.code {
-                    Esc | Char('q') => {}
-                    Char('c') | Char('C') | Char('y') => {
-                        match store::copy_to_clipboard(&profile.data) {
-                            Ok(()) => self.toast("PAYLOAD COPIED TO SYSTEM CLIPBOARD", true),
-                            Err(e) => self.toast(format!("CLIPBOARD COPY FAILED: {e}"), false),
-                        }
-                        self.mode = Mode::Qr { profile, qr, exported };
-                    }
-                    Char('s') | Char('S') | Char('e') => {
-                        match store::export_to_file(&profile) {
-                            Ok(path) => {
-                                let p_str = path.display().to_string();
-                                self.toast(format!("EXPORTED TO {p_str}"), true);
-                                exported = Some(p_str);
-                            }
-                            Err(e) => self.toast(format!("EXPORT FAILED: {e}"), false),
-                        }
-                        self.mode = Mode::Qr { profile, qr, exported };
-                    }
-                    _ => {
-                        self.mode = Mode::Qr { profile, qr, exported };
-                    }
-                }
-                return false;
-            }
-            Mode::Subs { mut list, mut subs } => {
-                match k.code {
-                    Esc | Char('q') => {}
-                    Char('j') | Down => {
-                        let n = subs.len();
-                        if n > 0 {
-                            let cur = list.selected().unwrap_or(0);
-                            list.select(Some((cur + 1).rem_euclid(n)));
-                        }
-                        self.mode = Mode::Subs { list, subs };
-                    }
-                    Char('k') | Up => {
-                        let n = subs.len();
-                        if n > 0 {
-                            let cur = list.selected().unwrap_or(0) as i32;
-                            list.select(Some((cur - 1).rem_euclid(n as i32) as usize));
-                        }
-                        self.mode = Mode::Subs { list, subs };
-                    }
-                    Enter | Char('u') => {
-                        if let Some(i) = list.selected().and_then(|i| subs.get(i)) {
-                            let id = i.id.clone();
-                            self.sync_single_sub(id);
-                        }
-                    }
-                    Char('s') | Char('S') => {
-                        self.sync_subs();
-                    }
-                    Char('a') => {
-                        self.mode = Mode::Add(String::new());
-                    }
-                    Char('d') => {
-                        if let Some(i) = list.selected() {
-                            if i < subs.len() {
-                                let sub = subs.remove(i);
-                                let _ = store::remove_sub(&sub.id, true);
-                                self.reload();
-                                if !subs.is_empty() {
-                                    list.select(Some(i.min(subs.len() - 1)));
-                                } else {
-                                    list.select(None);
-                                }
-                                self.toast(format!("PURGED SUBSCRIPTION [{}]", sub.name), true);
-                            }
-                        }
-                        self.mode = Mode::Subs { list, subs };
-                    }
-                    _ => {
-                        self.mode = Mode::Subs { list, subs };
-                    }
-                }
-                return false;
-            }
-            Mode::Recon(res) => {
-                match k.code {
-                    Esc | Char('q') | Enter => {}
-                    Char('r') | Char('R') => {
-                        if let Some(p) = self.cur().cloned() {
-                            self.start("reconnaissance probe");
-                            self.toast(format!("RE-PROBING NODE // TARGET: {}", p.name), true);
-                            let tx = self.tx.clone();
-                            thread::spawn(move || {
-                                let r = recon::probe_recon(&p).map_err(|e| format!("{e:#}"));
-                                let _ = tx.send(Msg::ReconDone(r));
-                            });
-                        }
-                    }
-                    _ => {
-                        self.mode = Mode::Recon(res);
-                    }
-                }
-                return false;
-            }
-            Mode::Speed { result, running } => {
-                match k.code {
-                    Esc | Char('q') => {}
-                    Char('r') | Char('R') | Enter if !running => {
-                        self.start("speed benchmark");
-                        self.toast("INITIATING MULTI-STREAM SPEED BENCHMARK...", true);
-                        self.mode = Mode::Speed { result: None, running: true };
-                        let tx = self.tx.clone();
-                        thread::spawn(move || {
-                            let res = benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS)
-                                .map_err(|e| format!("{e:#}"));
-                            let _ = tx.send(Msg::SpeedDone(res));
-                        });
-                    }
-                    _ => {
-                        self.mode = Mode::Speed { result, running };
-                    }
-                }
-                return false;
-            }
-            Mode::Normal => {}
         }
-        match k.code {
-            Char('q') => return true,
-            Char('Q') => {
-                let _ = tunnel::disconnect();
+        self.connect();
+    }
+
+    fn toggle_shield(&mut self) {
+        let pref = shield::is_enabled_preference();
+        if pref {
+            shield::set_enabled_preference(false);
+            let _ = shield::disarm();
+            self.shield_armed = false;
+            self.toast("ANTI-LEAK SHIELD DISARMED // KILL-SWITCH OFF", false);
+        } else {
+            shield::set_enabled_preference(true);
+            if let Some(s) = &self.session {
+                let endpoint_host = s.server.split(':').next().unwrap_or(&s.server);
+                if let Err(e) = shield::arm(Some(&s.iface), Some(endpoint_host)) {
+                    self.toast(format!("SHIELD ARM ERROR: {e}"), false);
+                } else {
+                    self.shield_armed = true;
+                    self.toast("ANTI-LEAK SHIELD ARMED // PACKET LEAKAGE BLOCKED", true);
+                }
+            } else {
+                self.shield_armed = false;
+                self.toast("SHIELD PREFERENCE ARMED (AUTO-LOCK ON CONNECT)", true);
+            }
+        }
+    }
+
+    /// Primary key event handler: delegates purely to keymap::map_key and apply
+    pub fn handle_key(&mut self, k: KeyEvent) -> bool {
+        if let Some(action) = keymap::map_key(&self.mode, k) {
+            self.apply(action)
+        } else {
+            false
+        }
+    }
+
+    pub fn apply(&mut self, action: Action) -> bool {
+        match action {
+            Action::ForceQuit => return true,
+            Action::Quit => {
+                if self.session.is_some() {
+                    self.mode = Mode::Confirm(ConfirmKind::QuitWhileConnected);
+                    return false;
+                }
                 return true;
             }
-            Esc => {
-                if self.show_log {
-                    self.show_log = false;
-                } else if !self.filter.is_empty() {
-                    self.filter.clear();
-                    self.rebuild();
+            Action::ConfirmYes => {
+                match self.mode {
+                    Mode::Confirm(ConfirmKind::DeleteNode) => {
+                        self.delete();
+                        self.mode = Mode::Normal;
+                    }
+                    Mode::Confirm(ConfirmKind::QuitWhileConnected) => {
+                        let _ = tunnel::disconnect();
+                        return true;
+                    }
+                    _ => {}
+                }
+                self.toast = None;
+            }
+            Action::ConfirmBackground => {
+                if matches!(self.mode, Mode::Confirm(ConfirmKind::QuitWhileConnected)) {
+                    return true;
                 }
             }
-            Char('?') => self.mode = Mode::Help,
-            Char('j') | Down => self.mv(1),
-            Char('k') | Up => self.mv(-1),
-            Char('g') | Home => {
+            Action::ConfirmNo => {
+                self.mode = Mode::Normal;
+                self.toast = None;
+            }
+            Action::Cancel => {
+                match &self.mode {
+                    Mode::Normal => {
+                        if self.show_log {
+                            self.show_log = false;
+                        } else if !self.filter.is_empty() {
+                            self.filter.clear();
+                            self.rebuild();
+                        }
+                    }
+                    Mode::Search(_) => {
+                        self.filter.clear();
+                        self.rebuild();
+                        self.mode = Mode::Normal;
+                    }
+                    _ => {
+                        self.mode = Mode::Normal;
+                        self.toast = None;
+                    }
+                }
+            }
+            Action::NextNode => self.mv(1),
+            Action::PrevNode => self.mv(-1),
+            Action::FirstNode => {
                 if !self.view.is_empty() {
-                    self.list.select(Some(0))
+                    self.list.select(Some(0));
                 }
             }
-            Char('G') | End => {
+            Action::LastNode => {
                 if !self.view.is_empty() {
-                    self.list.select(Some(self.view.len() - 1))
+                    self.list.select(Some(self.view.len() - 1));
                 }
             }
-            Enter => {
+            Action::FocusNextPanel => {
+                self.focused_panel = (self.focused_panel % 3) + 1;
+            }
+            Action::FocusPanel(p) => {
+                if (1..=3).contains(&p) {
+                    self.focused_panel = p;
+                }
+            }
+            Action::EnterSearch => {
+                self.mode = Mode::Search(self.filter.clone());
+            }
+            Action::ConnectSelected => {
                 let active = self.session.as_ref().map(|s| s.id.as_str());
                 if active.is_some() && active == self.cur().map(|p| p.id.as_str()) {
                     self.toast("already connected — space to disconnect", false);
@@ -875,76 +759,84 @@ impl App {
                     self.connect();
                 }
             }
-            Char(' ') | Char('s') => self.disconnect(),
-            Char('S') => self.sync_subs(),
-            Char('a') => self.mode = Mode::Add(String::new()),
-            Char('c') | Char('C') => {
-                if let Some(p) = self.cur().cloned() {
-                    let qr = store::generate_qr(&p.data).map_err(|e| format!("{e}"));
-                    self.mode = Mode::Qr { profile: p, qr, exported: None };
+            Action::ToggleConnection => {
+                if self.session.is_some() {
+                    self.disconnect();
+                } else {
+                    self.connect();
                 }
             }
-            Char('b') | Char('B') => {
-                let subs = store::load_subs();
-                let mut list = ListState::default();
-                if !subs.is_empty() {
-                    list.select(Some(0));
-                }
-                self.mode = Mode::Subs { list, subs };
+            Action::Reconnect => self.reconnect(),
+            Action::ToggleShield => self.toggle_shield(),
+            Action::AddNode => {
+                self.mode = Mode::Add(String::new());
             }
-            Char('u') => self.manage_auth(),
-            Char('v') => self.paste_clip(),
-            Char('/') => self.mode = Mode::Filter(self.filter.clone()),
-            Char('r') => {
+            Action::EditNode => {
                 if let Some(p) = self.cur() {
-                    self.mode = Mode::Rename(p.name.clone());
+                    self.mode = Mode::Edit(p.name.clone());
                 }
             }
-            Char('d') => {
+            Action::DeleteNode => {
                 if let Some(p) = self.cur() {
                     let m = format!("PURGE TARGET [{}]?  PRESS [Y] TO CONFIRM", p.name);
-                    self.mode = Mode::Confirm;
+                    self.mode = Mode::Confirm(ConfirmKind::DeleteNode);
                     self.toast = Some((m, false, Instant::now() + Duration::from_secs(600)));
                 }
             }
-            Char('t') => self.test(false),
-            Char('T') => self.test(true),
-            Char('o') => {
+            Action::CopyConfig => {
+                if self.mode == Mode::Qr {
+                    if let Some(p) = &self.qr_profile {
+                        match store::copy_to_clipboard(&p.data) {
+                            Ok(()) => self.toast("PAYLOAD COPIED TO SYSTEM CLIPBOARD", true),
+                            Err(e) => self.toast(format!("CLIPBOARD COPY FAILED: {e}"), false),
+                        }
+                    }
+                } else if let Some(p) = self.cur() {
+                    match store::copy_to_clipboard(&p.data) {
+                        Ok(()) => self.toast("PAYLOAD COPIED TO SYSTEM CLIPBOARD", true),
+                        Err(e) => self.toast(format!("CLIPBOARD COPY FAILED: {e}"), false),
+                    }
+                }
+            }
+            Action::ShowQr => {
+                if let Some(p) = self.cur().cloned() {
+                    let qr = store::generate_qr(&p.data).map_err(|e| format!("{e}"));
+                    self.qr_profile = Some(p);
+                    self.qr_code = Some(qr);
+                    self.qr_exported = None;
+                    self.mode = Mode::Qr;
+                }
+            }
+            Action::CycleSort => {
                 self.sort_ping = !self.sort_ping;
                 self.rebuild();
                 self.toast(if self.sort_ping { "sorted by latency" } else { "sorted by name" }, true);
             }
-            Char('l') => self.show_log = !self.show_log,
-            Char('i') => {
-                if self.session.is_some() {
-                    self.ip.clear();
-                    self.spawn_ip();
-                }
+            Action::TestSelected => self.test(true),
+            Action::TestAll => self.test(false),
+            Action::SpeedTest => {
+                self.start("speed benchmark");
+                self.toast("LAUNCHING BANDWIDTH BENCHMARK (MULTI-STREAM)...", true);
+                self.speed_result = None;
+                self.speed_running = true;
+                self.mode = Mode::Speed;
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let res = benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS)
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::SpeedDone(res));
+                });
             }
-            Char('K') | Char('z') | Char('Z') => {
-                let pref = shield::is_enabled_preference();
-                if pref {
-                    let _ = shield::set_enabled_preference(false);
-                    let _ = shield::disarm();
-                    self.shield_armed = false;
-                    self.toast("ANTI-LEAK SHIELD DISARMED // KILL-SWITCH OFF", false);
-                } else {
-                    let _ = shield::set_enabled_preference(true);
-                    if let Some(s) = &self.session {
-                        let endpoint_host = s.server.split(':').next().unwrap_or(&s.server);
-                        if let Err(e) = shield::arm(Some(&s.iface), Some(endpoint_host)) {
-                            self.toast(format!("SHIELD ARM ERROR: {e}"), false);
-                        } else {
-                            self.shield_armed = true;
-                            self.toast("ANTI-LEAK SHIELD ARMED // PACKET LEAKAGE BLOCKED", true);
-                        }
-                    } else {
-                        self.shield_armed = false;
-                        self.toast("SHIELD PREFERENCE ARMED (AUTO-LOCK ON CONNECT)", true);
-                    }
+            Action::UpdateSubs => self.sync_subs(),
+            Action::ManageSubs => {
+                self.subs = store::load_subs();
+                self.subs_list = ListState::default();
+                if !self.subs.is_empty() {
+                    self.subs_list.select(Some(0));
                 }
+                self.mode = Mode::Subs;
             }
-            Char('n') | Char('N') => {
+            Action::ToggleFlows => {
                 self.show_flows = !self.show_flows;
                 if self.show_flows {
                     self.flows = tunnel::active_flows();
@@ -953,7 +845,8 @@ impl App {
                     self.toast("FLOW SNIFFER DISENGAGED", true);
                 }
             }
-            Char('x') | Char('X') => {
+            Action::ToggleLog => self.show_log = !self.show_log,
+            Action::ShowIpInfo => {
                 if let Some(p) = self.cur().cloned() {
                     self.start("reconnaissance probe");
                     self.toast(format!("LAUNCHING DEEP RECON // TARGET: {}", p.name), true);
@@ -966,18 +859,128 @@ impl App {
                     self.toast("SELECT A TARGET NODE FIRST", false);
                 }
             }
-            Char('w') | Char('W') => {
-                self.start("speed benchmark");
-                self.toast("LAUNCHING BANDWIDTH BENCHMARK (MULTI-STREAM)...", true);
-                self.mode = Mode::Speed { result: None, running: true };
-                let tx = self.tx.clone();
-                thread::spawn(move || {
-                    let res = benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS)
-                        .map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(Msg::SpeedDone(res));
-                });
+            Action::Help => self.mode = Mode::Help,
+            Action::ManageAuth => self.manage_auth(),
+            Action::PasteClipboard => self.paste_clip(),
+            Action::InputChar(c) => match &mut self.mode {
+                Mode::Search(s) => {
+                    s.push(c);
+                    self.filter = s.clone();
+                    self.rebuild();
+                }
+                Mode::Add(s) | Mode::Edit(s) => {
+                    s.push(c);
+                }
+                _ => {}
+            },
+            Action::Backspace => match &mut self.mode {
+                Mode::Search(s) => {
+                    s.pop();
+                    self.filter = s.clone();
+                    self.rebuild();
+                }
+                Mode::Add(s) | Mode::Edit(s) => {
+                    s.pop();
+                }
+                _ => {}
+            },
+            Action::ClearInput => match &mut self.mode {
+                Mode::Search(s) => {
+                    s.clear();
+                    self.filter.clear();
+                    self.rebuild();
+                }
+                Mode::Add(s) | Mode::Edit(s) => {
+                    s.clear();
+                }
+                _ => {}
+            },
+            Action::Submit => {
+                match std::mem::replace(&mut self.mode, Mode::Normal) {
+                    Mode::Search(_) => {}
+                    Mode::Add(s) => {
+                        if !s.trim().is_empty() {
+                            self.import(s);
+                        }
+                    }
+                    Mode::Edit(s) => {
+                        self.rename(s);
+                    }
+                    _ => {}
+                }
             }
-            _ => {}
+            Action::ExportConfig => {
+                if let Some(p) = &self.qr_profile {
+                    match store::export_to_file(p) {
+                        Ok(path) => {
+                            let p_str = path.display().to_string();
+                            self.toast(format!("EXPORTED TO {p_str}"), true);
+                            self.qr_exported = Some(p_str);
+                        }
+                        Err(e) => self.toast(format!("EXPORT FAILED: {e}"), false),
+                    }
+                }
+            }
+            Action::NextSub => {
+                let n = self.subs.len();
+                if n > 0 {
+                    let cur = self.subs_list.selected().unwrap_or(0);
+                    self.subs_list.select(Some((cur + 1).rem_euclid(n)));
+                }
+            }
+            Action::PrevSub => {
+                let n = self.subs.len();
+                if n > 0 {
+                    let cur = self.subs_list.selected().unwrap_or(0) as i32;
+                    self.subs_list.select(Some((cur - 1).rem_euclid(n as i32) as usize));
+                }
+            }
+            Action::SyncSelectedSub => {
+                if let Some(i) = self.subs_list.selected().and_then(|i| self.subs.get(i)) {
+                    let id = i.id.clone();
+                    self.sync_single_sub(id);
+                }
+            }
+            Action::DeleteSub => {
+                if let Some(i) = self.subs_list.selected() {
+                    if i < self.subs.len() {
+                        let sub = self.subs.remove(i);
+                        let _ = store::remove_sub(&sub.id, true);
+                        self.reload();
+                        if !self.subs.is_empty() {
+                            self.subs_list.select(Some(i.min(self.subs.len() - 1)));
+                        } else {
+                            self.subs_list.select(None);
+                        }
+                        self.toast(format!("PURGED SUBSCRIPTION [{}]", sub.name), true);
+                    }
+                }
+            }
+            Action::RetryProbe => {
+                if let Some(p) = self.cur().cloned() {
+                    self.start("reconnaissance probe");
+                    self.toast(format!("RE-PROBING NODE // TARGET: {}", p.name), true);
+                    let tx = self.tx.clone();
+                    thread::spawn(move || {
+                        let r = recon::probe_recon(&p).map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(Msg::ReconDone(r));
+                    });
+                }
+            }
+            Action::RetrySpeedTest => {
+                if !self.speed_running {
+                    self.start("speed benchmark");
+                    self.toast("INITIATING MULTI-STREAM SPEED BENCHMARK...", true);
+                    self.speed_result = None;
+                    self.speed_running = true;
+                    let tx = self.tx.clone();
+                    thread::spawn(move || {
+                        let res = benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS)
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(Msg::SpeedDone(res));
+                    });
+                }
+            }
         }
         false
     }
@@ -1010,8 +1013,8 @@ pub fn run() -> Result<()> {
             };
             if event::poll(timeout)? {
                 match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => {
-                        if app.key(k) {
+                    Event::Key(k) => {
+                        if app.handle_key(k) {
                             break;
                         }
                         dirty = true;
@@ -1142,9 +1145,7 @@ fn block(title: &str, active: bool) -> Block<'static> {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let header_h = if area.height >= 26 {
-        2
-    } else if area.height >= 12 {
+    let header_h = if area.height >= 12 {
         2
     } else {
         1
@@ -1170,15 +1171,26 @@ fn draw(f: &mut Frame, app: &mut App) {
     if footer_h > 0 {
         footer(f, rows[2], app);
     }
-    match &mut app.mode {
+    let mode = app.mode.clone();
+    match &mode {
         Mode::Add(s) => popup(f, area, "0xIN // INJECT CONFIGURATION PAYLOAD", "VLESS · VMESS · TROJAN · SS · HY2 · TUIC · WG · AWG · OVPN · SUB URL", s),
-        Mode::Rename(s) => popup(f, area, "0xRN // MUTATE TARGET IDENTIFIER", "enter new cryptographic profile alias", s),
-        Mode::Confirm => confirm_popup(f, area, app),
+        Mode::Edit(s) => popup(f, area, "0xRN // MUTATE TARGET IDENTIFIER", "enter new cryptographic profile alias", s),
+        Mode::Confirm(kind) => confirm_popup(f, area, app, *kind),
         Mode::Help => help(f, area),
-        Mode::Qr { profile, qr, exported } => qr_popup(f, area, profile, qr, exported.as_deref()),
-        Mode::Subs { list, subs } => subs_popup(f, area, list, subs),
-        Mode::Recon(res) => recon_popup(f, area, res),
-        Mode::Speed { result, running } => speed_popup(f, area, result.as_ref(), *running),
+        Mode::Qr => {
+            if let Some(p) = &app.qr_profile {
+                if let Some(qr) = &app.qr_code {
+                    qr_popup(f, area, p, qr, app.qr_exported.as_deref());
+                }
+            }
+        }
+        Mode::Subs => subs_popup(f, area, &mut app.subs_list, &app.subs),
+        Mode::Recon => {
+            if let Some(res) = &app.recon_report {
+                recon_popup(f, area, res);
+            }
+        }
+        Mode::Speed => speed_popup(f, area, app.speed_result.as_ref(), app.speed_running),
         _ => {}
     }
 }
@@ -1303,16 +1315,17 @@ fn ping_cell(app: &App, id: &str) -> Span<'static> {
 }
 
 fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
-    let mut title = format!("0x01 // TARGET NODE MATRIX [ {:02} NODES ]", app.view.len());
+    let is_focused = app.focused_panel == 1;
+    let mut title = format!("[1] TARGET MATRIX [ {:02} NODES ]", app.view.len());
     if !app.filter.is_empty() {
-        title = format!("0x01 // SCAN: \"{}\"█ [ {} MATCHES ]", trunc(&app.filter, 12), app.view.len());
+        title = format!("[1] TARGET MATRIX [ SCAN: \"{}\"█ · {} MATCHES ]", trunc(&app.filter, 12), app.view.len());
     } else if app.sort_ping {
-        title = format!("0x01 // TARGET MATRIX [ {:02} NODES · ↑RTT ]", app.view.len());
+        title = format!("[1] TARGET MATRIX [ {:02} NODES · ↑RTT ]", app.view.len());
     }
-    if let Mode::Filter(s) = &app.mode {
-        title = format!("0x01 // PATTERN SCAN: \"{}\"█", trunc(s, 16));
+    if let Mode::Search(s) = &app.mode {
+        title = format!("[1] TARGET MATRIX [ SEARCH: \"{}\"█ ]", trunc(s, 16));
     }
-    let blk = block(&title, app.session.is_some());
+    let blk = block(&title, is_focused);
     if app.view.is_empty() {
         let inner = blk.inner(area);
         f.render_widget(blk, area);
@@ -1442,7 +1455,7 @@ fn spark(f: &mut Frame, r: Rect, data: &[u64], c: Color) {
 
 fn info(f: &mut Frame, area: Rect, app: &App) {
     if app.show_log {
-        let blk = block("0x04 // REAL-TIME KERNEL AUDIT & CORE LOGS", true);
+        let blk = block("0x04 // [2] KERNEL AUDIT & CORE LOGS", app.focused_panel == 2);
         let inner = blk.inner(area);
         f.render_widget(blk, area);
         let inner = inner.inner(Margin::new(1, 1));
@@ -1478,7 +1491,7 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         _ => None,
     };
     let Some((name, kind, server)) = shown else {
-        f.render_widget(block("0x02 // ROUTE DISENGAGED // NO SELECTION", false), area);
+        f.render_widget(block("0x02 // [2] TELEMETRY // NO SELECTION", app.focused_panel == 2), area);
         return;
     };
 
@@ -1486,7 +1499,7 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
     let is_connected = app.session.is_some();
 
     // ── connection card
-    let blk = block("0x02 // TELEMETRY & TACTICAL ROUTE INSPECTOR", is_connected);
+    let blk = block("0x02 // [2] TELEMETRY", app.focused_panel == 2);
     let inner = blk.inner(parts[0]).inner(Margin::new(1, 0));
     f.render_widget(blk, parts[0]);
     let nw = (inner.width as usize).saturating_sub(16);
@@ -1532,7 +1545,7 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled("  [⏎] ENGAGE NODE  ", Style::new().fg(CYAN).bold()),
                 Span::styled(" [T] PROBE LATENCY  ", Style::new().fg(YELLOW).bold()),
-                Span::styled(" [X] DEEP RECON", Style::new().fg(GREEN).bold()),
+                Span::styled(" [I] DEEP RECON", Style::new().fg(GREEN).bold()),
             ]));
         }
     }
@@ -1542,7 +1555,7 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
     if app.show_flows {
         flows_table(f, parts[1], app);
     } else if is_connected {
-        let blk = block("0x03 // PACKET FLOW & SPECTRUM ANALYZER", true);
+        let blk = block("0x03 // [3] PACKET FLOW", app.focused_panel == 3);
         let inner = blk.inner(parts[1]).inner(Margin::new(1, 0));
         f.render_widget(blk, parts[1]);
         let rows = Layout::vertical([
@@ -1601,7 +1614,7 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(Paragraph::new(Span::styled(rtt_txt, Style::new().fg(FG_DIM).bold())), rows[4]);
         spark(f, rows[5], &app.rtt_hist, YELLOW);
     } else {
-        let blk = block("0x03 // TARGET ENCRYPTED PARAMETERS & RECON VECTOR", false);
+        let blk = block("0x03 // [3] TARGET PARAMETERS", app.focused_panel == 3);
         let inner = blk.inner(parts[1]).inner(Margin::new(1, 0));
         f.render_widget(blk, parts[1]);
         let mut lines: Vec<Line> = sel
@@ -1643,7 +1656,7 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn flows_table(f: &mut Frame, area: Rect, app: &App) {
-    let blk = block(&format!("0x03 // LIVE SOCKET & PACKET FLOW SNIFFER [ {:02} ACTIVE FLOWS ]", app.flows.len()), true);
+    let blk = block(&format!("0x03 // [3] PACKET FLOWS [ {:02} ACTIVE ]", app.flows.len()), app.focused_panel == 3);
     let inner = blk.inner(area).inner(Margin::new(1, 0));
     f.render_widget(blk, area);
 
@@ -1664,7 +1677,7 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  [N] TOGGLE SPECTRUM / FLOWS  ·  [W] BENCHMARK SPEED", Style::new().fg(FG_DIM)),
+                Span::styled("  [F] TOGGLE SPECTRUM / FLOWS  ·  [W] BENCHMARK SPEED", Style::new().fg(FG_DIM)),
             ]),
         ];
         f.render_widget(Paragraph::new(msg), inner);
@@ -1738,34 +1751,69 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
         f.render_widget(Paragraph::new(Span::styled(text, Style::new().fg(c).bold())), a);
         return;
     }
-    let mut sp = vec![
-        Span::styled(" root@vortex", Style::new().fg(GREEN).bold()),
-        Span::styled("[SYS]# ", Style::new().fg(CYAN).bold()),
-    ];
-    let keys = [
-        ("RET", "ENGAGE"),
-        ("SPC", "SEVER"),
-        ("K", "SHIELD"),
-        ("N", "FLOWS"),
-        ("X", "RECON"),
-        ("W", "SPEED"),
-        ("A", "INJECT"),
-        ("C", "QR/CONF"),
-        ("B", "SUBS"),
-        ("S", "SYNC"),
-        ("T", "PROBE"),
-        ("U", "AUTH"),
-        ("/", "SCAN"),
-        ("O", "SORT"),
-        ("L", "LOG"),
-        ("?", "HELP"),
-        ("Q", "QUIT"),
-    ];
-    for (k, d) in keys {
-        sp.push(Span::styled(format!("[{k}]"), Style::new().fg(CYAN).bold()));
-        sp.push(Span::styled(format!(" {d} "), Style::new().fg(FG_DIM)));
+    match &app.mode {
+        Mode::Search(q) => {
+            let line = Line::from(vec![
+                Span::styled(" [SEARCH] ", Style::new().fg(GREEN).bold()),
+                Span::styled(format!("\"{}\"█  ", q), Style::new().fg(FG).bold()),
+                Span::styled("[Enter]", Style::new().fg(CYAN).bold()),
+                Span::styled(" keep filter  ", Style::new().fg(FG_DIM)),
+                Span::styled("[Esc]", Style::new().fg(CYAN).bold()),
+                Span::styled(" clear & exit", Style::new().fg(FG_DIM)),
+            ]);
+            f.render_widget(Paragraph::new(line), a);
+        }
+        Mode::Confirm(ConfirmKind::DeleteNode) => {
+            let line = Line::from(vec![
+                Span::styled(" [CONFIRM PURGE] >> ", Style::new().fg(RED).bold()),
+                Span::styled("[y]", Style::new().fg(GREEN).bold()),
+                Span::styled(" delete node  ", Style::new().fg(FG_DIM)),
+                Span::styled("[n/Esc]", Style::new().fg(RED).bold()),
+                Span::styled(" cancel", Style::new().fg(FG_DIM)),
+            ]);
+            f.render_widget(Paragraph::new(line), a);
+        }
+        Mode::Confirm(ConfirmKind::QuitWhileConnected) => {
+            let line = Line::from(vec![
+                Span::styled(" [ACTIVE TUNNEL] >> ", Style::new().fg(YELLOW).bold()),
+                Span::styled("[y]", Style::new().fg(GREEN).bold()),
+                Span::styled(" disconnect & quit  ", Style::new().fg(FG_DIM)),
+                Span::styled("[b]", Style::new().fg(PURPLE).bold()),
+                Span::styled(" quit (background)  ", Style::new().fg(FG_DIM)),
+                Span::styled("[n/Esc]", Style::new().fg(RED).bold()),
+                Span::styled(" cancel", Style::new().fg(FG_DIM)),
+            ]);
+            f.render_widget(Paragraph::new(line), a);
+        }
+        _ => {
+            let is_connected = app.session.is_some();
+            let shield_armed = app.shield_armed || shield::is_armed();
+
+            let space_desc = if is_connected { "disconnect" } else { "connect" };
+            let shield_desc = if shield_armed { "shield:armed" } else { "shield:off" };
+
+            let hints: [(&str, &str); 8] = [
+                ("Enter", "connect"),
+                ("Space", space_desc),
+                ("t", "test"),
+                ("a", "add"),
+                ("/", "search"),
+                ("K", shield_desc),
+                ("?", "help"),
+                ("q", "quit"),
+            ];
+
+            let mut spans = vec![
+                Span::styled(" root@vortex", Style::new().fg(GREEN).bold()),
+                Span::styled("[SYS]# ", Style::new().fg(CYAN).bold()),
+            ];
+            for (k, d) in hints {
+                spans.push(Span::styled(format!("[{k}]"), Style::new().fg(CYAN).bold()));
+                spans.push(Span::styled(format!(" {d}  "), Style::new().fg(FG_DIM)));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), a);
+        }
     }
-    f.render_widget(Paragraph::new(Line::from(sp)), a);
 }
 
 fn popup(f: &mut Frame, area: Rect, title: &str, hint: &str, input: &str) {
@@ -1799,10 +1847,9 @@ fn popup(f: &mut Frame, area: Rect, title: &str, hint: &str, input: &str) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn confirm_popup(f: &mut Frame, area: Rect, app: &App) {
-    let Some(p) = app.cur() else { return };
+fn confirm_popup(f: &mut Frame, area: Rect, app: &App, kind: ConfirmKind) {
     let w = 64.min(area.width);
-    let h = 7.min(area.height);
+    let h = 8.min(area.height);
     let r = Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
@@ -1810,35 +1857,78 @@ fn confirm_popup(f: &mut Frame, area: Rect, app: &App) {
         height: h,
     };
     f.render_widget(Clear, r);
-    let blk = Block::bordered()
-        .border_type(BorderType::Plain)
-        .border_style(Style::new().fg(RED))
-        .title(Line::from(vec![
-            Span::styled(" ◈ [ ", Style::new().fg(RED)),
-            Span::styled("0xDEL // TARGET PURGE CONFIRMATION", Style::new().fg(RED).bold()),
-            Span::styled(" ] ", Style::new().fg(RED)),
-        ]));
-    let inner = blk.inner(r).inner(Margin::new(2, 1));
-    f.render_widget(blk, r);
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("[!] CRITICAL: ", Style::new().fg(RED).bold()),
-            Span::styled("PERMANENT NODE VECTOR PURGE", Style::new().fg(FG).bold()),
-        ]),
-        Line::from(vec![
-            Span::styled("TARGET: ", Style::new().fg(FG_DIM)),
-            Span::styled(trunc(&p.name, (inner.width as usize).saturating_sub(10)), Style::new().fg(YELLOW).bold()),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("PRESS [", Style::new().fg(FG_DIM)),
-            Span::styled("Y", Style::new().fg(GREEN).bold()),
-            Span::styled("] TO CONFIRM PURGE  ·  [", Style::new().fg(FG_DIM)),
-            Span::styled("ESC", Style::new().fg(RED).bold()),
-            Span::styled("] TO ABORT", Style::new().fg(FG_DIM)),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(lines), inner);
+
+    match kind {
+        ConfirmKind::DeleteNode => {
+            let Some(p) = app.cur() else { return };
+            let blk = Block::bordered()
+                .border_type(BorderType::Plain)
+                .border_style(Style::new().fg(RED))
+                .title(Line::from(vec![
+                    Span::styled(" ◈ [ ", Style::new().fg(RED)),
+                    Span::styled("0xDEL // TARGET PURGE CONFIRMATION", Style::new().fg(RED).bold()),
+                    Span::styled(" ] ", Style::new().fg(RED)),
+                ]));
+            let inner = blk.inner(r).inner(Margin::new(2, 1));
+            f.render_widget(blk, r);
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("[!] CRITICAL: ", Style::new().fg(RED).bold()),
+                    Span::styled("PERMANENT NODE VECTOR PURGE", Style::new().fg(FG).bold()),
+                ]),
+                Line::from(vec![
+                    Span::styled("TARGET: ", Style::new().fg(FG_DIM)),
+                    Span::styled(trunc(&p.name, (inner.width as usize).saturating_sub(10)), Style::new().fg(YELLOW).bold()),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("PRESS [", Style::new().fg(FG_DIM)),
+                    Span::styled("Y", Style::new().fg(GREEN).bold()),
+                    Span::styled("] TO CONFIRM PURGE  ·  [", Style::new().fg(FG_DIM)),
+                    Span::styled("ESC / N", Style::new().fg(RED).bold()),
+                    Span::styled("] TO ABORT", Style::new().fg(FG_DIM)),
+                ]),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        ConfirmKind::QuitWhileConnected => {
+            let s_name = app.session.as_ref().map(|s| s.name.as_str()).unwrap_or("ACTIVE TUNNEL");
+            let blk = Block::bordered()
+                .border_type(BorderType::Plain)
+                .border_style(Style::new().fg(YELLOW))
+                .title(Line::from(vec![
+                    Span::styled(" ◈ [ ", Style::new().fg(YELLOW)),
+                    Span::styled("0xQUIT // TUNNEL RUNNING CONFIRMATION", Style::new().fg(YELLOW).bold()),
+                    Span::styled(" ] ", Style::new().fg(YELLOW)),
+                ]));
+            let inner = blk.inner(r).inner(Margin::new(2, 1));
+            f.render_widget(blk, r);
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("[!] ACTIVE LINK: ", Style::new().fg(YELLOW).bold()),
+                    Span::styled(trunc(s_name, (inner.width as usize).saturating_sub(18)), Style::new().fg(FG).bold()),
+                ]),
+                Line::from(Span::styled("Choose termination policy before console detach:", Style::new().fg(FG_DIM))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  [", Style::new().fg(FG_DIM)),
+                    Span::styled("Y", Style::new().fg(GREEN).bold()),
+                    Span::styled("] DISCONNECT TUNNEL & QUIT", Style::new().fg(FG)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  [", Style::new().fg(FG_DIM)),
+                    Span::styled("B", Style::new().fg(PURPLE).bold()),
+                    Span::styled("] QUIT & KEEP RUNNING IN BACKGROUND", Style::new().fg(FG)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  [", Style::new().fg(FG_DIM)),
+                    Span::styled("N / ESC", Style::new().fg(RED).bold()),
+                    Span::styled("] CANCEL & RETURN TO VORTEX", Style::new().fg(FG_DIM)),
+                ]),
+            ];
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+    }
 }
 
 fn time_ago(ts: Option<u64>) -> String {
@@ -2255,55 +2345,35 @@ fn speed_popup(f: &mut Frame, area: Rect, result: Option<&SpeedResult>, running:
 }
 
 fn help(f: &mut Frame, area: Rect) {
-    let rows: [(&str, &str, &str); 24] = [
-        ("TUNNEL CONTROL", "RET / ENTER", "ENGAGE SELECTED TARGET NODE"),
-        ("TUNNEL CONTROL", "SPC / S", "SEVER / ABORT ACTIVE TUNNEL"),
-        ("TUNNEL CONTROL", "J K ↑ ↓", "NAVIGATE TARGET NODE MATRIX"),
-        ("TUNNEL CONTROL", "G / SHIFT+G", "JUMP TO FIRST / LAST NODE"),
-        ("STEALTH SHIELD", "K / Z", "TOGGLE ANTI-LEAK KILL SWITCH SHIELD"),
-        ("NET MONITOR", "N", "TOGGLE LIVE SOCKET & PACKET FLOW SNIFFER"),
-        ("NET MONITOR", "W", "RUN BANDWIDTH THROUGHPUT BENCHMARK (CDNS)"),
-        ("RECON & PROBE", "X", "DEEP NODE RECONNAISSANCE & TLS PROBE"),
-        ("RECON & PROBE", "T", "EXECUTE LATENCY PROBE (ALL NODES)"),
-        ("RECON & PROBE", "SHIFT+T", "EXECUTE LATENCY PROBE (SELECTED)"),
-        ("RECON & PROBE", "O", "CYCLE SORT ORDER (RTT SPEED ⇄ ID)"),
-        ("RECON & PROBE", "/", "PATTERN SCAN & GREP FILTER"),
-        ("RECON & PROBE", "I", "PROBE LIVE PUBLIC EXIT IP"),
-        ("PAYLOAD & AUTH", "C", "RENDER QR CODE & CONFIGURATION INSPECTOR"),
-        ("PAYLOAD & AUTH", "A", "INJECT LINK / SUBSCRIPTION / FILE / QR IMAGE"),
-        ("PAYLOAD & AUTH", "V", "INJECT VECTOR / QR SCREENSHOT FROM CLIPBOARD"),
-        ("PAYLOAD & AUTH", "U", "CONFIGURE OPENVPN CREDENTIAL VAULT"),
-        ("PAYLOAD & AUTH", "R", "MUTATE TARGET IDENTIFIER (RENAME)"),
-        ("PAYLOAD & AUTH", "D", "PURGE TARGET VECTOR FROM KEYSTORE"),
-        ("SUBSCRIPTION", "B", "OPEN SUBSCRIPTION REGISTRY MANAGER"),
-        ("SUBSCRIPTION", "SHIFT+S", "EXECUTE RECURSIVE SYNC ON ALL SUBS"),
-        ("SYSTEM OPS", "L", "TOGGLE KERNEL AUDIT & LIVE LOGS"),
-        ("SYSTEM OPS", "ESC", "DISMISS / CLEAR FILTER / ABORT"),
-        ("SYSTEM OPS", "Q / SHIFT+Q", "DETACH CONSOLE / TERMINATE ALL"),
-    ];
-    let h = (rows.len() as u16 + 5).min(area.height);
-    let w = 68.min(area.width);
+    let entries = keymap::HELP_ENTRIES;
+    let h = ((entries.len() + 10) as u16).min(area.height.saturating_sub(2));
+    let w = 74.min(area.width.saturating_sub(4));
     let r = Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
         width: w,
         height: h,
     };
     f.render_widget(Clear, r);
-    let blk = block("0x?? // BLACK-HAT COMMAND CONSOLE DIRECTORY", true);
+    let blk = block("0x?? // COMMAND DIRECTORY & KEYMAP", true);
     let inner = blk.inner(r).inner(Margin::new(1, 1));
     f.render_widget(blk, r);
+
     let mut lines = vec![];
     let mut last_cat = "";
-    for (cat, k, d) in rows {
-        if cat != last_cat && inner.height >= 20 {
-            lines.push(Line::from(Span::styled(format!(" // {cat}"), Style::new().fg(CYAN).bold())));
-            last_cat = cat;
+    for entry in entries {
+        if entry.category != last_cat && inner.height >= 18 {
+            if !last_cat.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(format!(" // {}", entry.category), Style::new().fg(CYAN).bold())));
+            last_cat = entry.category;
         }
+        let is_primary = entry.key.contains("Enter") || entry.key.contains("Space");
         lines.push(Line::from(vec![
-            Span::styled(format!(" [{k:<11}] "), Style::new().fg(if k.contains("RET") || k.contains("SPC") { GREEN } else { CYAN }).bold()),
+            Span::styled(format!(" [{:<13}] ", entry.key), Style::new().fg(if is_primary { GREEN } else { CYAN }).bold()),
             Span::styled("► ", Style::new().fg(BORDER_ACTIVE)),
-            Span::styled(d, Style::new().fg(FG)),
+            Span::styled(entry.description, Style::new().fg(FG)),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -2351,8 +2421,37 @@ mod tests {
         assert_eq!(app.view.len(), 1);
         app.mode = Mode::Help;
         render(80, 24, &mut app);
-        app.mode = Mode::Rename("x".into());
+        app.mode = Mode::Edit("x".into());
         render(80, 24, &mut app);
+    }
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn edit(s: &mut String, k: &KeyEvent) -> bool {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Backspace => {
+                s.pop();
+                true
+            }
+            KeyCode::Char('u') if ctrl => {
+                s.clear();
+                true
+            }
+            KeyCode::Char('w') if ctrl => {
+                let t = s.trim_end().len();
+                s.truncate(t);
+                while s.chars().last().map(|c| !c.is_whitespace()).unwrap_or(false) {
+                    s.pop();
+                }
+                true
+            }
+            KeyCode::Char(c) if !ctrl => {
+                s.push(c);
+                true
+            }
+            _ => false,
+        }
     }
 
     #[test]
@@ -2394,7 +2493,7 @@ mod tests {
         println!("{out}");
         assert!(out.contains("LINK ENGAGED"));
         assert!(out.contains("CHACHA20"));
-        assert!(out.contains("PACKET FLOW & SPECTRUM ANALYZER"));
+        assert!(out.contains("PACKET FLOW"));
     }
 
     #[test]
@@ -2414,7 +2513,10 @@ mod tests {
         let mut app = App::new();
         let p = prof("test-qr", "Frankfurt QR", Kind::Vless, "vless://u@example.com:443?security=reality#Frankfurt");
         let qr = store::generate_qr(&p.data).map_err(|e| format!("{e}"));
-        app.mode = Mode::Qr { profile: p, qr, exported: Some("~/vortex-test-qr.conf".into()) };
+        app.qr_profile = Some(p);
+        app.qr_code = Some(qr);
+        app.qr_exported = Some("~/vortex-test-qr.conf".into());
+        app.mode = Mode::Qr;
         let out = render(100, 30, &mut app);
         assert!(out.contains("0xQR // CONFIGURATION & QR EXPORT MATRIX"));
         assert!(out.contains("NODE TELEMETRY & CREDENTIALS"));
@@ -2436,7 +2538,9 @@ mod tests {
                 updated: Some(1720000000),
             },
         ];
-        app.mode = Mode::Subs { list, subs };
+        app.subs = subs;
+        app.subs_list = list;
+        app.mode = Mode::Subs;
         let out = render(100, 30, &mut app);
         assert!(out.contains("0xSUB // SUBSCRIPTION REGISTRY & SYNC MANAGER"));
         assert!(out.contains("VIP Dedicated Nodes"));
@@ -2451,33 +2555,48 @@ mod tests {
         app.rebuild();
         assert_eq!(app.view.len(), 1);
 
-        // Press 'c' to open QR modal
-        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert!(matches!(app.mode, Mode::Qr { .. }));
+        // Press 's' to open QR modal
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Qr));
 
         // Press Esc to dismiss QR modal
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Normal));
 
-        // Press 'b' to open Subs modal
-        app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        assert!(matches!(app.mode, Mode::Subs { .. }));
+        // Press 'S' (Shift+s) to open Subs modal
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        assert!(matches!(app.mode, Mode::Subs));
 
         // Press Esc to dismiss Subs modal
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Normal));
 
-        // Press 'n' to toggle flows view
-        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        // Press 'f' to toggle flows view
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
         assert!(app.show_flows);
-        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
         assert!(!app.show_flows);
 
         // Press 'w' to initiate speed benchmark modal
-        app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
-        assert!(matches!(app.mode, Mode::Speed { .. }));
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Speed));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Normal));
+
+        // Test panel focus navigation with Tab and direct 1/2/3
+        assert_eq!(app.focused_panel, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focused_panel, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focused_panel, 3);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focused_panel, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.focused_panel, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.focused_panel, 3);
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(app.focused_panel, 1);
     }
 
     #[test]
@@ -2507,7 +2626,8 @@ mod tests {
             exit_ip: Some("185.220.101.5".into()),
             exit_colo: Some("FRA".into()),
         };
-        app.mode = Mode::Recon(Ok(report));
+        app.recon_report = Some(Ok(report));
+        app.mode = Mode::Recon;
         let out = render(100, 32, &mut app);
         assert!(out.contains("0xRC // DEEP NODE RECONNAISSANCE & TLS FINGERPRINT REPORT"));
         assert!(out.contains("Frankfurt Cyber-Node"));
@@ -2525,10 +2645,9 @@ mod tests {
             mbps: 101.8,
             mbs: 12.72,
         };
-        app.mode = Mode::Speed {
-            result: Some(speed),
-            running: false,
-        };
+        app.speed_result = Some(speed);
+        app.speed_running = false;
+        app.mode = Mode::Speed;
         let out = render(90, 20, &mut app);
         assert!(out.contains("0xSPD // LIVE BANDWIDTH THROUGHPUT & NETWORK BENCHMARK"));
         assert!(out.contains("101.80 Mbps"));
@@ -2556,7 +2675,7 @@ mod tests {
         app.view = vec![0];
         app.list.select(Some(0));
         let out = render(110, 30, &mut app);
-        assert!(out.contains("LIVE SOCKET & PACKET FLOW SNIFFER"));
+        assert!(out.contains("PACKET FLOWS"));
         assert!(out.contains("api.github.com:443"));
         assert!(out.contains("curl"));
     }
