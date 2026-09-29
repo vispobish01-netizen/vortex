@@ -7,11 +7,18 @@ use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 use vortex_core::ipc::*;
 use vortex_core::model::*;
+use vortex_core::probe::{self, NodeMetrics, ScoringWeights, SelectionMode};
 use vortex_core::{benchmark, ping, shield, store, tunnel};
 
 struct DaemonState {
     status: DaemonStatus,
     subscribers: broadcast::Sender<DaemonEvent>,
+    selection_mode: SelectionMode,
+    scoring_weights: ScoringWeights,
+    metrics: std::collections::HashMap<String, NodeMetrics>,
+    consecutive_probe_failures: u32,
+    last_failover_ts: Option<std::time::Instant>,
+    failover_attempt: u32,
 }
 
 impl DaemonState {
@@ -37,6 +44,12 @@ impl DaemonState {
         DaemonState {
             status,
             subscribers: tx,
+            selection_mode: SelectionMode::Manual,
+            scoring_weights: ScoringWeights::default(),
+            metrics: std::collections::HashMap::new(),
+            consecutive_probe_failures: 0,
+            last_failover_ts: None,
+            failover_attempt: 0,
         }
     }
 
@@ -101,8 +114,10 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut last_bytes: Option<(u64, u64)> = None;
+        let mut tick_counter: u64 = 0;
         loop {
             interval.tick().await;
+            tick_counter += 1;
             let (iface, is_connected) = {
                 let mut st = bg_state.lock().await;
                 st.refresh_status();
@@ -125,6 +140,94 @@ async fn main() -> Result<()> {
                             total_rx: rx,
                             total_tx: tx,
                         });
+                    }
+                }
+
+                // Check tunnel health and auto-failover every 5 seconds
+                if tick_counter.is_multiple_of(5) {
+                    let (mode, active_opt) = {
+                        let st = bg_state.lock().await;
+                        (st.selection_mode, st.status.active_profile.clone())
+                    };
+
+                    if mode != SelectionMode::Manual {
+                        let probe_ok = tokio::task::spawn_blocking(ping::probe)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        let mut st = bg_state.lock().await;
+                        if probe_ok {
+                            st.consecutive_probe_failures = 0;
+                            st.failover_attempt = 0;
+                        } else {
+                            st.consecutive_probe_failures += 1;
+                            warn!(
+                                "Health probe failed through active tunnel (failures: {})",
+                                st.consecutive_probe_failures
+                            );
+                            if st.consecutive_probe_failures >= 3 {
+                                let now = std::time::Instant::now();
+                                let cooldown_passed = st
+                                    .last_failover_ts
+                                    .map(|t| now.duration_since(t) > Duration::from_secs(15))
+                                    .unwrap_or(true);
+
+                                if cooldown_passed && st.failover_attempt < 5 {
+                                    st.failover_attempt += 1;
+                                    st.last_failover_ts = Some(now);
+                                    let active_id = active_opt
+                                        .as_ref()
+                                        .map(|p| p.id.clone())
+                                        .unwrap_or_default();
+                                    let all_profiles = store::load_all();
+                                    let candidates: Vec<Profile> = all_profiles
+                                        .into_iter()
+                                        .filter(|p| p.id != active_id)
+                                        .collect();
+
+                                    if let Some(target) = probe::select_best_node(
+                                        &candidates,
+                                        &st.metrics,
+                                        st.selection_mode,
+                                        &st.scoring_weights,
+                                    ) {
+                                        let to_id = target.id.clone();
+                                        let target_clone = target.clone();
+                                        let reason = format!(
+                                            "Health check failed {} consecutive times",
+                                            st.consecutive_probe_failures
+                                        );
+                                        warn!("Auto-failover triggered: switching from {active_id} to {to_id} ({reason})");
+                                        let _ = bg_tx.send(DaemonEvent::FailoverTriggered {
+                                            from_id: active_id,
+                                            to_id: to_id.clone(),
+                                            reason,
+                                        });
+
+                                        let creds = if tunnel::ovpn_needs_auth(&target_clone) {
+                                            target_clone
+                                                .auth
+                                                .as_ref()
+                                                .map(|a| (a.username.clone(), a.password.clone()))
+                                        } else {
+                                            None
+                                        };
+
+                                        if let Ok(_sess) = tunnel::connect_with_credentials(
+                                            &target_clone,
+                                            creds.as_ref().map(|(u, pw)| (u.as_str(), pw.as_str())),
+                                        ) {
+                                            st.refresh_status();
+                                            st.consecutive_probe_failures = 0;
+                                            let _ = bg_tx.send(DaemonEvent::StatusChanged(
+                                                st.status.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -313,35 +416,40 @@ async fn process_request(
             }
         }
         IpcRequest::RunProbe { profile_id } => {
+            let prober = probe::MultiLayerProber::new(16, Duration::from_millis(2000), None);
             let profiles = store::load_all();
-            let mut results = vec![];
-            if let Some(id) = profile_id {
-                if let Some(p) = profiles.into_iter().find(|x| x.id == id) {
-                    let r = ping::measure(&p);
-                    let ms = match r {
-                        ping::Ping::Ms(m) => Some(m),
-                        ping::Ping::Timeout => None,
-                    };
-                    results.push(ProbeResult {
-                        profile_id: p.id,
-                        rtt_ms: ms,
-                        is_available: ms.is_some(),
-                        real_delay_ms: None,
-                    });
-                }
+            let to_probe: Vec<Profile> = if let Some(id) = profile_id {
+                profiles.into_iter().filter(|x| x.id == id).collect()
             } else {
-                for (p, r) in ping::measure_all(profiles) {
-                    let ms = match r {
-                        ping::Ping::Ms(m) => Some(m),
-                        ping::Ping::Timeout => None,
-                    };
-                    results.push(ProbeResult {
-                        profile_id: p.id,
-                        rtt_ms: ms,
-                        is_available: ms.is_some(),
-                        real_delay_ms: None,
-                    });
+                profiles
+            };
+
+            let mut results = vec![];
+            for p in to_probe {
+                let (tcp_ms, tls_ms, real_delay) = prober.probe_profile(&p).await;
+                let latency = tls_ms.or(tcp_ms);
+                {
+                    let mut st = state.lock().await;
+                    let m = st.metrics.entry(p.id.clone()).or_default();
+                    m.record_sample(latency);
+                    m.last_tcp_ms = tcp_ms;
+                    m.last_tls_ms = tls_ms;
+                    m.last_real_delay_ms = real_delay;
                 }
+                let _ = state
+                    .lock()
+                    .await
+                    .subscribers
+                    .send(DaemonEvent::ProbeCompleted {
+                        profile_id: p.id.clone(),
+                        rtt_ms: latency,
+                    });
+                results.push(ProbeResult {
+                    profile_id: p.id,
+                    rtt_ms: latency,
+                    is_available: latency.is_some(),
+                    real_delay_ms: real_delay,
+                });
             }
             Some(IpcResponse::Probe(results))
         }
@@ -385,6 +493,19 @@ async fn process_request(
             Ok(_) => Some(IpcResponse::Routing(cfg)),
             Err(e) => Some(IpcResponse::Error(format!("Save routing failed: {e:#}"))),
         },
+        IpcRequest::SetSelectionMode { mode } => {
+            let mut st = state.lock().await;
+            st.selection_mode = mode;
+            Some(IpcResponse::SelectionMode(mode))
+        }
+        IpcRequest::GetSelectionMode => {
+            let st = state.lock().await;
+            Some(IpcResponse::SelectionMode(st.selection_mode))
+        }
+        IpcRequest::GetNodeMetrics => {
+            let st = state.lock().await;
+            Some(IpcResponse::NodeMetrics(st.metrics.clone()))
+        }
         IpcRequest::SubscribeEvents => {
             // No direct response needed; incoming events will stream via the select block
             None

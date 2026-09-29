@@ -5,6 +5,7 @@ pub mod ipc;
 pub mod model;
 pub mod parser;
 pub mod ping;
+pub mod probe;
 pub mod recon;
 pub mod shield;
 pub mod storage;

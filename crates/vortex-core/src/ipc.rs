@@ -19,6 +19,8 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/vortex-{uid}.sock"))
 }
 
+use crate::probe::{NodeMetrics, SelectionMode};
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "action", content = "payload")]
 pub enum IpcRequest {
@@ -40,6 +42,9 @@ pub enum IpcRequest {
     GetLogs { lines: usize },
     GetRouting,
     SetRouting(RoutingConfig),
+    SetSelectionMode { mode: SelectionMode },
+    GetSelectionMode,
+    GetNodeMetrics,
     SubscribeEvents,
 }
 
@@ -59,6 +64,8 @@ pub enum IpcResponse {
     Probe(Vec<ProbeResult>),
     Leak(LeakReport),
     Routing(RoutingConfig),
+    SelectionMode(SelectionMode),
+    NodeMetrics(std::collections::HashMap<String, NodeMetrics>),
 }
 
 #[allow(clippy::large_enum_variant)]
