@@ -19,6 +19,37 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/vortex-{uid}.sock"))
 }
 
+pub fn active_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("VORTEX_SOCK") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            let p = PathBuf::from(&dir).join("vortex.sock");
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    let sys = PathBuf::from("/run/vortex/vortex.sock");
+    if sys.exists() {
+        return sys;
+    }
+    let uid = unsafe { libc::getuid() };
+    let user_tmp = PathBuf::from(format!("/tmp/vortex-{uid}.sock"));
+    if user_tmp.exists() {
+        return user_tmp;
+    }
+    let root_tmp = PathBuf::from("/tmp/vortex-0.sock");
+    if root_tmp.exists() {
+        return root_tmp;
+    }
+    default_socket_path()
+}
+
+use crate::history::TrafficHistory;
 use crate::probe::{NodeMetrics, SelectionMode};
 use crate::routing::{ExplainResult, RulesConfig};
 
@@ -55,6 +86,9 @@ pub enum IpcRequest {
     RunSpeedTest,
     RunLeakTest,
     GetFlows,
+    KillFlow {
+        id: String,
+    },
     GetLogs {
         lines: usize,
     },
@@ -69,12 +103,21 @@ pub enum IpcRequest {
         process: Option<String>,
     },
     ReloadRouting,
+    GetHistory,
+    ExportHistory {
+        format: String,
+        since_secs: Option<u64>,
+    },
     SetSelectionMode {
         mode: SelectionMode,
     },
     GetSelectionMode,
     GetNodeMetrics,
     SubscribeEvents,
+    XrayInstall,
+    XrayUpdate,
+    XrayVersion,
+    XrayDoctor,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -83,10 +126,15 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     Ok,
     Error(String),
-    Version { version: u32, app_version: String },
+    Version {
+        version: u32,
+        app_version: String,
+    },
     Status(DaemonStatus),
     Profiles(Vec<Profile>),
-    ProfileAdded { count: usize },
+    ProfileAdded {
+        count: usize,
+    },
     Flows(Vec<ActiveFlow>),
     Logs(Vec<String>),
     Speed(SpeedResult),
@@ -97,6 +145,25 @@ pub enum IpcResponse {
     ExplainRoute(ExplainResult),
     SelectionMode(SelectionMode),
     NodeMetrics(std::collections::HashMap<String, NodeMetrics>),
+    History(TrafficHistory),
+    Export(String),
+    XrayInstalled {
+        version: String,
+    },
+    XrayUpdated {
+        version: String,
+    },
+    XrayVersion {
+        version: Option<String>,
+        path: Option<String>,
+        is_managed: bool,
+    },
+    XrayDoctor {
+        healthy: bool,
+        binary: Option<String>,
+        version: Option<String>,
+        issues: Vec<String>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -136,6 +203,10 @@ pub struct DaemonStatus {
     pub exit_ip: Option<String>,
     pub shield_armed: bool,
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 // ───────────────────────── Async Frame I/O ─────────────────────────
@@ -218,7 +289,7 @@ impl Default for IpcClient {
 impl IpcClient {
     pub fn new() -> Self {
         Self {
-            sock_path: default_socket_path(),
+            sock_path: active_socket_path(),
         }
     }
 
@@ -227,7 +298,27 @@ impl IpcClient {
     }
 
     pub fn is_daemon_running(&self) -> bool {
-        self.sock_path.exists()
+        if !self.sock_path.exists() {
+            return false;
+        }
+        std::os::unix::net::UnixStream::connect(&self.sock_path).is_ok()
+    }
+
+    pub fn request_sync(&self, req: &IpcRequest) -> Result<IpcResponse, VortexError> {
+        let mut stream = std::os::unix::net::UnixStream::connect(&self.sock_path).map_err(|e| {
+            VortexError::Ipc(format!(
+                "Cannot connect to vortexd at {:?}: {e}",
+                self.sock_path
+            ))
+        })?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+            .ok();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(15)))
+            .ok();
+        write_frame_sync(&mut stream, req)?;
+        read_frame_sync::<_, IpcResponse>(&mut stream)
     }
 
     pub async fn request(&self, req: &IpcRequest) -> Result<IpcResponse, VortexError> {

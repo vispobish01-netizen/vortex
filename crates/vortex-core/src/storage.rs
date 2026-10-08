@@ -126,7 +126,7 @@ pub fn load_profile_from_path(path: &Path) -> Result<Profile, VortexError> {
         ));
     };
 
-    Ok(Profile {
+    let mut p = Profile {
         id: stored.id,
         name: stored.name,
         kind: stored.kind,
@@ -138,7 +138,10 @@ pub fn load_profile_from_path(path: &Path) -> Result<Profile, VortexError> {
         group: stored.group,
         created_at: stored.created_at,
         updated_at: stored.updated_at,
-    })
+        ..Default::default()
+    };
+    p.populate_metadata();
+    Ok(p)
 }
 
 pub fn load_all() -> Vec<Profile> {

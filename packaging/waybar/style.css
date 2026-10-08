@@ -1,0 +1,26 @@
+/* Vortex Waybar Styling */
+
+#custom-vortex {
+    padding: 0 10px;
+    margin: 0 4px;
+    font-weight: bold;
+    border-radius: 6px;
+    transition: all 0.2s ease-in-out;
+}
+
+#custom-vortex.connected {
+    color: #00ffcc;
+    background: rgba(0, 240, 255, 0.12);
+    border: 1px solid rgba(0, 240, 255, 0.35);
+}
+
+#custom-vortex.connected.shield-armed {
+    border-bottom: 2px solid #00f0ff;
+    box-shadow: 0 0 8px rgba(0, 240, 255, 0.25);
+}
+
+#custom-vortex.disconnected {
+    color: #608a8e;
+    background: rgba(22, 61, 68, 0.25);
+    border: 1px solid rgba(96, 138, 142, 0.2);
+}

@@ -13,6 +13,7 @@ pub enum Kind {
     Wg,
     Awg,
     Ovpn,
+    Xray,
 }
 
 impl Kind {
@@ -27,6 +28,7 @@ impl Kind {
             Kind::Wg => "WG",
             Kind::Awg => "AWG",
             Kind::Ovpn => "OVPN",
+            Kind::Xray => "XRAY",
         }
     }
 
@@ -41,11 +43,87 @@ impl Kind {
             Kind::Wg => "WG    ",
             Kind::Awg => "AWG   ",
             Kind::Ovpn => "OVPN  ",
+            Kind::Xray => "XRAY  ",
         }
     }
 
     pub fn is_singbox(self) -> bool {
-        !matches!(self, Kind::Wg | Kind::Awg | Kind::Ovpn)
+        !matches!(self, Kind::Wg | Kind::Awg | Kind::Ovpn | Kind::Xray)
+    }
+
+    pub fn is_xray_capable(self) -> bool {
+        matches!(
+            self,
+            Kind::Vless | Kind::Vmess | Kind::Trojan | Kind::Ss | Kind::Hy2 | Kind::Xray
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    Tcp,
+    Udp,
+    Quic,
+    Ws,
+    Grpc,
+    H2,
+    HttpUpgrade,
+    Xhttp,
+    #[default]
+    Unknown,
+}
+
+impl Transport {
+    pub fn is_tcp(&self) -> bool {
+        matches!(
+            self,
+            Transport::Tcp
+                | Transport::Ws
+                | Transport::Grpc
+                | Transport::H2
+                | Transport::HttpUpgrade
+                | Transport::Xhttp
+        )
+    }
+
+    pub fn is_udp(&self) -> bool {
+        matches!(self, Transport::Udp | Transport::Quic)
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Transport::Tcp => "TCP",
+            Transport::Udp => "UDP",
+            Transport::Quic => "UDP/QUIC",
+            Transport::Ws => "TCP+WS",
+            Transport::Grpc => "TCP+gRPC",
+            Transport::H2 => "TCP+H2",
+            Transport::HttpUpgrade => "TCP+Upgrade",
+            Transport::Xhttp => "TCP+XHTTP",
+            Transport::Unknown => "--",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Security {
+    None,
+    Tls,
+    Reality,
+    #[default]
+    Unknown,
+}
+
+impl Security {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Security::None => "none",
+            Security::Tls => "TLS",
+            Security::Reality => "Reality",
+            Security::Unknown => "--",
+        }
     }
 }
 
@@ -105,6 +183,38 @@ pub struct Profile {
     pub created_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<u64>,
+    #[serde(default)]
+    pub transport: Transport,
+    #[serde(default)]
+    pub security: Security,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obfs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality_public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality_short_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality_spider_x: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ech: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_peer_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_quantum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_type: Option<String>,
 }
 
 impl Profile {
@@ -115,11 +225,15 @@ impl Profile {
         server: impl Into<String>,
         data: impl Into<String>,
     ) -> Self {
+        let server_str = server.into();
+        let port = server_str
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.split('/').next().unwrap_or("").parse::<u16>().ok());
         Self {
             id: id.into(),
             name: name.into(),
             kind,
-            server: server.into(),
+            server: server_str,
             data: data.into(),
             auth: None,
             sub_id: None,
@@ -127,7 +241,72 @@ impl Profile {
             group: None,
             created_at: None,
             updated_at: None,
+            transport: Transport::Unknown,
+            security: Security::Unknown,
+            tls_version: None,
+            sni: None,
+            alpn: None,
+            obfs: None,
+            port,
+            flow: None,
+            fingerprint: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            reality_spider_x: None,
+            ech: None,
+            pinned_peer_cert: None,
+            post_quantum: None,
+            backend_type: None,
         }
+    }
+
+    pub fn display_transport(&self) -> String {
+        match self.transport {
+            Transport::Unknown => "--".to_string(),
+            Transport::Quic => "UDP/QUIC".to_string(),
+            Transport::Udp => "UDP".to_string(),
+            Transport::Ws => "TCP+WS".to_string(),
+            Transport::Grpc => "TCP+gRPC".to_string(),
+            Transport::H2 => "TCP+H2".to_string(),
+            Transport::HttpUpgrade => "TCP+Upgrade".to_string(),
+            Transport::Xhttp => "TCP+XHTTP".to_string(),
+            Transport::Tcp => {
+                if self.security == Security::Reality {
+                    "TCP+Reality".to_string()
+                } else {
+                    "TCP".to_string()
+                }
+            }
+        }
+    }
+
+    pub fn display_security(&self) -> String {
+        match self.security {
+            Security::Reality => "Reality".to_string(),
+            Security::Tls => {
+                if let Some(v) = &self.tls_version {
+                    if v.to_ascii_uppercase().starts_with("TLS") {
+                        v.clone()
+                    } else {
+                        format!("TLS {v}")
+                    }
+                } else {
+                    "TLS".to_string()
+                }
+            }
+            Security::None => {
+                if self.kind == Kind::Wg || self.kind == Kind::Awg {
+                    "none".to_string()
+                } else {
+                    "none (warn)".to_string()
+                }
+            }
+            Security::Unknown => "--".to_string(),
+        }
+    }
+
+    pub fn populate_metadata(&mut self) {
+        crate::parser::derive_metadata_for_profile(self);
     }
 }
 
@@ -147,6 +326,10 @@ pub struct ActiveFlow {
     pub process: String,
     pub upload: u64,
     pub download: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

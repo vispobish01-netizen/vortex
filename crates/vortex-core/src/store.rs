@@ -15,7 +15,7 @@ pub const ROOT: &str = "/etc/vortex";
 pub const STORE: &str = "/etc/vortex/profiles";
 pub const SUBS_FILE: &str = "/etc/vortex/subscriptions.json";
 
-pub use crate::model::{Auth, Kind, Profile, Subscription};
+pub use crate::model::{Auth, Kind, Profile, Security, Subscription, Transport};
 
 // ───────────────────────── storage ─────────────────────────
 
@@ -36,10 +36,14 @@ fn expand(s: &str) -> PathBuf {
 }
 
 pub fn ensure_dirs() -> Result<()> {
-    fs::create_dir_all(STORE)?;
-    fs::set_permissions(ROOT, fs::Permissions::from_mode(0o700))?;
-    fs::create_dir_all(crate::tunnel::RUN)?;
-    fs::set_permissions(crate::tunnel::RUN, fs::Permissions::from_mode(0o700))?;
+    if unsafe { libc::geteuid() } == 0 {
+        let _ = fs::create_dir_all(STORE);
+        let _ = fs::set_permissions(ROOT, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(STORE, fs::Permissions::from_mode(0o755));
+        let _ = fs::create_dir_all(crate::tunnel::RUN);
+        let _ = fs::set_permissions(crate::tunnel::RUN, fs::Permissions::from_mode(0o755));
+    }
+    let _ = crate::storage::ensure_dirs();
     Ok(())
 }
 
@@ -51,6 +55,31 @@ pub fn load_all() -> Vec<Profile> {
         .filter_map(|e| fs::read_to_string(e.path()).ok())
         .filter_map(|s| serde_json::from_str(&s).ok())
         .collect();
+
+    let user_prof_dir = crate::storage::profiles_dir();
+    if user_prof_dir.as_path() != Path::new(STORE) {
+        if let Ok(entries) = fs::read_dir(&user_prof_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(p) = crate::storage::load_profile_from_path(&path) {
+                    if !v.iter().any(|existing| existing.id == p.id) {
+                        v.push(p);
+                    }
+                } else if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(p) = serde_json::from_str::<Profile>(&content) {
+                        if !v.iter().any(|existing| existing.id == p.id) {
+                            v.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for p in &mut v {
+        if p.transport == Transport::Unknown {
+            p.populate_metadata();
+        }
+    }
     v.sort_by(|a, b| {
         a.name
             .bytes()
@@ -61,14 +90,25 @@ pub fn load_all() -> Vec<Profile> {
 }
 
 pub fn save(p: &Profile) -> Result<()> {
-    let path = Path::new(STORE).join(format!("{}.json", p.id));
-    fs::write(&path, serde_json::to_string_pretty(p)?)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    if unsafe { libc::geteuid() } == 0 {
+        let path = Path::new(STORE).join(format!("{}.json", p.id));
+        fs::write(&path, serde_json::to_string_pretty(p)?)?;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+    } else {
+        crate::storage::save_profile(p).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     Ok(())
 }
 
 pub fn remove(id: &str) -> Result<()> {
-    fs::remove_file(Path::new(STORE).join(format!("{id}.json")))?;
+    let sys_path = Path::new(STORE).join(format!("{id}.json"));
+    if sys_path.exists() {
+        let _ = fs::remove_file(sys_path);
+    }
+    let user_path = crate::storage::profiles_dir().join(format!("{id}.json"));
+    if user_path.exists() {
+        let _ = fs::remove_file(user_path);
+    }
     Ok(())
 }
 
@@ -297,12 +337,23 @@ pub fn export_to_file(p: &Profile) -> Result<PathBuf> {
     let ext = match p.kind {
         Kind::Ovpn => "ovpn",
         Kind::Wg | Kind::Awg => "conf",
+        Kind::Xray => "json",
         _ => "txt",
     };
     let filename = format!("vortex-{}.{}", p.id, ext);
     let target = user_home().join(&filename);
 
-    let content = if p.kind.is_singbox() {
+    let content = if p.kind == Kind::Xray || p.backend_type.as_deref() == Some("xray") {
+        if let Ok(cfg) = crate::xray::generate_xray_config(p, "vx0", 1080, 54321, None) {
+            format!(
+                "{}\n\n// Xray-core configuration:\n{}\n",
+                p.data,
+                serde_json::to_string_pretty(&cfg)?
+            )
+        } else {
+            p.data.clone()
+        }
+    } else if p.kind.is_singbox() {
         if let Ok((_, ob, _, _)) = outbound(&p.data) {
             format!(
                 "{}\n\n// sing-box outbound configuration:\n{}\n",
@@ -515,24 +566,28 @@ fn parse_raw_config(text: &str) -> Result<Vec<Profile>> {
         let awg = AWG_KEYS.iter().any(|k| kv_find(text, k).is_some());
         let server = kv_find(text, "Endpoint").unwrap_or_default();
         let name = format!("Config · {}", if awg { "AWG" } else { "WireGuard" });
-        return Ok(vec![Profile {
+        let mut p = Profile {
             id: String::new(),
             name,
             kind: if awg { Kind::Awg } else { Kind::Wg },
             server,
             data: text.to_string(),
             ..Default::default()
-        }]);
+        };
+        p.populate_metadata();
+        return Ok(vec![p]);
     }
     if text.lines().any(|l| l.trim_start().starts_with("remote ")) {
-        return Ok(vec![Profile {
+        let mut p = Profile {
             id: String::new(),
             name: "Config · OpenVPN".to_string(),
             kind: Kind::Ovpn,
             server: ovpn_server(text),
             data: text.to_string(),
             ..Default::default()
-        }]);
+        };
+        p.populate_metadata();
+        return Ok(vec![p]);
     }
     bail!("unrecognized raw config")
 }
@@ -879,8 +934,29 @@ fn tuic(l: &str) -> Result<Parsed> {
     Ok((o, frag(&u, &h, p), format!("{h}:{p}")))
 }
 
-/// Build the sing-box outbound for a stored link.
+/// Build the sing-box outbound for a stored link or raw JSON outbound.
 pub fn outbound(link: &str) -> Result<(Kind, Value, String, String)> {
+    let trimmed = link.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(mut ob) = serde_json::from_str::<Value>(trimmed) {
+            let ty = ob["type"].as_str().unwrap_or("").to_ascii_lowercase();
+            let k = match ty.as_str() {
+                "vless" => Kind::Vless,
+                "vmess" => Kind::Vmess,
+                "trojan" => Kind::Trojan,
+                "shadowsocks" | "ss" => Kind::Ss,
+                "hysteria2" | "hy2" => Kind::Hy2,
+                "tuic" => Kind::Tuic,
+                _ => bail!("unsupported sing-box outbound type '{ty}'"),
+            };
+            let name = ob["tag"].as_str().unwrap_or("proxy").to_string();
+            let srv = ob["server"].as_str().unwrap_or("");
+            let port = ob["server_port"].as_u64().unwrap_or(443);
+            let server_str = format!("{srv}:{port}");
+            ob["tag"] = json!("proxy");
+            return Ok((k, ob, name, server_str));
+        }
+    }
     let scheme = link.split("://").next().unwrap_or("").to_ascii_lowercase();
     let (k, (o, n, s)) = match scheme.as_str() {
         "vless" => (Kind::Vless, uri_proxy(link, Kind::Vless)?),
@@ -900,14 +976,16 @@ fn parse_link(l: &str) -> Result<Vec<Profile>> {
         return amnezia(l);
     }
     let (k, _, name, server) = outbound(l)?;
-    Ok(vec![Profile {
+    let mut p = Profile {
         id: String::new(),
         name,
         kind: k,
         server,
         data: l.to_string(),
         ..Default::default()
-    }])
+    };
+    p.populate_metadata();
+    Ok(vec![p])
 }
 
 // ───────────────────────── profile helpers ─────────────────────────
@@ -961,32 +1039,28 @@ pub fn last() -> Option<String> {
 /// Human-readable facts about a profile (transport, security, endpoint…) for the details pane.
 pub fn details(p: &Profile) -> Vec<(&'static str, String)> {
     let mut v: Vec<(&'static str, String)> = vec![];
+    v.push(("transport", p.display_transport()));
+    v.push(("security", p.display_security()));
+    if let Some(port) = p.port {
+        v.push(("port", port.to_string()));
+    }
+    if let Some(sni) = &p.sni {
+        v.push(("sni", sni.clone()));
+    }
+    if let Some(alpn) = &p.alpn {
+        v.push(("alpn", alpn.clone()));
+    }
+    if let Some(obfs) = &p.obfs {
+        v.push(("obfs", obfs.clone()));
+    }
     if p.kind.is_singbox() {
         if let Ok((_, ob, _, _)) = outbound(&p.data) {
             let s = |x: &Value| x.as_str().map(String::from);
-            v.push((
-                "transport",
-                s(&ob["transport"]["type"]).unwrap_or_else(|| "tcp".into()),
-            ));
-            let sec = if ob["tls"]["reality"]["enabled"].as_bool() == Some(true) {
-                "reality"
-            } else if ob["tls"]["enabled"].as_bool() == Some(true) {
-                "tls"
-            } else {
-                "none"
-            };
-            v.push(("security", sec.into()));
-            if let Some(x) = s(&ob["tls"]["server_name"]) {
-                v.push(("sni", x));
-            }
             if let Some(x) = s(&ob["flow"]) {
                 v.push(("flow", x));
             }
             if let Some(x) = s(&ob["method"]) {
                 v.push(("cipher", x));
-            }
-            if let Some(x) = s(&ob["obfs"]["type"]) {
-                v.push(("obfs", x));
             }
         }
     } else {
@@ -1013,8 +1087,8 @@ pub fn details(p: &Profile) -> Vec<(&'static str, String)> {
                 v.push(("cipher", t[7..].trim().to_string()));
             }
         }
-        v.dedup_by_key(|x| x.0);
     }
+    v.dedup_by_key(|x| x.0);
     v
 }
 
@@ -1111,30 +1185,48 @@ fn import_file(s: &str) -> Result<Profile> {
         .and_then(|x| x.to_str())
         .unwrap_or("profile")
         .to_string();
+
+    if let Ok(parsed) = crate::parser::parse_any(s) {
+        if let Some(mut first) = parsed.into_iter().next() {
+            if first.name == "Config · WireGuard" || first.name == "Config · OpenVPN" {
+                first.name = name;
+            }
+            first.populate_metadata();
+            return Ok(first);
+        }
+    }
+
     if text.contains("[Interface]") {
         let awg = AWG_KEYS.iter().any(|k| kv_find(&text, k).is_some());
-        return Ok(Profile {
+        let mut prof = Profile {
             id: String::new(),
             name,
             kind: if awg { Kind::Awg } else { Kind::Wg },
             server: kv_find(&text, "Endpoint").unwrap_or_default(),
             data: text,
             ..Default::default()
-        });
+        };
+        prof.populate_metadata();
+        return Ok(prof);
     }
-    if text.lines().any(|l| l.trim_start().starts_with("remote ")) {
+    if text.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("remote ") || t.starts_with("remote\t")
+    }) {
         let dir = p.parent().unwrap_or(Path::new("."));
         let data = inline_ovpn(&text, dir);
-        return Ok(Profile {
+        let mut prof = Profile {
             id: String::new(),
             name,
             kind: Kind::Ovpn,
             server: ovpn_server(&data),
             data,
             ..Default::default()
-        });
+        };
+        prof.populate_metadata();
+        return Ok(prof);
     }
-    bail!("unrecognized file (expected WireGuard, AmneziaWG or OpenVPN config)")
+    bail!("unrecognized file (expected WireGuard, AmneziaWG, OpenVPN, or sing-box config)")
 }
 
 /// vpn:// = base64url( qCompress(json) ) — 4 byte BE length + zlib stream.
@@ -1227,6 +1319,17 @@ mod tests {
         assert_eq!(n, "vm");
         assert_eq!(o["transport"]["type"], "ws");
         assert_eq!(o["tls"]["server_name"], "a.b");
+    }
+
+    #[test]
+    fn test_outbound_json_format() {
+        let j = r#"{"type":"vless","tag":"vless-node","server":"1.2.3.4","server_port":443,"uuid":"12345"}"#;
+        let (k, o, n, s) = outbound(j).unwrap();
+        assert_eq!(k, Kind::Vless);
+        assert_eq!(n, "vless-node");
+        assert_eq!(s, "1.2.3.4:443");
+        assert_eq!(o["tag"], "proxy");
+        assert_eq!(o["type"], "vless");
     }
 
     #[test]

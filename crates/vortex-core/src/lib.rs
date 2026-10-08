@@ -1,6 +1,8 @@
+pub mod backend;
 pub mod benchmark;
 pub mod crypto;
 pub mod error;
+pub mod history;
 pub mod ipc;
 pub mod leak;
 pub mod model;
@@ -13,6 +15,7 @@ pub mod shield;
 pub mod storage;
 pub mod store;
 pub mod tunnel;
+pub mod xray;
 
 pub use error::VortexError;
 pub use model::*;

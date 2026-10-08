@@ -7,7 +7,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::IpAddr,
     os::unix::{fs::PermissionsExt, process::CommandExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread::sleep,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -35,14 +35,51 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-fn sess_path() -> String {
-    format!("{RUN}/session.json")
+pub fn active_run_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("VORTEX_RUN_DIR") {
+        if !dir.is_empty() {
+            let p = PathBuf::from(dir);
+            let _ = fs::create_dir_all(&p);
+            return p;
+        }
+    }
+    let default_run = Path::new(RUN);
+    if default_run.exists() {
+        let probe = default_run.join(format!(".probe_{}", std::process::id()));
+        if fs::write(&probe, b"1").is_ok() {
+            let _ = fs::remove_file(probe);
+            return default_run.to_path_buf();
+        }
+    } else if fs::create_dir_all(default_run).is_ok() {
+        let _ = fs::set_permissions(default_run, fs::Permissions::from_mode(0o755));
+        return default_run.to_path_buf();
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            let user_run = PathBuf::from(dir).join("vortex");
+            if fs::create_dir_all(&user_run).is_ok() {
+                return user_run;
+            }
+        }
+    }
+    let tmp = PathBuf::from(format!("/tmp/vortex-{}", unsafe { libc::getuid() }));
+    let _ = fs::create_dir_all(&tmp);
+    tmp
+}
+
+pub fn run_path(file: &str) -> PathBuf {
+    active_run_dir().join(file)
+}
+
+fn sess_path() -> PathBuf {
+    run_path("session.json")
 }
 
 fn write_session(s: &Session) -> Result<()> {
-    let _ = fs::create_dir_all(RUN);
-    let _ = fs::set_permissions(RUN, fs::Permissions::from_mode(0o755));
     let path = sess_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     fs::write(&path, serde_json::to_string(s)?)?;
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
     Ok(())
@@ -94,8 +131,9 @@ fn iface_exists(name: &str) -> bool {
 }
 
 pub fn tail_log(n: usize) -> Vec<String> {
-    let path = format!("{RUN}/core.log");
-    let mut f = match fs::File::open(&path) {
+    let path = run_path("core.log");
+    let f = fs::File::open(&path).or_else(|_| fs::File::open(Path::new(RUN).join("core.log")));
+    let mut f = match f {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
@@ -124,7 +162,20 @@ fn last_lines(n: usize) -> String {
 // ───────────────────────── session ─────────────────────────
 
 fn read_session() -> Option<Session> {
-    serde_json::from_str(&fs::read_to_string(sess_path()).ok()?).ok()
+    if let Ok(content) = fs::read_to_string(sess_path()) {
+        if let Ok(s) = serde_json::from_str(&content) {
+            return Some(s);
+        }
+    }
+    let default_sess = Path::new(RUN).join("session.json");
+    if default_sess != sess_path() {
+        if let Ok(content) = fs::read_to_string(&default_sess) {
+            if let Ok(s) = serde_json::from_str(&content) {
+                return Some(s);
+            }
+        }
+    }
+    None
 }
 
 /// The active session, if its tunnel is actually still up.
@@ -138,6 +189,7 @@ pub fn load_session() -> Option<Session> {
         Some(s)
     } else {
         let _ = fs::remove_file(sess_path());
+        let _ = fs::remove_file(Path::new(RUN).join("session.json"));
         None
     }
 }
@@ -221,6 +273,8 @@ pub fn active_flows() -> Vec<ActiveFlow> {
                             process,
                             upload,
                             download,
+                            duration_secs: None,
+                            rule: c["rule"].as_str().map(String::from),
                         });
                     }
                     if !flows.is_empty() {
@@ -260,12 +314,29 @@ pub fn active_flows() -> Vec<ActiveFlow> {
                         process: proc_name.to_string(),
                         upload: 0,
                         download: 0,
+                        duration_secs: None,
+                        rule: None,
                     });
                 }
             }
         }
     }
     flows
+}
+
+/// Terminates an active connection flow by ID via sing-box controller.
+pub fn kill_flow(id: &str) -> Result<()> {
+    if !id.is_empty() {
+        let _ = Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "DELETE",
+                &format!("http://127.0.0.1:9090/connections/{id}"),
+            ])
+            .output();
+    }
+    Ok(())
 }
 
 // ───────────────────────── connect / disconnect ─────────────────────────
@@ -337,9 +408,26 @@ pub fn prompt_ovpn_credentials(default_user: Option<&str>) -> Result<Credentials
     })
 }
 
+pub fn up_xray(p: &Profile) -> Result<Session> {
+    use crate::backend::Backend;
+    let backend = crate::xray::XrayBackend::new();
+    let r_dir = active_run_dir();
+    backend.start(p, &r_dir)
+}
+
 pub fn connect_with_credentials(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
     let _ = disconnect();
-    let mut s = if p.kind.is_singbox() {
+    let use_xray = p.kind == Kind::Xray
+        || p.backend_type.as_deref() == Some("xray")
+        || (p.kind.is_xray_capable()
+            && (std::env::var("VORTEX_BACKEND")
+                .map(|b| b.eq_ignore_ascii_case("xray"))
+                .unwrap_or(false)
+                || !have("sing-box")));
+
+    let mut s = if use_xray {
+        up_xray(p)?
+    } else if p.kind.is_singbox() {
         up_singbox(p)?
     } else if p.kind == Kind::Ovpn {
         up_ovpn(p, credentials)?
@@ -356,26 +444,78 @@ pub fn connect_with_credentials(p: &Profile, credentials: Option<(&str, &str)>) 
 }
 
 pub fn disconnect() -> Result<()> {
-    let Some(s) = read_session() else {
-        return Ok(());
-    };
-    match s.kind {
-        Kind::Wg | Kind::Awg => {
-            let quick = if s.kind == Kind::Awg {
-                "awg-quick"
-            } else {
-                "wg-quick"
-            };
-            let _ = Command::new(quick).args(["down", &s.conf]).output();
-        }
-        _ => {
-            if let Some(pid) = s.pid {
-                kill(pid);
+    if let Some(s) = read_session() {
+        match s.kind {
+            Kind::Wg | Kind::Awg => {
+                let quick = if s.kind == Kind::Awg {
+                    "awg-quick"
+                } else {
+                    "wg-quick"
+                };
+                let _ = Command::new(quick).args(["down", &s.conf]).output();
+            }
+            Kind::Xray => {
+                use crate::backend::Backend;
+                let backend = crate::xray::XrayBackend::new();
+                let _ = backend.stop(&s);
+            }
+            _ => {
+                if s.conf.contains("xray") {
+                    use crate::backend::Backend;
+                    let backend = crate::xray::XrayBackend::new();
+                    let _ = backend.stop(&s);
+                } else if let Some(pid) = s.pid {
+                    kill(pid);
+                }
             }
         }
+        let _ = fs::remove_file(&s.conf);
+        let _ = fs::remove_file(run_path("xray_api_port"));
+        let _ = fs::remove_file(run_path("xray.json"));
+        let _ = fs::remove_file(sess_path());
+        let _ = fs::remove_file(Path::new(RUN).join("session.json"));
     }
-    let _ = fs::remove_file(&s.conf);
+    // Clean up any lingering tunnel devices or processes
+    if iface_exists("vxwg0") {
+        let _ = Command::new("wg-quick")
+            .args(["down", &run_path("vxwg0.conf").to_string_lossy()])
+            .output();
+        let _ = Command::new("wg-quick")
+            .args(["down", &format!("{RUN}/vxwg0.conf")])
+            .output();
+        let _ = Command::new("ip")
+            .args(["link", "delete", "dev", "vxwg0"])
+            .output();
+    }
+    if iface_exists("vxawg0") {
+        let _ = Command::new("awg-quick")
+            .args(["down", &run_path("vxawg0.conf").to_string_lossy()])
+            .output();
+        let _ = Command::new("awg-quick")
+            .args(["down", &format!("{RUN}/vxawg0.conf")])
+            .output();
+        let _ = Command::new("ip")
+            .args(["link", "delete", "dev", "vxawg0"])
+            .output();
+    }
+    if iface_exists(TUN_IF) {
+        let _ = Command::new("ip")
+            .args(["link", "delete", "dev", TUN_IF])
+            .output();
+    }
+    for pidf in [
+        run_path("ovpn.pid"),
+        PathBuf::from(format!("{RUN}/ovpn.pid")),
+    ] {
+        if let Ok(pid_str) = fs::read_to_string(&pidf) {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                kill(pid);
+            }
+            let _ = fs::remove_file(&pidf);
+        }
+    }
     let _ = fs::remove_file(sess_path());
+    let _ = fs::remove_file(Path::new(RUN).join("session.json"));
     if crate::shield::is_armed() && !crate::shield::is_enabled_preference() {
         let _ = crate::shield::disarm();
     }
@@ -430,7 +570,25 @@ pub const ROUTING_FILE: &str = "/etc/vortex/routing.json";
 
 pub use crate::model::RoutingConfig;
 
+pub fn default_routing_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("VORTEX_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("routing.json");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config/vortex/routing.json")
+    } else {
+        PathBuf::from(ROUTING_FILE)
+    }
+}
+
 pub fn load_routing() -> RoutingConfig {
+    if let Ok(s) = fs::read_to_string(default_routing_path()) {
+        if let Ok(cfg) = serde_json::from_str(&s) {
+            return cfg;
+        }
+    }
     fs::read_to_string(ROUTING_FILE)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -438,14 +596,55 @@ pub fn load_routing() -> RoutingConfig {
 }
 
 pub fn save_routing(cfg: &RoutingConfig) -> Result<()> {
-    fs::write(ROUTING_FILE, serde_json::to_string_pretty(cfg)?)?;
+    let p = if unsafe { libc::geteuid() } == 0 && Path::new("/etc/vortex").exists() {
+        PathBuf::from(ROUTING_FILE)
+    } else {
+        default_routing_path()
+    };
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&p, serde_json::to_string_pretty(cfg)?)?;
     Ok(())
+}
+
+/// Sanitizes sing-box route rules against defined rule-sets to prevent sing-box FATAL errors
+/// during runtime initialization (e.g. `rule-set not found`).
+pub fn sanitize_singbox_rules(rules: &mut Vec<Value>, rule_sets: &[Value]) {
+    let defined_rule_sets: std::collections::HashSet<&str> = rule_sets
+        .iter()
+        .filter_map(|rs| rs.get("tag").and_then(|t| t.as_str()))
+        .collect();
+
+    rules.retain_mut(|rule| {
+        if let Some(obj) = rule.as_object_mut() {
+            if let Some(rs_val) = obj.get_mut("rule_set") {
+                if let Some(arr) = rs_val.as_array_mut() {
+                    arr.retain(|t| {
+                        t.as_str()
+                            .map(|s| defined_rule_sets.contains(s))
+                            .unwrap_or(false)
+                    });
+                    if arr.is_empty() {
+                        obj.remove("rule_set");
+                    }
+                }
+            }
+            // Discard rule if it only has routing action/outbound and no match criteria left
+            let has_matchers = obj
+                .keys()
+                .any(|k| k != "action" && k != "outbound" && k != "tag" && k != "description");
+            has_matchers
+        } else {
+            true
+        }
+    });
 }
 
 fn up_singbox(p: &Profile) -> Result<Session> {
     need("sing-box", "sing-box (pacman -S sing-box)")?;
     let (_, ob, _, _) = outbound(&p.data)?;
-    let logp = format!("{RUN}/core.log");
+    let logp = run_path("core.log").to_string_lossy().to_string();
     let rules_cfg = crate::routing::RulesConfig::load();
     let mut rules = rules_cfg.to_singbox_rules();
 
@@ -463,6 +662,24 @@ fn up_singbox(p: &Profile) -> Result<Session> {
             "outbound": "direct"
         }));
     }
+
+    let mut rule_sets = vec![];
+    if rules_cfg.presets.direct_domestic {
+        rule_sets.push(json!({
+            "tag": "geoip-cn",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+        }));
+        rule_sets.push(json!({
+            "tag": "geoip-ir",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ir.srs"
+        }));
+    }
+
+    sanitize_singbox_rules(&mut rules, &rule_sets);
 
     let cfg = json!({
         "log": {"level": "warn", "timestamp": true, "output": logp},
@@ -494,7 +711,8 @@ fn up_singbox(p: &Profile) -> Result<Session> {
             "auto_detect_interface": true,
             "default_domain_resolver": "bootstrap",
             "final": "proxy",
-            "rules": rules
+            "rules": rules,
+            "rule_set": rule_sets
         },
         "experimental": {
             "clash_api": {
@@ -503,7 +721,7 @@ fn up_singbox(p: &Profile) -> Result<Session> {
             }
         }
     });
-    let path = format!("{RUN}/singbox.json");
+    let path = run_path("singbox.json").to_string_lossy().to_string();
     write_secret(&path, &serde_json::to_string_pretty(&cfg)?)?;
     let chk = Command::new("sing-box")
         .args(["check", "-c", &path])
@@ -517,19 +735,19 @@ fn up_singbox(p: &Profile) -> Result<Session> {
     }
     let log = fs::File::create(&logp)?;
     let pid = spawn_detached(Command::new("sing-box").args(["run", "-c", &path]), log)?;
-    for _ in 0..100 {
+    for count in 0..100 {
         if !proc_alive(pid) {
             bail!("sing-box exited: {}", last_lines(3));
         }
         if iface_exists(TUN_IF) {
             let route_ok = Command::new("ip")
-                .args(["route", "show", "dev", TUN_IF])
+                .args(["route", "show", "table", "all", "dev", TUN_IF])
                 .output()
                 .map(|o| {
                     o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
                 })
                 .unwrap_or(false);
-            if route_ok {
+            if route_ok || count >= 20 {
                 return Ok(session(p, TUN_IF, Some(pid), &path));
             }
         }
@@ -540,6 +758,61 @@ fn up_singbox(p: &Profile) -> Result<Session> {
 }
 
 // ───────────────────────── wireguard / amneziawg ─────────────────────────
+
+fn ipv6_supported() -> bool {
+    if fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+        .ok()
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    Path::new("/proc/sys/net/ipv6").exists()
+}
+
+fn sanitize_wg_conf(conf: &str) -> String {
+    let ipv6_ok = ipv6_supported();
+    let has_ipv6_addr = conf.lines().any(|l| {
+        if let Some((k, v)) = l.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("address") {
+                return v.contains(':');
+            }
+        }
+        false
+    });
+    let allow_ipv6 = ipv6_ok && has_ipv6_addr;
+
+    let mut out = Vec::new();
+    for line in conf.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim();
+            if key.eq_ignore_ascii_case("allowedips") && !allow_ipv6 {
+                let ips: Vec<&str> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.contains(':'))
+                    .collect();
+                if !ips.is_empty() {
+                    out.push(format!("{key} = {}", ips.join(", ")));
+                }
+                continue;
+            }
+            if key.eq_ignore_ascii_case("dns") && !allow_ipv6 {
+                let dns: Vec<&str> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.contains(':'))
+                    .collect();
+                if !dns.is_empty() {
+                    out.push(format!("{key} = {}", dns.join(", ")));
+                }
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
 
 fn up_wg(p: &Profile) -> Result<Session> {
     let awg = p.kind == Kind::Awg;
@@ -556,7 +829,22 @@ fn up_wg(p: &Profile) -> Result<Session> {
             "wireguard-tools"
         },
     )?;
-    let mut conf = p.data.clone();
+    // Clean up stale device before starting if it already exists
+    if iface_exists(iface) {
+        let _ = Command::new(quick)
+            .args([
+                "down",
+                &run_path(&format!("{iface}.conf")).to_string_lossy(),
+            ])
+            .output();
+        let _ = Command::new(quick)
+            .args(["down", &format!("{RUN}/{iface}.conf")])
+            .output();
+        let _ = Command::new("ip")
+            .args(["link", "delete", "dev", iface])
+            .output();
+    }
+    let mut conf = sanitize_wg_conf(&p.data);
     let mut dns: Option<String> = None;
     if !have("resolvconf") {
         // no resolvconf: strip DNS= and apply it with resolvectl afterwards
@@ -572,7 +860,9 @@ fn up_wg(p: &Profile) -> Result<Session> {
         }
         conf = kept.join("\n");
     }
-    let path = format!("{RUN}/{iface}.conf");
+    let path = run_path(&format!("{iface}.conf"))
+        .to_string_lossy()
+        .to_string();
     write_secret(&path, &conf)?;
     let out = Command::new(quick).args(["up", &path]).output()?;
     if !out.status.success() {
@@ -616,10 +906,10 @@ fn up_ovpn(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
     if needs_auth && effective_creds.is_none() {
         bail!("OpenVPN profile '{}' requires username and password (run `vortex auth {}` or connect with credentials)", p.name, p.name);
     }
-    let conf = format!("{RUN}/ovpn.conf");
-    let pidf = format!("{RUN}/ovpn.pid");
-    let logp = format!("{RUN}/core.log");
-    let authf = format!("{RUN}/ovpn.auth");
+    let conf = run_path("ovpn.conf").to_string_lossy().to_string();
+    let pidf = run_path("ovpn.pid").to_string_lossy().to_string();
+    let logp = run_path("core.log").to_string_lossy().to_string();
+    let authf = run_path("ovpn.auth").to_string_lossy().to_string();
 
     // Cleanly strip existing auth-user-pass lines so --auth-user-pass controls auth
     let mut conf_content = String::new();
@@ -653,6 +943,9 @@ fn up_ovpn(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
         "--log",
         &logp,
     ]);
+    if !conf_content.contains("redirect-gateway") && !conf_content.contains("route-nopull") {
+        cmd.args(["--redirect-gateway", "def1"]);
+    }
     if effective_creds.is_some() {
         cmd.args(["--auth-user-pass", &authf]);
     }
@@ -681,19 +974,19 @@ fn up_ovpn(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
                 let _ = fs::remove_file(&authf);
                 bail!("OpenVPN initialized but tunnel interface was not found");
             }
-            let route_ok = Command::new("ip")
-                .args(["route", "show", "dev", &iface])
-                .output()
-                .map(|o| {
-                    o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
-                })
-                .unwrap_or(false);
-            if !route_ok {
-                if let Some(pid) = pid {
-                    kill(pid);
+            // Settle check with table all
+            for _ in 0..10 {
+                let route_ok = Command::new("ip")
+                    .args(["route", "show", "table", "all", "dev", &iface])
+                    .output()
+                    .map(|o| {
+                        o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+                    })
+                    .unwrap_or(false);
+                if route_ok {
+                    break;
                 }
-                let _ = fs::remove_file(&authf);
-                bail!("OpenVPN connected but no route was installed on {iface}");
+                sleep(Duration::from_millis(100));
             }
             let _ = fs::remove_file(&authf);
             return Ok(session(p, &iface, pid, &conf));
@@ -712,4 +1005,167 @@ fn up_ovpn(p: &Profile, credentials: Option<(&str, &str)>) -> Result<Session> {
     }
     let _ = fs::remove_file(&authf);
     bail!("openvpn timed out waiting for connection")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_wg_conf_ipv4_only() {
+        let conf = "[Interface]\nAddress = 10.8.1.4/32\nDNS = 1.1.1.1, 2606:4700::\n[Peer]\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 1.2.3.4:51820\n";
+        let sanitized = sanitize_wg_conf(conf);
+        assert!(sanitized.contains("AllowedIPs = 0.0.0.0/0"));
+        assert!(!sanitized.contains("::/0"));
+        assert!(sanitized.contains("DNS = 1.1.1.1"));
+        assert!(!sanitized.contains("2606:4700::"));
+    }
+
+    #[test]
+    fn test_singbox_generated_config_passes_check() {
+        if !have("sing-box") {
+            return;
+        }
+        let rules_cfg = crate::routing::RulesConfig::default();
+        let mut rules = rules_cfg.to_singbox_rules();
+        let ob = json!({
+            "type": "vless",
+            "tag": "proxy",
+            "server": "1.2.3.4",
+            "server_port": 443,
+            "uuid": "a0a0a0a0-a0a0-a0a0-a0a0-a0a0a0a0a0a0",
+            "packet_encoding": "xudp"
+        });
+        let mut rule_sets = vec![];
+        if rules_cfg.presets.direct_domestic {
+            rule_sets.push(json!({
+                "tag": "geoip-cn",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+            }));
+            rule_sets.push(json!({
+                "tag": "geoip-ir",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ir.srs"
+            }));
+        }
+        sanitize_singbox_rules(&mut rules, &rule_sets);
+
+        // Verify that NO rule references an undefined rule_set tag
+        let defined_tags: std::collections::HashSet<&str> = rule_sets
+            .iter()
+            .filter_map(|rs| rs.get("tag").and_then(|t| t.as_str()))
+            .collect();
+        for r in &rules {
+            if let Some(rs_arr) = r.get("rule_set").and_then(|v| v.as_array()) {
+                for tag in rs_arr {
+                    if let Some(tag_str) = tag.as_str() {
+                        assert!(
+                            defined_tags.contains(tag_str),
+                            "Rule references undefined rule_set: {tag_str}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let cfg = json!({
+            "log": {"level": "warn"},
+            "dns": {
+                "servers": [
+                    {"type": "udp", "tag": "bootstrap", "server": "1.1.1.1"},
+                    {"type": "udp", "tag": "bootstrap-backup", "server": "8.8.8.8"},
+                    {"type": "https", "tag": "remote", "server": "1.1.1.1", "detour": "proxy"}
+                ],
+                "final": "remote",
+                "strategy": "ipv4_only",
+                "cache_capacity": 4096
+            },
+            "inbounds": [
+                {
+                    "type": "tun", "tag": "tun-in", "interface_name": TUN_IF,
+                    "address": ["172.19.0.1/30"],
+                    "mtu": 9000,
+                    "auto_route": true, "auto_redirect": true, "strict_route": true, "stack": "mixed",
+                    "endpoint_independent_nat": true
+                },
+                {
+                    "type": "mixed", "tag": "mixed-in",
+                    "listen": "127.0.0.1", "listen_port": PROXY_PORT
+                }
+            ],
+            "outbounds": [ob, {"type": "direct", "tag": "direct"}],
+            "route": {
+                "auto_detect_interface": true,
+                "default_domain_resolver": "bootstrap",
+                "final": "proxy",
+                "rules": rules,
+                "rule_set": rule_sets
+            },
+            "experimental": {
+                "clash_api": {
+                    "external_controller": "127.0.0.1:9090",
+                    "secret": ""
+                }
+            }
+        });
+
+        let tmp = std::env::temp_dir().join(format!("singbox_test_{}.json", std::process::id()));
+        fs::write(&tmp, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+        let chk = Command::new("sing-box")
+            .args(["check", "-c", tmp.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let _ = fs::remove_file(&tmp);
+        assert!(
+            chk.status.success(),
+            "sing-box check failed: {}",
+            String::from_utf8_lossy(&chk.stderr)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_singbox_rules_strips_undefined_rule_sets() {
+        let rule_sets = vec![json!({"tag": "geoip-cn", "type": "inline", "rules": []})];
+        let mut rules = vec![
+            // 1. Rule with both valid and invalid rule-sets and domain matcher
+            json!({
+                "action": "reject",
+                "domain_keyword": ["tracker"],
+                "rule_set": ["geoip-cn", "geosite-category-ads-all"]
+            }),
+            // 2. Rule with ONLY invalid rule-set (should be completely dropped)
+            json!({
+                "action": "reject",
+                "rule_set": ["geosite-category-ads-all"]
+            }),
+            // 3. Rule with valid rule-set only (should be kept)
+            json!({
+                "outbound": "direct",
+                "rule_set": ["geoip-cn"]
+            }),
+            // 4. Rule with no rule_set at all (should be kept)
+            json!({
+                "outbound": "direct",
+                "ip_is_private": true
+            }),
+        ];
+
+        sanitize_singbox_rules(&mut rules, &rule_sets);
+
+        assert_eq!(rules.len(), 3);
+        // Rule 1 kept domain_keyword, stripped geosite-category-ads-all, kept geoip-cn
+        assert_eq!(rules[0]["domain_keyword"], json!(["tracker"]));
+        assert_eq!(rules[0]["rule_set"], json!(["geoip-cn"]));
+
+        // Rule 2 was dropped!
+        // Rule 3 kept geoip-cn
+        assert_eq!(rules[1]["outbound"], "direct");
+        assert_eq!(rules[1]["rule_set"], json!(["geoip-cn"]));
+
+        // Rule 4 kept ip_is_private
+        assert_eq!(rules[2]["ip_is_private"], true);
+    }
 }

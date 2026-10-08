@@ -22,7 +22,7 @@ use vortex_core::benchmark::{self, SpeedResult};
 use vortex_core::ping::{self, Ping};
 use vortex_core::recon::{self, ReconReport};
 use vortex_core::shield;
-use vortex_core::store::{self, Kind, Profile};
+use vortex_core::store::{self, Kind, Profile, Security, Transport};
 use vortex_core::tunnel::{self, ActiveFlow, Session};
 
 // Elite Black-Hat Cyber Palette
@@ -56,6 +56,56 @@ enum Msg {
     Flows(Vec<ActiveFlow>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SortMode {
+    #[default]
+    Name,
+    Latency,
+    Transport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TransportFilter {
+    #[default]
+    All,
+    Tcp,
+    Udp,
+}
+
+impl TransportFilter {
+    fn cycle(&self) -> Self {
+        match self {
+            TransportFilter::All => TransportFilter::Tcp,
+            TransportFilter::Tcp => TransportFilter::Udp,
+            TransportFilter::Udp => TransportFilter::All,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            TransportFilter::All => "ALL",
+            TransportFilter::Tcp => "TCP",
+            TransportFilter::Udp => "UDP",
+        }
+    }
+
+    fn matches_profile(&self, p: &Profile) -> bool {
+        match self {
+            TransportFilter::All => true,
+            TransportFilter::Tcp => p.transport.is_tcp(),
+            TransportFilter::Udp => p.transport.is_udp(),
+        }
+    }
+
+    fn matches_flow(&self, f: &ActiveFlow) -> bool {
+        match self {
+            TransportFilter::All => true,
+            TransportFilter::Tcp => f.network.eq_ignore_ascii_case("tcp"),
+            TransportFilter::Udp => f.network.eq_ignore_ascii_case("udp"),
+        }
+    }
+}
+
 struct App {
     profiles: Vec<Profile>,
     /// indices into `profiles` after filter + sort
@@ -63,6 +113,9 @@ struct App {
     list: ListState,
     filter: String,
     sort_ping: bool,
+    sort_mode: SortMode,
+    transport_filter: TransportFilter,
+    flows_filter: TransportFilter,
     mode: Mode,
     focused_panel: usize,
     session: Option<Session>,
@@ -118,6 +171,9 @@ impl App {
             list: ListState::default(),
             filter: String::new(),
             sort_ping: false,
+            sort_mode: SortMode::Name,
+            transport_filter: TransportFilter::All,
+            flows_filter: TransportFilter::All,
             mode: Mode::Normal,
             focused_panel: 1,
             session: tunnel::load_session(),
@@ -190,21 +246,59 @@ impl App {
     fn rebuild(&mut self) {
         let keep = self.cur().map(|p| p.id.clone());
         let f = self.filter.to_lowercase();
+        let clean_f = f.trim_start_matches('/');
         let mut v: Vec<usize> = (0..self.profiles.len())
             .filter(|&i| {
                 let p = &self.profiles[i];
-                f.is_empty()
-                    || p.name.to_lowercase().contains(&f)
-                    || p.kind.tag().to_lowercase().contains(&f)
-                    || p.server.to_lowercase().contains(&f)
+                if !self.transport_filter.matches_profile(p) {
+                    return false;
+                }
+                if f.is_empty() {
+                    return true;
+                }
+                let t_disp = p.display_transport().to_lowercase();
+                let matches_target = |s: &str| {
+                    let sl = s.to_lowercase();
+                    sl.contains(&f) || (!clean_f.is_empty() && sl.contains(clean_f))
+                };
+                matches_target(&p.name)
+                    || matches_target(p.kind.tag())
+                    || matches_target(&p.server)
+                    || matches_target(&t_disp)
+                    || (clean_f == "udp" && p.transport.is_udp())
+                    || (clean_f == "tcp" && p.transport.is_tcp())
+                    || (clean_f == "ws" && p.transport == Transport::Ws)
+                    || (clean_f == "grpc" && p.transport == Transport::Grpc)
+                    || (clean_f == "quic" && p.transport == Transport::Quic)
+                    || (clean_f == "reality" && p.security == Security::Reality)
             })
             .collect();
-        if self.sort_ping {
-            v.sort_by_key(|&i| match self.pings.get(&self.profiles[i].id) {
-                Some(Ping::Ms(m)) => (0, *m),
-                None => (1, 0),
-                Some(Ping::Timeout) => (2, 0),
-            });
+        match self.sort_mode {
+            SortMode::Latency => {
+                v.sort_by_key(|&i| match self.pings.get(&self.profiles[i].id) {
+                    Some(Ping::Ms(m)) => (0, *m),
+                    None => (1, 0),
+                    Some(Ping::Timeout) => (2, 0),
+                });
+            }
+            SortMode::Transport => {
+                v.sort_by(|&a, &b| {
+                    let pa = &self.profiles[a];
+                    let pb = &self.profiles[b];
+                    pa.display_transport()
+                        .cmp(&pb.display_transport())
+                        .then_with(|| pa.name.to_lowercase().cmp(&pb.name.to_lowercase()))
+                });
+            }
+            SortMode::Name => {
+                if self.sort_ping {
+                    v.sort_by_key(|&i| match self.pings.get(&self.profiles[i].id) {
+                        Some(Ping::Ms(m)) => (0, *m),
+                        None => (1, 0),
+                        Some(Ping::Timeout) => (2, 0),
+                    });
+                }
+            }
         }
         self.view = v;
         let idx = keep
@@ -889,16 +983,34 @@ impl App {
                 }
             }
             Action::CycleSort => {
-                self.sort_ping = !self.sort_ping;
+                self.sort_mode = match self.sort_mode {
+                    SortMode::Name => SortMode::Latency,
+                    SortMode::Latency => SortMode::Transport,
+                    SortMode::Transport => SortMode::Name,
+                };
+                self.sort_ping = self.sort_mode == SortMode::Latency;
                 self.rebuild();
                 self.toast(
-                    if self.sort_ping {
-                        "sorted by latency"
-                    } else {
-                        "sorted by name"
+                    match self.sort_mode {
+                        SortMode::Latency => "sorted by latency",
+                        SortMode::Transport => "sorted by transport",
+                        SortMode::Name => "sorted by name",
                     },
                     true,
                 );
+            }
+            Action::CycleTransportFilter => {
+                if self.show_flows {
+                    self.flows_filter = self.flows_filter.cycle();
+                    self.toast(format!("flows filter: {}", self.flows_filter.label()), true);
+                } else {
+                    self.transport_filter = self.transport_filter.cycle();
+                    self.rebuild();
+                    self.toast(
+                        format!("transport filter: {}", self.transport_filter.label()),
+                        true,
+                    );
+                }
             }
             Action::TestSelected => self.test(true),
             Action::TestAll => self.test(false),
@@ -1200,6 +1312,7 @@ fn kind_color(k: Kind) -> Color {
         Kind::Wg => GREEN,
         Kind::Awg => Color::Rgb(0x10, 0xb9, 0x81), // Emerald
         Kind::Ovpn => YELLOW,
+        Kind::Xray => Color::Rgb(0x00, 0xf0, 0xff), // Electric Cyan
     }
 }
 
@@ -1214,6 +1327,7 @@ fn kind_badge(k: Kind) -> &'static str {
         Kind::Wg => "WG-0 ",
         Kind::Awg => "AMN-W",
         Kind::Ovpn => "OVPN ",
+        Kind::Xray => "X-RAY",
     }
 }
 
@@ -1385,11 +1499,37 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
     }
 
     let armed = app.shield_armed || shield::is_armed();
+    let (core_tag, core_val) = if let Some(s) = &app.session {
+        if s.kind == Kind::Xray || s.conf.contains("xray") {
+            let ver = vortex_core::xray::active_xray_version().unwrap_or_default();
+            (
+                "  XRAY: ",
+                if ver.is_empty() {
+                    "xray-core".to_string()
+                } else {
+                    format!("xray {ver}")
+                },
+            )
+        } else if s.kind == Kind::Wg {
+            ("  SYS: ", "wireguard".to_string())
+        } else if s.kind == Kind::Awg {
+            ("  SYS: ", "amneziawg".to_string())
+        } else if s.kind == Kind::Ovpn {
+            ("  SYS: ", "openvpn".to_string())
+        } else {
+            ("  SYS: ", "sing-box/bpf".to_string())
+        }
+    } else if let Some(ver) = vortex_core::xray::active_xray_version() {
+        ("  XRAY: ", format!("xray {ver}"))
+    } else {
+        ("  SYS: ", "sing-box/bpf".to_string())
+    };
+
     let (sub_line, right_sub) = if a.width >= 100 {
         (
             Line::from(vec![
-                Span::styled("  SYS: ", Style::new().fg(DIM).bold()),
-                Span::styled("sing-box/bpf", Style::new().fg(CYAN)),
+                Span::styled(core_tag, Style::new().fg(DIM).bold()),
+                Span::styled(core_val.clone(), Style::new().fg(CYAN)),
                 Span::styled("  ◈  KERNEL: ", Style::new().fg(DIM).bold()),
                 Span::styled("vx0", Style::new().fg(FG)),
                 Span::styled("  ◈  PROXY: ", Style::new().fg(DIM).bold()),
@@ -1412,7 +1552,7 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
         (
             Line::from(vec![
                 Span::styled("  CORE: ", Style::new().fg(DIM).bold()),
-                Span::styled("sing-box", Style::new().fg(CYAN)),
+                Span::styled(core_val, Style::new().fg(CYAN)),
                 Span::styled("  ◈  PROXY: :1080  ◈  DNS: DoH", Style::new().fg(FG_DIM)),
             ]),
             Line::from(vec![
@@ -1475,8 +1615,29 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
             trunc(&app.filter, 12),
             app.view.len()
         );
-    } else if app.sort_ping {
-        title = format!("[1] TARGET MATRIX [ {:02} NODES · ↑RTT ]", app.view.len());
+    } else {
+        match app.sort_mode {
+            SortMode::Latency => {
+                title = format!("[1] TARGET MATRIX [ {:02} NODES · ↑RTT ]", app.view.len());
+            }
+            SortMode::Transport => {
+                title = format!(
+                    "[1] TARGET MATRIX [ {:02} NODES · TRANSPORT ]",
+                    app.view.len()
+                );
+            }
+            SortMode::Name => {
+                if app.sort_ping {
+                    title = format!("[1] TARGET MATRIX [ {:02} NODES · ↑RTT ]", app.view.len());
+                } else if app.transport_filter != TransportFilter::All {
+                    title = format!(
+                        "[1] TARGET MATRIX [ {:02} NODES · {} ]",
+                        app.view.len(),
+                        app.transport_filter.label()
+                    );
+                }
+            }
+        }
     }
     if let Mode::Search(s) = &app.mode {
         title = format!("[1] TARGET MATRIX [ SEARCH: \"{}\"█ ]", trunc(s, 16));
@@ -1520,6 +1681,9 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
     }
     let w = (area.width as usize).saturating_sub(4);
     let active = app.session.as_ref().map(|s| s.id.clone());
+    let show_transport = f.area().width >= 100;
+    let transport_col_w = if show_transport { 12 } else { 0 }; // 1 space + 11 chars
+    let fixed_w = 4 + 3 + 12 + 1 + 7 + 1 + transport_col_w; // marker(4) + num(3) + ping(12) + space(1) + tag(7) + space(1) [+ transport]
     let items: Vec<ListItem> = app
         .view
         .iter()
@@ -1529,11 +1693,10 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
             let on = active.as_deref() == Some(p.id.as_str());
             let num = format!("{:02} ", idx + 1);
             let tag_str = format!("[{}]", kind_badge(p.kind));
-            let fixed_w = 4 + 3 + 12 + 1 + 7 + 1; // marker(4) + num(3) + ping(12) + space(1) + tag(7) + space(1) = 28
             let nw = w.saturating_sub(fixed_w).max(4);
             let name = trunc(&p.name, nw);
             let pad = nw.saturating_sub(name.chars().count());
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     if on { "[●] " } else { "[○] " },
                     Style::new().fg(if on { GREEN } else { DIM }).bold(),
@@ -1547,8 +1710,15 @@ fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
                 ping_cell(app, &p.id),
                 Span::raw(" "),
                 Span::styled(tag_str, Style::new().fg(kind_color(p.kind)).bold()),
-            ])
-            .into()
+            ];
+            if show_transport {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("{:<11}", trunc(&p.display_transport(), 11)),
+                    Style::new().fg(FG_DIM),
+                ));
+            }
+            Line::from(spans).into()
         })
         .collect();
     let list = List::new(items)
@@ -1701,6 +1871,10 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         _ => None,
     };
     let Some((name, kind, server)) = shown else {
+        if app.show_flows {
+            flows_table(f, area, app);
+            return;
+        }
         f.render_widget(
             block(
                 "0x02 // [2] TELEMETRY // NO SELECTION",
@@ -1711,8 +1885,34 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let parts = Layout::vertical([Constraint::Length(12), Constraint::Min(4)]).split(area);
+    let parts = Layout::vertical([Constraint::Length(14), Constraint::Min(4)]).split(area);
     let is_connected = app.session.is_some();
+
+    let cur_p = match &app.session {
+        Some(s) => app.profiles.iter().find(|p| p.id == s.id).or(sel),
+        None => sel,
+    };
+    let transport_str = cur_p
+        .map(|p| p.display_transport())
+        .unwrap_or_else(|| "--".to_string());
+    let (sec_str, is_warn_sec) = if let Some(p) = cur_p {
+        let s_disp = p.display_security();
+        let is_warn = p.security == vortex_core::model::Security::None
+            && p.kind != Kind::Wg
+            && p.kind != Kind::Awg;
+        (s_disp, is_warn)
+    } else {
+        ("--".to_string(), false)
+    };
+    let ep_str = if let Some(port) = cur_p.and_then(|p| p.port) {
+        if server.ends_with(&format!(":{port}")) {
+            format!("{server} (port {port})")
+        } else {
+            format!("{server}:{port} (port {port})")
+        }
+    } else {
+        server.clone()
+    };
 
     // ── connection card
     let blk = block("0x02 // [2] TELEMETRY", app.focused_panel == 2);
@@ -1742,7 +1942,22 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
                 format!("{} [STRICT-ROUTE / TUN]", s.kind.tag()),
                 kind_color(s.kind),
             ));
-            lines.push(kv("endpoint", trunc(&server, nw), FG));
+            lines.push(kv("transport", transport_str, CYAN));
+            if is_warn_sec {
+                lines.push(kv("security", format!("⚠ {sec_str}"), YELLOW));
+            } else {
+                lines.push(kv("security", sec_str, CYAN));
+            }
+            lines.push(kv("endpoint", trunc(&ep_str, nw), FG));
+            if is_warn_sec {
+                lines.push(Line::from(vec![
+                    Span::styled("  [!] WARN: ", Style::new().fg(YELLOW).bold()),
+                    Span::styled(
+                        "Unencrypted transport without TLS / encapsulation poses interception risk",
+                        Style::new().fg(YELLOW),
+                    ),
+                ]));
+            }
             lines.push(kv(
                 "exit ip",
                 if app.ip.is_empty() {
@@ -1801,7 +2016,22 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
             lines.push(kv("status", "○ STANDBY // ROUTE DISENGAGED", FG_DIM));
             lines.push(kv("target", trunc(&name, nw), FG));
             lines.push(kv("protocol", kind.tag(), kind_color(kind)));
-            lines.push(kv("endpoint", trunc(&server, nw), FG));
+            lines.push(kv("transport", transport_str, CYAN));
+            if is_warn_sec {
+                lines.push(kv("security", format!("⚠ {sec_str}"), YELLOW));
+            } else {
+                lines.push(kv("security", sec_str, CYAN));
+            }
+            lines.push(kv("endpoint", trunc(&ep_str, nw), FG));
+            if is_warn_sec {
+                lines.push(Line::from(vec![
+                    Span::styled("  [!] WARN: ", Style::new().fg(YELLOW).bold()),
+                    Span::styled(
+                        "Unencrypted transport without TLS / encapsulation poses interception risk",
+                        Style::new().fg(YELLOW),
+                    ),
+                ]));
+            }
             let id = sel.map(|p| p.id.as_str()).unwrap_or("");
             lines.push(match app.pings.get(id) {
                 Some(Ping::Ms(ms)) => kv(
@@ -1843,16 +2073,37 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         let blk = block("0x03 // [3] PACKET FLOW", app.focused_panel == 3);
         let inner = blk.inner(parts[1]).inner(Margin::new(1, 0));
         f.render_widget(blk, parts[1]);
-        let rows = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
+        let mut tcp_bytes: u64 = 0;
+        let mut udp_bytes: u64 = 0;
+        for flow in &app.flows {
+            let b = flow.upload.saturating_add(flow.download);
+            if flow.network.eq_ignore_ascii_case("tcp") {
+                tcp_bytes = tcp_bytes.saturating_add(b);
+            } else if flow.network.eq_ignore_ascii_case("udp") {
+                udp_bytes = udp_bytes.saturating_add(b);
+            }
+        }
+        let total_flow_bytes = tcp_bytes.saturating_add(udp_bytes);
+        let split_opt = if total_flow_bytes > 0 {
+            let tcp_pct = (tcp_bytes as f64 / total_flow_bytes as f64 * 100.0).round() as u64;
+            let udp_pct = 100u64.saturating_sub(tcp_pct);
+            Some((tcp_pct, udp_pct))
+        } else {
+            None
+        };
+
+        let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
+        if split_opt.is_some() {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.extend_from_slice(&[
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Min(0),
-        ])
-        .split(inner);
+        ]);
+        let rows = Layout::vertical(constraints).split(inner);
         let dn = app.down.last().copied().unwrap_or(0);
         let upn = app.up.last().copied().unwrap_or(0);
         let tot = app
@@ -1901,10 +2152,24 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
                 ),
             ])
         };
-        f.render_widget(Paragraph::new(line), rows[0]);
-        f.render_widget(Paragraph::new(sub), rows[1]);
-        spark(f, rows[2], &app.down, CYAN);
-        spark(f, rows[3], &app.up, PURPLE);
+        let mut r = 0;
+        f.render_widget(Paragraph::new(line), rows[r]);
+        r += 1;
+        f.render_widget(Paragraph::new(sub), rows[r]);
+        r += 1;
+        if let Some((tcp_pct, udp_pct)) = split_opt {
+            let split_line = Line::from(vec![
+                Span::styled(format!("TCP {tcp_pct}%"), Style::new().fg(CYAN).bold()),
+                Span::styled(" · ", Style::new().fg(FG_DIM)),
+                Span::styled(format!("UDP {udp_pct}%"), Style::new().fg(PURPLE).bold()),
+            ]);
+            f.render_widget(Paragraph::new(split_line), rows[r]);
+            r += 1;
+        }
+        spark(f, rows[r], &app.down, CYAN);
+        r += 1;
+        spark(f, rows[r], &app.up, PURPLE);
+        r += 1;
         let (lo, hi) = (app.rtt_hist.iter().min(), app.rtt_hist.iter().max());
         let cur_rtt = app.rtt.unwrap_or(0);
         let rtt_txt = match (lo, hi) {
@@ -1915,9 +2180,10 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
         };
         f.render_widget(
             Paragraph::new(Span::styled(rtt_txt, Style::new().fg(FG_DIM).bold())),
-            rows[4],
+            rows[r],
         );
-        spark(f, rows[5], &app.rtt_hist, YELLOW);
+        r += 1;
+        spark(f, rows[r], &app.rtt_hist, YELLOW);
     } else {
         let blk = block("0x03 // [3] TARGET PARAMETERS", app.focused_panel == 3);
         let inner = blk.inner(parts[1]).inner(Margin::new(1, 0));
@@ -1966,6 +2232,21 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn extract_dst_port(flow: &ActiveFlow) -> String {
+    let parse_p = |s: &str| -> Option<String> {
+        if let Some(pos) = s.rfind(':') {
+            let part = &s[pos + 1..];
+            if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                return Some(part.to_string());
+            }
+        }
+        None
+    };
+    parse_p(&flow.destination)
+        .or_else(|| parse_p(&flow.host))
+        .unwrap_or_else(|| "--".to_string())
+}
+
 fn flows_table(f: &mut Frame, area: Rect, app: &App) {
     let blk = block(
         &format!("0x03 // [3] PACKET FLOWS [ {:02} ACTIVE ]", app.flows.len()),
@@ -1974,8 +2255,29 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
     let inner = blk.inner(area).inner(Margin::new(1, 0));
     f.render_widget(blk, area);
 
+    let tcp_count = app
+        .flows
+        .iter()
+        .filter(|f| f.network.eq_ignore_ascii_case("tcp"))
+        .count();
+    let udp_count = app
+        .flows
+        .iter()
+        .filter(|f| f.network.eq_ignore_ascii_case("udp"))
+        .count();
+    let icmp_count = app
+        .flows
+        .iter()
+        .filter(|f| f.network.eq_ignore_ascii_case("icmp"))
+        .count();
+
     if app.flows.is_empty() {
         let msg = vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "  TCP 0 · UDP 0",
+                Style::new().fg(FG_DIM).bold(),
+            )]),
             Line::from(""),
             Line::from(Span::styled(
                 "[○] NO ACTIVE FLOWS INTERCEPTED // SYSTEM IDLE",
@@ -2005,11 +2307,39 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let filtered_flows: Vec<_> = app
+        .flows
+        .iter()
+        .filter(|flow| app.flows_filter.matches_flow(flow))
+        .collect();
+
     let mut lines = vec![];
-    let header_line = if inner.width >= 70 {
+
+    let summary_line = Line::from(vec![
+        Span::styled(
+            format!("TCP {tcp_count} · UDP {udp_count}"),
+            Style::new().fg(FG).bold(),
+        ),
+        if icmp_count > 0 {
+            Span::styled(
+                format!(" · ICMP {icmp_count}"),
+                Style::new().fg(YELLOW).bold(),
+            )
+        } else {
+            Span::raw("")
+        },
+        Span::styled(
+            format!("   [FILTER: {}] [P] CYCLE", app.flows_filter.label()),
+            Style::new().fg(FG_DIM),
+        ),
+    ]);
+    lines.push(summary_line);
+
+    let header_line = if inner.width >= 75 {
         Line::from(vec![
             Span::styled(" PROTO ", Style::new().fg(CYAN).bold()),
-            Span::styled("SOURCE            ", Style::new().fg(CYAN).bold()),
+            Span::styled("PORT  ", Style::new().fg(CYAN).bold()),
+            Span::styled("SOURCE          ", Style::new().fg(CYAN).bold()),
             Span::styled("DESTINATION / TARGET    ", Style::new().fg(CYAN).bold()),
             Span::styled("PROCESS   ", Style::new().fg(CYAN).bold()),
             Span::styled("STATS", Style::new().fg(CYAN).bold()),
@@ -2017,6 +2347,7 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Line::from(vec![
             Span::styled(" PROTO ", Style::new().fg(CYAN).bold()),
+            Span::styled("PORT  ", Style::new().fg(CYAN).bold()),
             Span::styled("DESTINATION / TARGET ", Style::new().fg(CYAN).bold()),
             Span::styled("PROCESS   ", Style::new().fg(CYAN).bold()),
             Span::styled("STATS", Style::new().fg(CYAN).bold()),
@@ -2028,9 +2359,10 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
         Style::new().fg(BORDER),
     )));
 
-    let max_rows = (inner.height as usize).saturating_sub(2);
-    for flow in app.flows.iter().take(max_rows) {
+    let max_rows = (inner.height as usize).saturating_sub(3);
+    for flow in filtered_flows.iter().take(max_rows) {
         let proto = flow.network.to_ascii_uppercase();
+        let port = extract_dst_port(flow);
         let target = if !flow.host.is_empty() {
             &flow.host
         } else {
@@ -2041,16 +2373,21 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
         } else {
             "OK".to_string()
         };
-        if inner.width >= 70 {
+        let proto_color = match proto.as_str() {
+            "TCP" => CYAN,
+            "UDP" => PURPLE,
+            "ICMP" => YELLOW,
+            _ => FG_DIM,
+        };
+        if inner.width >= 75 {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {:<5} ", proto),
-                    Style::new()
-                        .fg(if proto == "TCP" { CYAN } else { PURPLE })
-                        .bold(),
+                    Style::new().fg(proto_color).bold(),
                 ),
+                Span::styled(format!("{:<6}", port), Style::new().fg(FG_DIM)),
                 Span::styled(
-                    format!("{:<18} ", trunc(&flow.source, 17)),
+                    format!("{:<16} ", trunc(&flow.source, 15)),
                     Style::new().fg(FG_DIM),
                 ),
                 Span::styled(
@@ -2067,10 +2404,9 @@ fn flows_table(f: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {:<5} ", proto),
-                    Style::new()
-                        .fg(if proto == "TCP" { CYAN } else { PURPLE })
-                        .bold(),
+                    Style::new().fg(proto_color).bold(),
                 ),
+                Span::styled(format!("{:<6}", port), Style::new().fg(FG_DIM)),
                 Span::styled(
                     format!("{:<21} ", trunc(target, 20)),
                     Style::new().fg(FG).bold(),
@@ -2152,10 +2488,11 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
                 "shield:off"
             };
 
-            let hints: [(&str, &str); 8] = [
+            let hints: [(&str, &str); 9] = [
                 ("Enter", "connect"),
                 ("Space", space_desc),
                 ("t", "test"),
+                ("p", "filter"),
                 ("a", "add"),
                 ("/", "search"),
                 ("K", shield_desc),
@@ -3438,6 +3775,8 @@ mod tests {
             process: "curl".into(),
             upload: 1024,
             download: 65536,
+            duration_secs: None,
+            rule: None,
         }];
         let p = prof("a", "Frankfurt", Kind::Vless, "vless://u@203.0.113.7:443");
         app.profiles = vec![p];
@@ -3447,5 +3786,215 @@ mod tests {
         assert!(out.contains("PACKET FLOWS"));
         assert!(out.contains("api.github.com:443"));
         assert!(out.contains("curl"));
+    }
+
+    #[test]
+    fn test_snapshot_tcp_node() {
+        let mut app = App::new();
+        let mut p = prof(
+            "tcp-node",
+            "US-1",
+            Kind::Trojan,
+            "trojan://pass@1.2.3.4:443#Trojan",
+        );
+        p.transport = Transport::Tcp;
+        p.security = Security::Tls;
+        app.profiles = vec![p];
+        app.rebuild();
+        let out = render(120, 30, &mut app);
+        assert!(out.contains("TCP"));
+        assert!(out.contains("US-1"));
+    }
+
+    #[test]
+    fn test_snapshot_udp_quic_node() {
+        let mut app = App::new();
+        let mut p = prof("quic-node", "US-1", Kind::Hy2, "hy2://pass@1.2.3.4:443#Hy2");
+        p.transport = Transport::Quic;
+        p.security = Security::Tls;
+        app.profiles = vec![p];
+        app.rebuild();
+        let out = render(120, 30, &mut app);
+        assert!(out.contains("UDP/QUIC"));
+        assert!(out.contains("US-1"));
+    }
+
+    #[test]
+    fn test_snapshot_ws_node() {
+        let mut app = App::new();
+        let mut p = prof(
+            "ws-node",
+            "US-1",
+            Kind::Vless,
+            "vless://u@1.2.3.4:443?type=ws#VlessWS",
+        );
+        p.transport = Transport::Ws;
+        p.security = Security::Tls;
+        app.profiles = vec![p];
+        app.rebuild();
+        let out = render(120, 30, &mut app);
+        assert!(out.contains("TCP+WS"));
+        assert!(out.contains("US-1"));
+    }
+
+    #[test]
+    fn test_snapshot_unknown_transport_node() {
+        let mut app = App::new();
+        let mut p = prof("unk-node", "US-1", Kind::Vless, "vless://u@1.2.3.4:443#Unk");
+        p.transport = Transport::Unknown;
+        p.security = Security::Unknown;
+        app.profiles = vec![p];
+        app.rebuild();
+        let out = render(120, 30, &mut app);
+        assert!(out.contains("--"));
+        assert!(out.contains("US-1"));
+    }
+
+    #[test]
+    fn test_snapshot_narrow_terminal_column_hidden() {
+        let mut app = App::new();
+        let mut p = prof("node-1", "US-1", Kind::Hy2, "hy2://pass@1.2.3.4:443#Hy2");
+        p.transport = Transport::Quic;
+        app.profiles = vec![p];
+        app.rebuild();
+
+        // Wide terminal (width >= 100): transport column is shown in profiles list
+        let wide_out = render(120, 30, &mut app);
+        let wide_line = wide_out
+            .lines()
+            .find(|l| l.contains("US-1"))
+            .expect("node line in wide");
+        let wide_left_col = wide_line.split('│').nth(1).unwrap_or("");
+        assert!(wide_left_col.contains("UDP/QUIC"));
+
+        // Narrow terminal (width < 100): transport column is hidden in profiles list
+        let narrow_out = render(90, 30, &mut app);
+        let narrow_line = narrow_out
+            .lines()
+            .find(|l| l.contains("US-1"))
+            .expect("node line in narrow");
+        let narrow_left_col = narrow_line.split('│').nth(1).unwrap_or("");
+        assert!(!narrow_left_col.contains("UDP/QUIC"));
+        assert!(narrow_left_col.contains("US-1"));
+    }
+
+    #[test]
+    fn test_flows_table_columns_and_summary() {
+        let mut app = App::new();
+        app.show_flows = true;
+        let mut flows = vec![];
+        for i in 0..42 {
+            flows.push(ActiveFlow {
+                id: format!("tcp-{i}"),
+                network: "tcp".into(),
+                host: format!("host{i}.com:443"),
+                destination: format!("1.2.3.4:{i}"),
+                source: "127.0.0.1:1234".into(),
+                process: "curl".into(),
+                upload: 100,
+                download: 200,
+                duration_secs: None,
+                rule: None,
+            });
+        }
+        for i in 0..7 {
+            flows.push(ActiveFlow {
+                id: format!("udp-{i}"),
+                network: "udp".into(),
+                host: format!("dns{i}.com:53"),
+                destination: format!("8.8.8.8:{i}"),
+                source: "127.0.0.1:4321".into(),
+                process: "c-ares".into(),
+                upload: 50,
+                download: 50,
+                duration_secs: None,
+                rule: None,
+            });
+        }
+        app.flows = flows;
+        let out = render(110, 30, &mut app);
+        assert!(out.contains("TCP 42 · UDP 7"));
+        assert!(out.contains("PORT"));
+    }
+
+    #[test]
+    fn test_traffic_panel_split() {
+        let mut app = App::new();
+        let p = prof(
+            "conn-p",
+            "Connected Node",
+            Kind::Vless,
+            "vless://u@1.2.3.4:443#Conn",
+        );
+        app.profiles = vec![p];
+        app.rebuild();
+        app.session = Some(Session {
+            id: "conn-p".into(),
+            name: "Connected Node".into(),
+            kind: Kind::Vless,
+            server: "1.2.3.4:443".into(),
+            iface: "vx0".into(),
+            pid: Some(1337),
+            since: tunnel::now().saturating_sub(60),
+            conf: "".into(),
+        });
+        // 78% TCP, 22% UDP
+        app.flows = vec![
+            ActiveFlow {
+                id: "f1".into(),
+                network: "tcp".into(),
+                host: "example.com:443".into(),
+                destination: "1.2.3.4:443".into(),
+                source: "127.0.0.1:1000".into(),
+                process: "curl".into(),
+                upload: 3900,
+                download: 3900, // 7800 bytes
+                duration_secs: None,
+                rule: None,
+            },
+            ActiveFlow {
+                id: "f2".into(),
+                network: "udp".into(),
+                host: "dns.com:53".into(),
+                destination: "8.8.8.8:53".into(),
+                source: "127.0.0.1:2000".into(),
+                process: "dig".into(),
+                upload: 1100,
+                download: 1100, // 2200 bytes
+                duration_secs: None,
+                rule: None,
+            },
+        ];
+        let out = render(110, 30, &mut app);
+        assert!(out.contains("TCP 78% · UDP 22%"));
+    }
+
+    #[test]
+    fn test_sort_and_filter_by_transport() {
+        let mut app = App::new();
+        let mut p1 = prof("p1", "Alpha Node", Kind::Trojan, "trojan://u@1.2.3.4:443");
+        p1.transport = Transport::Tcp;
+        let mut p2 = prof("p2", "Beta Node", Kind::Hy2, "hy2://u@1.2.3.4:443");
+        p2.transport = Transport::Quic;
+        let mut p3 = prof("p3", "Gamma Node", Kind::Wg, "wg://u@1.2.3.4:443");
+        p3.transport = Transport::Udp;
+        app.profiles = vec![p1, p2, p3];
+        app.rebuild();
+        assert_eq!(app.view.len(), 3);
+
+        // Cycle transport filter: All -> Tcp -> Udp -> All via key 'p'
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.transport_filter, TransportFilter::Tcp);
+        assert_eq!(app.view.len(), 1);
+        assert_eq!(app.profiles[app.view[0]].id, "p1");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.transport_filter, TransportFilter::Udp);
+        // p2 is Quic (UDP based) and p3 is Udp
+        assert_eq!(app.view.len(), 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.transport_filter, TransportFilter::All);
+        assert_eq!(app.view.len(), 3);
     }
 }

@@ -1,0 +1,12 @@
+// Waybar module configuration for Vortex
+// Add "custom/vortex" to "modules-right" or "modules-left" in your ~/.config/waybar/config.jsonc
+
+"custom/vortex": {
+    "format": "{}",
+    "return-type": "json",
+    "interval": 2,
+    "exec": "vortex status --json",
+    "on-click": "vortex toggle",
+    "on-click-right": "vortex pick",
+    "tooltip": true
+}

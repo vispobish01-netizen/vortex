@@ -179,7 +179,7 @@ impl Default for RulesConfig {
                     ],
                     ip_cidrs: Vec::new(),
                     geoip: Vec::new(),
-                    geosite: vec!["category-ads-all".into()],
+                    geosite: Vec::new(),
                     ports: Vec::new(),
                     protocols: Vec::new(),
                     process_names: Vec::new(),
@@ -211,8 +211,13 @@ impl RulesConfig {
 
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read rules config from {path:?}"))?;
-        let cfg: RulesConfig = toml::from_str(&content)
+        let mut cfg: RulesConfig = toml::from_str(&content)
             .with_context(|| format!("Failed to parse TOML from {path:?}"))?;
+        for r in &mut cfg.custom_rules {
+            if r.id == "block_telemetry" {
+                r.geosite.retain(|g| g != "category-ads-all");
+            }
+        }
         Ok(cfg)
     }
 
@@ -266,7 +271,18 @@ impl RulesConfig {
         // 2. Preset: Block Ads
         if self.presets.block_ads {
             rules.push(serde_json::json!({
-                "geosite": ["category-ads-all"],
+                "domain_suffix": [
+                    "doubleclick.net",
+                    "googleadservices.com",
+                    "adservice.google.com",
+                    "googlesyndication.com",
+                    "adnxs.com"
+                ],
+                "domain_keyword": [
+                    "adservice",
+                    "telemetry",
+                    "analytics"
+                ],
                 "action": "reject"
             }));
         }
@@ -274,7 +290,7 @@ impl RulesConfig {
         // 3. Preset: Direct Domestic
         if self.presets.direct_domestic {
             rules.push(serde_json::json!({
-                "geoip": ["cn", "ir"],
+                "rule_set": ["geoip-cn", "geoip-ir"],
                 "outbound": "direct"
             }));
         }
@@ -336,11 +352,25 @@ impl RulesConfig {
             if !r.ip_cidrs.is_empty() {
                 obj.insert("ip_cidr".into(), serde_json::json!(r.ip_cidrs));
             }
-            if !r.geoip.is_empty() {
-                obj.insert("geoip".into(), serde_json::json!(r.geoip));
+            let mut rule_set_tags = Vec::new();
+            for g in &r.geoip {
+                let tag = if g.starts_with("geoip-") {
+                    g.clone()
+                } else {
+                    format!("geoip-{g}")
+                };
+                rule_set_tags.push(tag);
             }
-            if !r.geosite.is_empty() {
-                obj.insert("geosite".into(), serde_json::json!(r.geosite));
+            for g in &r.geosite {
+                let tag = if g.starts_with("geosite-") {
+                    g.clone()
+                } else {
+                    format!("geosite-{g}")
+                };
+                rule_set_tags.push(tag);
+            }
+            if !rule_set_tags.is_empty() {
+                obj.insert("rule_set".into(), serde_json::json!(rule_set_tags));
             }
             if !r.ports.is_empty() {
                 obj.insert("port".into(), serde_json::json!(r.ports));

@@ -1,34 +1,139 @@
 # vortex ◢
 
-Minimal terminal VPN/proxy manager for Omarchy. One list, one keypress, whole-system tunnel.
+Tactical egress daemon, terminal cockpit, and VPN/proxy manager built natively for Linux & Omarchy.
 
-| Protocol | Engine | Import |
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. AMBIENT DESKTOP CITIZEN (Omarchy / Hyprland / Waybar)    │
+│    • Waybar module: [🇩🇪 DE-01 42ms 🛡️]                     │
+│    • Hotkey toggle (`Super+V`), Rofi/Fuzzel node picker     │
+│    • Desktop notifications on connect, disconnect & failover│
+├─────────────────────────────────────────────────────────────┤
+│ 2. TACTICAL TERMINAL COCKPIT (`vortex` TUI / CLI)           │
+│    • Keyboard-first (Vim motions), sub-millisecond launch   │
+│    • Packet flows sniffer, latency jitter, deep node recon  │
+│    • Split tunneling, domain rules, and live benchmarks     │
+├─────────────────────────────────────────────────────────────┤
+│ 3. DETERMINISTIC SYSTEM DAEMON (`vortexd` + `nftables`)     │
+│    • Background service managing TUN & routing over IPC     │
+│    • Non-root client execution via Unix domain socket       │
+│    • Atomic nftables kill-switch & IPv6 leak protection     │
+│    • Multi-layer active probing and autonomous failover     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Supported Protocols & Ingestion
+
+Paste any link, scan a QR code, or point to a file:
+
+| Protocol | Engine | Ingestion Format |
 |---|---|---|
-| VLESS (Reality, WS, gRPC, TLS…), VMess, Trojan, Shadowsocks, Hysteria2, TUIC | `sing-box` TUN (auto-route + strict-route) | share link, subscription URL |
-| WireGuard | `wg-quick` | `.conf` |
-| AmneziaWG | `awg-quick` | `.conf`, Amnezia `vpn://` link |
-| OpenVPN | `openvpn` | `.ovpn` (certs next to the file are inlined) |
+| **VLESS** (REALITY, Vision, XHTTP, PQ `mlkem768x25519plus`, ECH), **VMess**, **Trojan**, **Shadowsocks**, **Hysteria 2** | `xray-core` / `sing-box` TUN (`vx0`) | Share URLs (`vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://`), raw Xray JSON, subscription endpoints |
+| **WireGuard** | `wg-quick` (`vxwg0`) | `.conf` file |
+| **AmneziaWG** | `awg-quick` (`vxawg0`) | `.conf` file, Amnezia `vpn://` links |
+| **OpenVPN** | `openvpn` (`tun0`) | `.ovpn` file (embedded or inline certs) with credential save mode |
 
-## Install
-    ./install.sh
+---
 
-## Use
-    vortex                # TUI
-    vortex add <link | https://sub-url | file.conf>
-    vortex list | up [n|name] | down | status
-    vortex ping           # latency of every profile, fastest first
-    vortex best           # test all, connect to the fastest
-    vortex rename <n|name> <new name> | rm <n|name>
+## Xray-Core Managed Engine
 
-`vortex up` with no argument reconnects the last-used profile.
+Vortex includes native, first-class lifecycle management for [Xray-core](https://github.com/XTLS/Xray-core):
 
-TUI keys (`?` shows them in-app):
-`⏎` connect · `space` disconnect · `a` add · `v` paste from clipboard · `/` filter · `t`/`T` test latency (all / selected) · `o` sort by latency · `r` rename · `d` delete · `l` core log · `i` refresh exit IP · `q` quit (tunnel keeps running) · `Q` quit + disconnect.
-Pasting (ctrl+shift+v) anywhere in the list imports directly. Latency is tested on launch; while connected the header and traffic pane show live RTT through the tunnel.
+- **Dynamic Release Discovery**: Queries upstream GitHub releases (including pre-releases) to acquire the newest release (e.g. `v26.9.30+`).
+- **Security & Integrity**: Strict SHA256/SHA512 `.dgst` checksum verification before extraction. Downloads run entirely unprivileged (never as root).
+- **Atomic Symlinks & Rollbacks**: Installed to `~/.local/share/vortex/xray/<version>/` with an atomic `current` symlink. Rollbacks take a single command.
+- **Modern Transports**: Full support for VLESS `xtls-rprx-vision`, REALITY (publicKey, shortId, serverName, fingerprint, spiderX), XHTTP, gRPC, WebSocket, TLS with ECH & certificate pinning, and post-quantum `mlkem768x25519plus`.
+- **System-Wide TUN & Routing Shield**: Kernel TUN inbound (`vx0`), gRPC stats query over internal IPC, DoH leak protection, remote server route exclusion to prevent routing loops, and isolated ephemeral instance probing.
 
-## Notes
-- Runs as root (re-execs through `sudo`). Profiles live in `/etc/vortex/profiles` (0600).
-- All sing-box protocols share one TUN (`vx0`); DNS goes through the tunnel (DoH), the proxy server itself is resolved directly.
-- Server latency can only be measured while disconnected (a connected tunnel would route the probe through itself).
-- Don't run alongside TorJet — both rewrite routing/firewall rules.
-- Not supported yet: Xray-only transports (xhttp), OpenVPN username/password prompts, Amnezia Xray/Cloak containers, kill-switch for wg/ovpn.
+```bash
+vortex xray install            # Dynamically fetch, verify & install newest stable Xray-core
+vortex xray update             # Check for newer releases and refresh geoip.dat / geosite.dat
+vortex xray version            # Inspect active Xray version, source (system vs managed), and path
+vortex xray doctor             # Audit binary permissions, kernel TUN support, and dependencies
+vortex xray rollback           # Instantly switch back to the previously installed version
+vortex xray test <config.json> # Validate Xray JSON syntax and routing schema
+```
+
+---
+
+## Install & Service Setup
+
+```bash
+./install.sh
+
+# Enable vortexd daemon (enables passwordless CLI commands & desktop widgets):
+systemctl --user enable --now vortexd.service
+```
+
+---
+
+## CLI & Desktop Commands
+
+```bash
+vortex                         # Launch the tactical TUI cockpit
+vortex status [--json|--waybar]# Query active tunnel status (human-readable or Waybar JSON)
+vortex toggle                  # Instant toggle: disconnect if active, connect fastest if down
+vortex pick [query]            # Fuzzy node picker (fuzzel / rofi / wofi / zenity / CLI)
+vortex up [n|name]             # Connect to profile (number, name, or last used)
+vortex down                    # Disconnect active tunnel
+vortex best                    # Probe all nodes, connect to the fastest
+vortex ping                    # Measure latency of every profile
+vortex shield [on|off]         # Toggle atomic nftables stealth kill-switch shield
+vortex leaks                   # Run comprehensive leak audit (IP, DNS, IPv6, WebRTC)
+vortex flows                   # Live socket & active connection traffic sniffer
+vortex history [--json]        # Cumulative traffic accounting & usage statistics
+vortex route                   # Manage split tunneling, LAN bypass, and domain rules
+vortex recon [n|name]          # Deep node reconnaissance (ASN, GeoIP, TLS cert, jitter)
+vortex speed                   # Measure live throughput & bandwidth under load
+vortex qr [n|name]             # Render compact terminal QR code for mobile import
+vortex conf [n|name]           # View / export raw configuration (--copy, --export)
+vortex sub list|add|update|rm  # Manage remote subscription endpoints
+vortex completion <shell>      # Generate shell completions (bash, zsh, fish)
+```
+
+---
+
+## Desktop & Waybar Integration
+
+See [docs/DESKTOP.md](docs/DESKTOP.md) for full configuration guides.
+
+### Waybar Module (`~/.config/waybar/config.jsonc`)
+```jsonc
+"custom/vortex": {
+    "format": "{}",
+    "return-type": "json",
+    "interval": 2,
+    "exec": "vortex status --json",
+    "on-click": "vortex toggle",
+    "on-click-right": "vortex pick",
+    "tooltip": true
+}
+```
+
+### Hyprland Bindings (`~/.config/hypr/bindings.lua` or `hyprland.conf`)
+```conf
+bind = $mainMod, V, exec, vortex toggle
+bind = $mainMod SHIFT, V, exec, vortex pick
+bind = $mainMod ALT, V, exec, vortex shield
+```
+
+---
+
+## TUI Controls
+
+- `⏎` : Connect selected node
+- `Space` : Disconnect tunnel
+- `a` : Import profile from string or link
+- `v` : Paste from clipboard
+- `/` : Live fuzzy search and filter (by name, transport e.g. `/udp`, `/reality`, `/ws`)
+- `t` / `T` : Probe latency (all nodes / selected node)
+- `o` : Cycle sort order (Name &rarr; Latency &rarr; Transport)
+- `p` : Cycle transport filter (ALL &rarr; TCP ONLY &rarr; UDP ONLY)
+- `f` : Toggle between Packet Traffic Spectrum and Live Packet Flows sniffer
+- `s` : Subscription manager overlay
+- `b` : Live throughput benchmark modal
+- `r` : Deep node reconnaissance report
+- `q` : Safe quit (tunnel continues running in background)
+- `Q` : Quit and disconnect tunnel

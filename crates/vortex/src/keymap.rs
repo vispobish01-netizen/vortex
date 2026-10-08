@@ -50,6 +50,7 @@ pub enum Action {
     CopyConfig,
     ShowQr,
     CycleSort,
+    CycleTransportFilter,
 
     // Testing
     TestSelected,
@@ -121,6 +122,7 @@ impl Action {
             Action::CopyConfig => "copy_config",
             Action::ShowQr => "show_qr",
             Action::CycleSort => "cycle_sort",
+            Action::CycleTransportFilter => "cycle_transport_filter",
             Action::TestSelected => "test_selected",
             Action::TestAll => "test_all",
             Action::SpeedTest => "speed_test",
@@ -173,6 +175,9 @@ impl Action {
             "copy_config" | "copy" => Some(Action::CopyConfig),
             "show_qr" | "qr" => Some(Action::ShowQr),
             "cycle_sort" | "sort" => Some(Action::CycleSort),
+            "cycle_transport_filter" | "transport_filter" | "filter_transport" => {
+                Some(Action::CycleTransportFilter)
+            }
             "test_selected" | "test" => Some(Action::TestSelected),
             "test_all" => Some(Action::TestAll),
             "speed_test" | "speed" => Some(Action::SpeedTest),
@@ -339,8 +344,14 @@ pub const HELP_ENTRIES: &[KeyHelp] = &[
     KeyHelp {
         category: "NODES",
         key: "o",
-        description: "Cycle sort mode (RTT / name / proto)",
+        description: "Cycle sort mode (RTT / transport / name)",
         action: Action::CycleSort,
+    },
+    KeyHelp {
+        category: "NODES",
+        key: "p",
+        description: "Cycle transport filter (All / TCP / UDP)",
+        action: Action::CycleTransportFilter,
     },
     KeyHelp {
         category: "NODES",
@@ -592,6 +603,7 @@ pub fn map_key(mode: &Mode, key: KeyEvent) -> Option<Action> {
                 KeyCode::Char('y') => Some(Action::CopyConfig),
                 KeyCode::Char('s') if !shift => Some(Action::ShowQr),
                 KeyCode::Char('o') => Some(Action::CycleSort),
+                KeyCode::Char('p') | KeyCode::Char('P') => Some(Action::CycleTransportFilter),
                 KeyCode::Char('t') if !shift => Some(Action::TestSelected),
                 KeyCode::Char('T') => Some(Action::TestAll),
                 KeyCode::Char('t') if shift => Some(Action::TestAll),
@@ -857,6 +869,10 @@ mod tests {
         assert_eq!(
             map_key(&m, press(KeyCode::Char('o'))),
             Some(Action::CycleSort)
+        );
+        assert_eq!(
+            map_key(&m, press(KeyCode::Char('p'))),
+            Some(Action::CycleTransportFilter)
         );
         assert_eq!(
             map_key(&m, press(KeyCode::Char('c'))),

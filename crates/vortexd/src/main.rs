@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
+use vortex_core::history::TrafficHistory;
 use vortex_core::ipc::*;
 use vortex_core::model::*;
 use vortex_core::probe::{self, NodeMetrics, ScoringWeights, SelectionMode};
@@ -19,12 +20,28 @@ struct DaemonState {
     consecutive_probe_failures: u32,
     last_failover_ts: Option<std::time::Instant>,
     failover_attempt: u32,
+    history: TrafficHistory,
 }
 
 impl DaemonState {
     fn new(tx: broadcast::Sender<DaemonEvent>) -> Self {
         let current_sess = tunnel::load_session();
         let shield_armed = shield::is_armed();
+        let xray_version = vortex_core::xray::active_xray_version();
+        let backend = current_sess.as_ref().map(|s| {
+            if s.kind == Kind::Xray || s.conf.contains("xray") {
+                "xray".to_string()
+            } else if s.kind == Kind::Wg {
+                "wireguard".to_string()
+            } else if s.kind == Kind::Awg {
+                "amneziawg".to_string()
+            } else if s.kind == Kind::Ovpn {
+                "openvpn".to_string()
+            } else {
+                "sing-box".to_string()
+            }
+        });
+
         let status = DaemonStatus {
             connected: current_sess.is_some(),
             active_profile: current_sess
@@ -39,6 +56,8 @@ impl DaemonState {
             exit_ip: None,
             shield_armed,
             pid: current_sess.as_ref().and_then(|s| s.pid),
+            xray_version,
+            backend,
         };
 
         DaemonState {
@@ -50,6 +69,7 @@ impl DaemonState {
             consecutive_probe_failures: 0,
             last_failover_ts: None,
             failover_attempt: 0,
+            history: TrafficHistory::load(),
         }
     }
 
@@ -61,6 +81,20 @@ impl DaemonState {
         self.status.server_endpoint = current_sess.as_ref().map(|s| s.server.clone());
         self.status.shield_armed = shield_armed;
         self.status.pid = current_sess.as_ref().and_then(|s| s.pid);
+        self.status.xray_version = vortex_core::xray::active_xray_version();
+        self.status.backend = current_sess.as_ref().map(|s| {
+            if s.kind == Kind::Xray || s.conf.contains("xray") {
+                "xray".to_string()
+            } else if s.kind == Kind::Wg {
+                "wireguard".to_string()
+            } else if s.kind == Kind::Awg {
+                "amneziawg".to_string()
+            } else if s.kind == Kind::Ovpn {
+                "openvpn".to_string()
+            } else {
+                "sing-box".to_string()
+            }
+        });
         if let Some(s) = &current_sess {
             self.status.uptime_secs = tunnel::now().saturating_sub(s.since);
             if self.status.active_profile.as_ref().map(|p| &p.id) != Some(&s.id) {
@@ -137,6 +171,21 @@ async fn main() -> Result<()> {
                             (0, 0)
                         };
                         last_bytes = Some((rx, tx));
+
+                        {
+                            let mut st = bg_state.lock().await;
+                            let active_profile = st.status.active_profile.clone();
+                            st.history.record_sample(
+                                rx_sec,
+                                tx_sec,
+                                active_profile.as_ref().map(|p| p.id.as_str()),
+                                active_profile.as_ref().map(|p| p.name.as_str()),
+                                active_profile.as_ref().map(|p| p.kind.tag()),
+                            );
+                            if tick_counter.is_multiple_of(60) {
+                                let _ = st.history.save();
+                            }
+                        }
 
                         let _ = bg_tx.send(DaemonEvent::TrafficStats {
                             rx_bytes_sec: rx_sec,
@@ -242,9 +291,14 @@ async fn main() -> Result<()> {
 
     // Handle shutdown gracefully
     let shutdown_sock = sock_path.clone();
+    let shutdown_state = Arc::clone(&state);
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("Received shutdown signal, cleaning up socket and firewall...");
+        {
+            let st = shutdown_state.lock().await;
+            let _ = st.history.save();
+        }
         let _ = shield::cleanup_stale_rules();
         let _ = std::fs::remove_file(&shutdown_sock);
         std::process::exit(0);
@@ -486,6 +540,22 @@ async fn process_request(
             let flows = tunnel::active_flows();
             Some(IpcResponse::Flows(flows))
         }
+        IpcRequest::KillFlow { id } => match tunnel::kill_flow(&id) {
+            Ok(_) => Some(IpcResponse::Ok),
+            Err(e) => Some(IpcResponse::Error(format!("Kill flow failed: {e:#}"))),
+        },
+        IpcRequest::GetHistory => {
+            let st = state.lock().await;
+            Some(IpcResponse::History(st.history.clone()))
+        }
+        IpcRequest::ExportHistory { format, since_secs } => {
+            let st = state.lock().await;
+            let out = match format.to_lowercase().as_str() {
+                "csv" => st.history.export_csv(since_secs),
+                _ => st.history.export_json(since_secs),
+            };
+            Some(IpcResponse::Export(out))
+        }
         IpcRequest::GetLogs { lines } => {
             let logs = tunnel::tail_log(lines);
             Some(IpcResponse::Logs(logs))
@@ -541,6 +611,46 @@ async fn process_request(
         IpcRequest::SubscribeEvents => {
             // No direct response needed; incoming events will stream via the select block
             None
+        }
+        IpcRequest::XrayInstall => match vortex_core::xray::install_xray(None) {
+            Ok(version) => Some(IpcResponse::XrayInstalled { version }),
+            Err(e) => Some(IpcResponse::Error(format!(
+                "Xray installation failed: {e:#}"
+            ))),
+        },
+        IpcRequest::XrayUpdate => {
+            let res = vortex_core::xray::install_xray(None).inspect(|_| {
+                let _ = vortex_core::xray::refresh_geo_databases();
+            });
+            match res {
+                Ok(version) => Some(IpcResponse::XrayUpdated { version }),
+                Err(e) => Some(IpcResponse::Error(format!("Xray update failed: {e:#}"))),
+            }
+        }
+        IpcRequest::XrayVersion => {
+            let path_opt = vortex_core::xray::resolve_xray_binary().ok();
+            let ver = path_opt
+                .as_ref()
+                .and_then(|p| vortex_core::xray::get_binary_version(p))
+                .or_else(vortex_core::xray::resolve_installed_version);
+            let is_managed = path_opt
+                .as_ref()
+                .map(|p| p.starts_with(vortex_core::xray::xray_data_dir()))
+                .unwrap_or(false);
+            Some(IpcResponse::XrayVersion {
+                version: ver,
+                path: path_opt.map(|p| p.to_string_lossy().to_string()),
+                is_managed,
+            })
+        }
+        IpcRequest::XrayDoctor => {
+            let doc = vortex_core::xray::run_xray_doctor();
+            Some(IpcResponse::XrayDoctor {
+                healthy: doc.is_healthy(),
+                binary: doc.binary_path.map(|p| p.to_string_lossy().to_string()),
+                version: doc.binary_version,
+                issues: doc.issues,
+            })
         }
     }
 }

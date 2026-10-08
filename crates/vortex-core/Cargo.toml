@@ -1,6 +1,6 @@
 [package]
 name = "vortex-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Core library for Vortex — VPN/proxy models, IPC protocol, probing, routing, and tunnel management"
 
@@ -23,3 +23,4 @@ keyring = "4.2.0"
 rqrr = "0.11.0"
 image = "0.25.10"
 regex = "1"
+sha2 = "0.10"
