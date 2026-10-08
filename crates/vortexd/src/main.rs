@@ -44,9 +44,12 @@ impl DaemonState {
 
         let status = DaemonStatus {
             connected: current_sess.is_some(),
-            active_profile: current_sess
-                .as_ref()
-                .and_then(|s| store::load_all().into_iter().find(|p| p.id == s.id)),
+            active_profile: current_sess.as_ref().map(|s| {
+                store::load_all()
+                    .into_iter()
+                    .find(|p| p.id == s.id)
+                    .unwrap_or_else(|| Profile::new(&s.id, &s.name, s.kind, &s.server, ""))
+            }),
             uptime_secs: current_sess
                 .as_ref()
                 .map(|s| tunnel::now().saturating_sub(s.since))
@@ -98,7 +101,12 @@ impl DaemonState {
         if let Some(s) = &current_sess {
             self.status.uptime_secs = tunnel::now().saturating_sub(s.since);
             if self.status.active_profile.as_ref().map(|p| &p.id) != Some(&s.id) {
-                self.status.active_profile = store::load_all().into_iter().find(|p| p.id == s.id);
+                self.status.active_profile = Some(
+                    store::load_all()
+                        .into_iter()
+                        .find(|p| p.id == s.id)
+                        .unwrap_or_else(|| Profile::new(&s.id, &s.name, s.kind, &s.server, "")),
+                );
             }
         } else {
             self.status.active_profile = None;

@@ -751,6 +751,8 @@ fn handle_status(args: &[String]) -> Result<()> {
         if let Some(st) = &daemon_status {
             let (name, kind_tag) = if let Some(p) = &st.active_profile {
                 (p.name.clone(), p.kind.tag().to_string())
+            } else if let Some(s) = tunnel::load_session() {
+                (s.name, s.kind.tag().to_string())
             } else {
                 ("Connected".to_string(), "".to_string())
             };
@@ -896,6 +898,11 @@ fn handle_down() -> Result<()> {
         }
     }
 
+    if tunnel::load_session().is_none() {
+        println!("disconnected");
+        return Ok(());
+    }
+
     if unsafe { libc::geteuid() } != 0 {
         return reexec_sudo(&["down".into()]);
     }
@@ -977,7 +984,11 @@ fn handle_pick(args: &[String]) -> Result<()> {
                 if out.status.success() {
                     let selected = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !selected.is_empty() {
-                        let name = selected.split('\t').next().unwrap_or(&selected).trim();
+                        let name = selected
+                            .split('\t')
+                            .nth(1)
+                            .unwrap_or_else(|| selected.split('\t').next().unwrap_or(&selected))
+                            .trim();
                         if let Ok(p) = find(name) {
                             return connect_profile(&p);
                         }
@@ -1739,6 +1750,130 @@ fn handle_update() -> Result<()> {
     Ok(())
 }
 
+fn handle_shield(args: &[String]) -> Result<()> {
+    let sub = args.get(1).map(String::as_str).unwrap_or("status");
+    match sub {
+        "on" | "enable" | "arm" => {
+            if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::ToggleShield { enable: Some(true) })? {
+                    IpcResponse::Status(st) => {
+                        let armed = st.shield_armed;
+                        println!(
+                            "shield: {}",
+                            if armed {
+                                "\x1b[1;32m[ARMED]\x1b[0m stealth kill-switch active"
+                            } else {
+                                "\x1b[1;33m[OFF]\x1b[0m stealth kill-switch disarmed"
+                            }
+                        );
+                        send_notification(
+                            "Vortex Shield",
+                            if armed {
+                                "Kill-switch armed"
+                            } else {
+                                "Kill-switch disarmed"
+                            },
+                            Some(if armed {
+                                "security-high"
+                            } else {
+                                "security-medium"
+                            }),
+                        );
+                        return Ok(());
+                    }
+                    IpcResponse::Error(e) => bail!("Shield toggle error: {e}"),
+                    _ => {}
+                }
+            }
+            if unsafe { libc::geteuid() } != 0 {
+                return reexec_sudo(args);
+            }
+            let sess = tunnel::load_session();
+            let iface = sess.as_ref().map(|s| s.iface.as_str());
+            let srv = sess.as_ref().map(|s| s.server.as_str());
+            shield::set_enabled_preference(true);
+            shield::arm(iface, srv)?;
+            println!("\x1b[1;32m✔ Stealth Shield ARMED // Zero-leak killswitch engaged\x1b[0m");
+            if let Some(s) = sess {
+                println!(
+                    "  Secured on interface {} via endpoint {}",
+                    s.iface, s.server
+                );
+            }
+            Ok(())
+        }
+        "off" | "disable" | "disarm" => {
+            if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::ToggleShield { enable: Some(false) })? {
+                    IpcResponse::Status(st) => {
+                        let armed = st.shield_armed;
+                        println!(
+                            "shield: {}",
+                            if armed {
+                                "\x1b[1;32m[ARMED]\x1b[0m stealth kill-switch active"
+                            } else {
+                                "\x1b[1;33m[OFF]\x1b[0m stealth kill-switch disarmed"
+                            }
+                        );
+                        send_notification(
+                            "Vortex Shield",
+                            "Kill-switch disarmed",
+                            Some("security-medium"),
+                        );
+                        return Ok(());
+                    }
+                    IpcResponse::Error(e) => bail!("Shield toggle error: {e}"),
+                    _ => {}
+                }
+            }
+            if unsafe { libc::geteuid() } != 0 {
+                return reexec_sudo(args);
+            }
+            shield::set_enabled_preference(false);
+            shield::disarm()?;
+            println!("\x1b[1;33m○ Stealth Shield DISARMED // Firewall rules cleared\x1b[0m");
+            Ok(())
+        }
+        _ => {
+            let (armed, iface, srv) = if let Some(client) = get_ipc() {
+                if let Ok(IpcResponse::Status(st)) = client.request_sync(&IpcRequest::GetStatus) {
+                    (st.shield_armed, st.iface, st.server_endpoint)
+                } else {
+                    let st = shield::status();
+                    (st.armed, st.iface, st.server)
+                }
+            } else {
+                let st = shield::status();
+                (st.armed, st.iface, st.server)
+            };
+            let pref = shield::is_enabled_preference();
+            println!("\x1b[1;36m◈ 0xSHIELD // STEALTH KILL SWITCH & ANTI-LEAK FIREWALL\x1b[0m");
+            let armed_str = if armed {
+                "\x1b[1;32mARMED (ACTIVE ENFORCEMENT)\x1b[0m"
+            } else {
+                "\x1b[2mDISARMED (OFF)\x1b[0m"
+            };
+            println!("  Firewall Status : {armed_str}");
+            println!(
+                "  Auto-Arm On Up  : {}",
+                if pref {
+                    "\x1b[1;32mENABLED\x1b[0m"
+                } else {
+                    "\x1b[2mDISABLED\x1b[0m"
+                }
+            );
+            if let Some(ifc) = iface {
+                println!("  Tunnel Interface: {ifc}");
+            }
+            if let Some(s) = srv {
+                println!("  Exempt Server   : {s}");
+            }
+            println!("\n\x1b[2mToggle with `vortex shield on` or `vortex shield off`\x1b[0m");
+            Ok(())
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(
@@ -1758,6 +1893,7 @@ fn main() -> Result<()> {
         Some("toggle") => return handle_toggle(),
         Some("down") => return handle_down(),
         Some("pick") => return handle_pick(&args),
+        Some("shield") | Some("killswitch") => return handle_shield(&args),
         Some("history") | Some("hist") => return handle_history(&args),
         Some("completion") => return handle_completion(&args),
         Some("list") | Some("ls") => return handle_list(),

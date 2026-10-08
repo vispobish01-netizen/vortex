@@ -207,8 +207,10 @@ pub async fn probe_tls_handshake(
 
     let output = tokio::task::spawn_blocking(move || {
         let start = Instant::now();
-        let status = std::process::Command::new("openssl")
+        let status = std::process::Command::new("timeout")
             .args([
+                &timeout_secs,
+                "openssl",
                 "s_client",
                 "-connect",
                 &target,
@@ -216,11 +218,26 @@ pub async fn probe_tls_handshake(
                 &servername,
                 "-brief",
             ])
-            .env("TIMEOUT", timeout_secs)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()
+            .or_else(|_| {
+                // Fallback if timeout utility not present
+                std::process::Command::new("openssl")
+                    .args([
+                        "s_client",
+                        "-connect",
+                        &target,
+                        "-servername",
+                        &servername,
+                        "-brief",
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+            });
         match status {
             Ok(s) if s.success() => Some(start.elapsed().as_millis() as u32),
             _ => None,
