@@ -1883,6 +1883,13 @@ fn main() -> Result<()> {
         print!("{HELP}");
         return Ok(());
     }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-V" | "-v" | "--version" | "version")
+    ) {
+        println!("vortex {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     // Diagnostic, proxy, status, inspection, and desktop commands that do not require root:
     match args.first().map(String::as_str) {
@@ -2028,13 +2035,18 @@ fn main() -> Result<()> {
 
     // Direct mode fallback: requires root for modifying tunnels/firewall
     if unsafe { libc::geteuid() } != 0 {
-        let exe = std::env::current_exe()?;
-        let err = Command::new("sudo")
-            .arg("--preserve-env=WAYLAND_DISPLAY,XDG_RUNTIME_DIR,TERM,COLORTERM,LANG")
-            .arg(exe)
-            .args(&args)
-            .exec();
-        bail!("could not run sudo: {err}");
+        match args.first().map(String::as_str) {
+            None | Some("up") | Some("best") | Some("auth") => {
+                let exe = std::env::current_exe()?;
+                let err = Command::new("sudo")
+                    .arg("--preserve-env=WAYLAND_DISPLAY,XDG_RUNTIME_DIR,TERM,COLORTERM,LANG")
+                    .arg(exe)
+                    .args(&args)
+                    .exec();
+                bail!("could not run sudo: {err}");
+            }
+            Some(x) => bail!("unknown command '{x}' — try `vortex --help`"),
+        }
     }
     store::ensure_dirs()?;
     match args.first().map(String::as_str) {

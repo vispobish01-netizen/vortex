@@ -120,6 +120,27 @@ type SharedState = Arc<Mutex<DaemonState>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-v" | "-V" | "--version" | "version")
+    ) {
+        println!("vortexd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-h" | "--help" | "help")
+    ) {
+        println!("vortexd - Background daemon for Vortex VPN & Proxy");
+        println!("Usage: vortexd [options]");
+        println!();
+        println!("Options:");
+        println!("  -h, --help       Print help information");
+        println!("  -V, --version    Print version information");
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
