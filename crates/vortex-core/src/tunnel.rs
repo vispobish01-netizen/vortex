@@ -194,15 +194,146 @@ pub fn load_session() -> Option<Session> {
     }
 }
 
+fn query_clash_traffic() -> Option<(u64, u64)> {
+    use std::net::{SocketAddr, TcpStream};
+
+    let addr: SocketAddr = "127.0.0.1:9090".parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(80)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(80)));
+
+    let req = b"GET /connections HTTP/1.1\r\nHost: 127.0.0.1:9090\r\nConnection: close\r\n\r\n";
+    stream.write_all(req).ok()?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+
+    let body_start = response.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let body = &response[body_start..];
+
+    let val: Value = serde_json::from_slice(body).ok()?;
+    let download = val["downloadTotal"].as_u64()?;
+    let upload = val["uploadTotal"].as_u64()?;
+    Some((download, upload))
+}
+
+fn query_xray_traffic() -> Option<(u64, u64)> {
+    let r_dir = active_run_dir();
+    let api_port = fs::read_to_string(r_dir.join("xray_api_port"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())?;
+
+    let xray_bin = crate::xray::resolve_xray_binary().ok()?;
+    let output = Command::new(&xray_bin)
+        .args([
+            "api",
+            "statsquery",
+            &format!("--server=127.0.0.1:{api_port}"),
+        ])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        if let Ok(val) = serde_json::from_slice::<Value>(&output.stdout) {
+            let mut rx = 0u64;
+            let mut tx = 0u64;
+            if let Some(stats) = val["stat"].as_array() {
+                for s in stats {
+                    let name = s["name"].as_str().unwrap_or("");
+                    let value = s["value"].as_u64().unwrap_or(0);
+                    if name.starts_with("outbound>>>") && !name.contains(">>>api>>>") {
+                        if name.ends_with(">>>downlink") {
+                            rx = rx.saturating_add(value);
+                        } else if name.ends_with(">>>uplink") {
+                            tx = tx.saturating_add(value);
+                        }
+                    }
+                }
+                return Some((rx, tx));
+            }
+        }
+    }
+    None
+}
+
+fn query_wg_traffic(iface: &str) -> Option<(u64, u64)> {
+    let cmd = if iface.starts_with("awg") { "awg" } else { "wg" };
+    if let Ok(out) = Command::new(cmd).args(["show", iface, "transfer"]).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = s.lines().next() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let rx: u64 = parts[1].parse().unwrap_or(0);
+                    let tx: u64 = parts[2].parse().unwrap_or(0);
+                    return Some((rx, tx));
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn bytes(iface: &str) -> Option<(u64, u64)> {
-    let r = |f: &str| -> Option<u64> {
-        fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{f}"))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
-    };
-    Some((r("rx_bytes")?, r("tx_bytes")?))
+    // 1. If sysfs interface statistics exist, check them first
+    if !iface.is_empty() && !iface.contains(':') && !iface.contains('/') {
+        let r = |f: &str| -> Option<u64> {
+            fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{f}"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        if let (Some(rx), Some(tx)) = (r("rx_bytes"), r("tx_bytes")) {
+            if rx > 0 || tx > 0 {
+                return Some((rx, tx));
+            }
+        }
+    }
+
+    // 2. Query sing-box Clash API (handles both Proxy Mode and TUN Mode)
+    if let Some((rx, tx)) = query_clash_traffic() {
+        if rx > 0 || tx > 0 || iface.contains(':') {
+            return Some((rx, tx));
+        }
+    }
+
+    // 3. Query Xray API if active
+    if let Some((rx, tx)) = query_xray_traffic() {
+        if rx > 0 || tx > 0 || iface.contains(':') {
+            return Some((rx, tx));
+        }
+    }
+
+    // 4. Query WireGuard / Amnezia CLI
+    if iface.starts_with("wg") || iface.starts_with("awg") || iface == "vx0" {
+        if let Some((rx, tx)) = query_wg_traffic(iface) {
+            if rx > 0 || tx > 0 {
+                return Some((rx, tx));
+            }
+        }
+    }
+
+    // 5. Fallback to sysfs even if 0
+    if !iface.is_empty() && !iface.contains(':') && !iface.contains('/') {
+        let r = |f: &str| -> Option<u64> {
+            fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{f}"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        if let (Some(rx), Some(tx)) = (r("rx_bytes"), r("tx_bytes")) {
+            return Some((rx, tx));
+        }
+    }
+
+    // 6. Proxy mode (e.g. 127.0.0.1:1080) fallback when idle
+    if iface.contains(':') {
+        return Some((0, 0));
+    }
+
+    None
 }
 
 pub fn public_ip() -> String {
@@ -419,11 +550,22 @@ pub fn connect_with_credentials(p: &Profile, credentials: Option<(&str, &str)>) 
     let _ = disconnect();
     let use_xray = p.kind == Kind::Xray
         || p.backend_type.as_deref() == Some("xray")
+        || p.transport == crate::model::Transport::Xhttp
         || (p.kind.is_xray_capable()
             && (std::env::var("VORTEX_BACKEND")
                 .map(|b| b.eq_ignore_ascii_case("xray"))
                 .unwrap_or(false)
                 || !have("sing-box")));
+
+    let is_proxy_only = crate::storage::get_mode_preference().is_proxy()
+        || p.backend_type.as_deref() == Some("proxy")
+        || std::env::var("VORTEX_MODE")
+            .map(|m| m.eq_ignore_ascii_case("proxy"))
+            .unwrap_or(false);
+
+    if is_proxy_only && (p.kind == Kind::Wg || p.kind == Kind::Awg || p.kind == Kind::Ovpn) {
+        bail!("WireGuard and OpenVPN protocols only support TUNNEL mode (switch mode using `vortex mode tunnel`)");
+    }
 
     let mut s = if use_xray {
         up_xray(p)?
@@ -437,7 +579,7 @@ pub fn connect_with_credentials(p: &Profile, credentials: Option<(&str, &str)>) 
     s.since = now();
     write_session(&s)?;
     crate::store::set_last(&s.id);
-    if crate::shield::is_enabled_preference() {
+    if crate::shield::is_enabled_preference() && !is_proxy_only {
         let _ = crate::shield::arm(Some(&s.iface), Some(&s.server));
     }
     Ok(s)
@@ -502,6 +644,11 @@ pub fn disconnect() -> Result<()> {
         let _ = Command::new("ip")
             .args(["link", "delete", "dev", TUN_IF])
             .output();
+        if iface_exists(TUN_IF) && unsafe { libc::geteuid() != 0 } {
+            let _ = Command::new("sudo")
+                .args(["-n", "ip", "link", "delete", "dev", TUN_IF])
+                .output();
+        }
     }
     for pidf in [
         run_path("ovpn.pid"),
@@ -526,14 +673,25 @@ fn kill(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
-    for _ in 0..40 {
+    for _ in 0..20 {
         if !proc_alive(pid) {
             return;
         }
-        sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(50));
     }
     unsafe {
         libc::kill(pid as i32, libc::SIGKILL);
+    }
+    if proc_alive(pid) && unsafe { libc::geteuid() != 0 } {
+        let _ = Command::new("sudo")
+            .args(["-n", "kill", "-TERM", &pid.to_string()])
+            .output();
+        sleep(Duration::from_millis(100));
+        if proc_alive(pid) {
+            let _ = Command::new("sudo")
+                .args(["-n", "kill", "-KILL", &pid.to_string()])
+                .output();
+        }
     }
 }
 
@@ -642,7 +800,16 @@ pub fn sanitize_singbox_rules(rules: &mut Vec<Value>, rule_sets: &[Value]) {
 }
 
 fn up_singbox(p: &Profile) -> Result<Session> {
-    need("sing-box", "sing-box (pacman -S sing-box)")?;
+    let singbox_bin = crate::privilege::resolve_singbox_binary().ok_or_else(|| {
+        anyhow::anyhow!("sing-box binary not found (install via `pacman -S sing-box`)")
+    })?;
+
+    let is_proxy_only = crate::storage::get_mode_preference().is_proxy()
+        || p.backend_type.as_deref() == Some("proxy")
+        || std::env::var("VORTEX_MODE")
+            .map(|m| m.eq_ignore_ascii_case("proxy"))
+            .unwrap_or(false);
+
     let (_, ob, _, _) = outbound(&p.data)?;
     let logp = run_path("core.log").to_string_lossy().to_string();
     let rules_cfg = crate::routing::RulesConfig::load();
@@ -681,6 +848,27 @@ fn up_singbox(p: &Profile) -> Result<Session> {
 
     sanitize_singbox_rules(&mut rules, &rule_sets);
 
+    let inbounds = if is_proxy_only {
+        vec![json!({
+            "type": "mixed", "tag": "mixed-in",
+            "listen": "127.0.0.1", "listen_port": PROXY_PORT
+        })]
+    } else {
+        vec![
+            json!({
+                "type": "tun", "tag": "tun-in", "interface_name": TUN_IF,
+                "address": ["172.19.0.1/30"],
+                "mtu": 9000,
+                "auto_route": true, "auto_redirect": true, "strict_route": true, "stack": "mixed",
+                "endpoint_independent_nat": true
+            }),
+            json!({
+                "type": "mixed", "tag": "mixed-in",
+                "listen": "127.0.0.1", "listen_port": PROXY_PORT
+            }),
+        ]
+    };
+
     let cfg = json!({
         "log": {"level": "warn", "timestamp": true, "output": logp},
         "dns": {
@@ -693,22 +881,10 @@ fn up_singbox(p: &Profile) -> Result<Session> {
             "strategy": "ipv4_only",
             "cache_capacity": 4096
         },
-        "inbounds": [
-            {
-                "type": "tun", "tag": "tun-in", "interface_name": TUN_IF,
-                "address": ["172.19.0.1/30"],
-                "mtu": 9000,
-                "auto_route": true, "auto_redirect": true, "strict_route": true, "stack": "mixed",
-                "endpoint_independent_nat": true
-            },
-            {
-                "type": "mixed", "tag": "mixed-in",
-                "listen": "127.0.0.1", "listen_port": PROXY_PORT
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": [ob, {"type": "direct", "tag": "direct"}],
         "route": {
-            "auto_detect_interface": true,
+            "auto_detect_interface": !is_proxy_only,
             "default_domain_resolver": "bootstrap",
             "final": "proxy",
             "rules": rules,
@@ -723,7 +899,7 @@ fn up_singbox(p: &Profile) -> Result<Session> {
     });
     let path = run_path("singbox.json").to_string_lossy().to_string();
     write_secret(&path, &serde_json::to_string_pretty(&cfg)?)?;
-    let chk = Command::new("sing-box")
+    let chk = Command::new(&singbox_bin)
         .args(["check", "-c", &path])
         .output()?;
     if !chk.status.success() {
@@ -733,11 +909,74 @@ fn up_singbox(p: &Profile) -> Result<Session> {
             e.trim().lines().last().unwrap_or("unknown error")
         );
     }
+
+    let mut cmd = if is_proxy_only {
+        Command::new(&singbox_bin)
+    } else {
+        let preflight = crate::privilege::run_preflight_check();
+        if !preflight.tun_device_exists {
+            bail!("Linux TUN device /dev/net/tun is missing (run `sudo modprobe tun` to enable the kernel TUN driver)");
+        }
+
+        match preflight.strategy {
+            crate::privilege::PrivilegeStrategy::DirectRoot
+            | crate::privilege::PrivilegeStrategy::FileCapabilities => Command::new(&singbox_bin),
+            crate::privilege::PrivilegeStrategy::SudoPasswordless => {
+                let mut c = Command::new("sudo");
+                c.args(["-n", &singbox_bin.to_string_lossy()]);
+                c
+            }
+            _ => {
+                if crate::privilege::check_sudo_passwordless() {
+                    let mut c = Command::new("sudo");
+                    c.args(["-n", &singbox_bin.to_string_lossy()]);
+                    c
+                } else {
+                    bail!(
+                        "sing-box requires CAP_NET_ADMIN or root to configure TUN interface. Run `vortex setup` to grant passwordless capabilities, authenticate via sudo, or switch to proxy mode using `vortex mode proxy`."
+                    );
+                }
+            }
+        }
+    };
+    cmd.args(["run", "-c", &path]);
+
     let log = fs::File::create(&logp)?;
-    let pid = spawn_detached(Command::new("sing-box").args(["run", "-c", &path]), log)?;
+    let pid = spawn_detached(&mut cmd, log)?;
+
+    if is_proxy_only {
+        for _ in 0..40 {
+            if !proc_alive(pid) {
+                let err_str = last_lines(3);
+                bail!("sing-box proxy exited: {}", err_str.trim());
+            }
+            if std::net::TcpStream::connect(format!("127.0.0.1:{PROXY_PORT}")).is_ok() {
+                return Ok(session(p, "127.0.0.1:1080", Some(pid), &path));
+            }
+            sleep(Duration::from_millis(50));
+        }
+        return Ok(session(p, "127.0.0.1:1080", Some(pid), &path));
+    }
+
     for count in 0..100 {
         if !proc_alive(pid) {
-            bail!("sing-box exited: {}", last_lines(3));
+            let err_log = last_lines(5);
+            let meaningful = err_log
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("sing-box terminated unexpectedly")
+                .trim();
+            if err_log.contains("TUNSETIFF: operation not permitted")
+                || err_log.contains("permission denied")
+            {
+                bail!(
+                    "PRIVILEGE ERROR: sing-box lacks CAP_NET_ADMIN for TUN interface. Run `vortex setup` or authenticate via sudo. (Details: {})",
+                    meaningful
+                );
+            } else {
+                bail!("sing-box exited: {}", meaningful);
+            }
         }
         if iface_exists(TUN_IF) {
             let route_ok = Command::new("ip")
@@ -1167,5 +1406,20 @@ mod tests {
 
         // Rule 4 kept ip_is_private
         assert_eq!(rules[2]["ip_is_private"], true);
+    }
+
+    #[test]
+    fn test_bytes_proxy_mode_fallback() {
+        // Proxy mode uses an IP:port string like "127.0.0.1:1080"
+        let res = bytes("127.0.0.1:1080");
+        assert!(res.is_some(), "Proxy mode endpoint must return Some((rx, tx)) rather than failing sysfs read");
+        let (rx, tx) = res.unwrap();
+        let _ = (rx, tx);
+    }
+
+    #[test]
+    fn test_bytes_invalid_iface_returns_none() {
+        let res = bytes("nonexistent_device_xyz123");
+        assert!(res.is_none());
     }
 }

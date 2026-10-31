@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use std::{os::unix::process::CommandExt, process::Command};
 use vortex_core::ipc::{IpcClient, IpcRequest, IpcResponse};
-use vortex_core::{benchmark, ping, recon, shield, store, tunnel};
+use vortex_core::model::OperationalMode;
+use vortex_core::{benchmark, ping, recon, shield, storage, store, tunnel};
 mod keymap;
 mod ui;
 
@@ -9,6 +10,7 @@ const HELP: &str = "\
 vortex — elite cyber warfare VPN & proxy manager for Omarchy
 
   vortex                         open the cyber warfare TUI
+  vortex mode [tunnel|proxy|toggle] inspect or set operational mode (VPN vs SOCKS5/HTTP)
   vortex add <x>                 import share link, sub URL, QR image (.png), or .conf/.ovpn
   vortex list                    list profiles
   vortex up [n|name]             connect (number from `list`, or part of name; no arg = last used)
@@ -35,7 +37,8 @@ vortex — elite cyber warfare VPN & proxy manager for Omarchy
   vortex auth <n|name> [--clear] manage OpenVPN username & password (with save mode)
   vortex rename <n|name> <new>   rename a profile
   vortex rm <n|name>             delete a profile
-  vortex status [--json|--waybar] show active tunnel, daemon, and shield status
+  vortex check                   preflight audit of root, capabilities, and TUN device
+  vortex setup                   grant network capabilities to Vortex sing-box binary
   vortex xray [cmd]              manage Xray-core backend (install|update|version|doctor|rollback|test)
   vortex completion <shell>      generate shell autocompletions (bash, zsh, fish)
 
@@ -136,7 +139,28 @@ fn handle_proxy(args: &[String]) -> Result<()> {
             println!("export HTTPS_PROXY=http://127.0.0.1:1080");
             println!("export ALL_PROXY=socks5://127.0.0.1:1080");
         }
+        "set" | "system" | "on" => {
+            let _ = Command::new("gsettings")
+                .args(["set", "org.gnome.system.proxy", "mode", "'manual'"])
+                .output();
+            let _ = Command::new("gsettings")
+                .args(["set", "org.gnome.system.proxy.socks", "host", "'127.0.0.1'"])
+                .output();
+            let _ = Command::new("gsettings")
+                .args(["set", "org.gnome.system.proxy.socks", "port", "1080"])
+                .output();
+            println!(
+                "\x1b[1;32m✔ Desktop system proxy set to 127.0.0.1:1080 (if supported)\x1b[0m"
+            );
+            println!("  Terminal environment export:");
+            println!("    export http_proxy=http://127.0.0.1:1080");
+            println!("    export https_proxy=http://127.0.0.1:1080");
+            println!("    export all_proxy=socks5://127.0.0.1:1080");
+        }
         "unset" | "off" => {
+            let _ = Command::new("gsettings")
+                .args(["set", "org.gnome.system.proxy", "mode", "'none'"])
+                .output();
             println!("unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY");
         }
         "test" => {
@@ -183,6 +207,99 @@ fn handle_proxy(args: &[String]) -> Result<()> {
             println!("\n\x1b[2mOne-line shell evaluation: eval $(vortex proxy env)\x1b[0m");
         }
     }
+    Ok(())
+}
+
+fn handle_mode(args: &[String]) -> Result<()> {
+    let sub = args.get(1).map(String::as_str);
+    let cur = storage::get_mode_preference();
+
+    match sub {
+        None | Some("status") | Some("get") => {
+            let ipc_mode = if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::GetMode) {
+                    Ok(IpcResponse::Mode(m)) => Some(m),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let effective = ipc_mode.unwrap_or(cur);
+            match effective {
+                OperationalMode::Tunnel => {
+                    println!("\x1b[1;36m◈ 0xMODE // TUNNEL MODE (FULL VPN)\x1b[0m");
+                    println!("  Interface   : \x1b[1;32mvx0\x1b[0m (virtual TUN device)");
+                    println!(
+                        "  Scope       : Whole-system network routing & anti-leak kill-switch"
+                    );
+                    println!("  Permissions : Requires CAP_NET_ADMIN / root (managed via vortexd or sudo)");
+                    println!("  Proxy Bridge: SOCKS5 & HTTP also available on 127.0.0.1:1080");
+                }
+                OperationalMode::Proxy => {
+                    println!("\x1b[1;33m◈ 0xMODE // PROXY MODE (LOCAL SOCKS5/HTTP)\x1b[0m");
+                    println!(
+                        "  Interface   : \x1b[1;32m127.0.0.1:1080\x1b[0m (SOCKS5 & HTTP inbound)"
+                    );
+                    println!(
+                        "  Scope       : Local user applications, browser, curl, git, telegram"
+                    );
+                    println!("  Permissions : \x1b[1;32m100% UNPRIVILEGED\x1b[0m (no root, no sudo, no TUN device)");
+                    println!("  Tunnel (TUN): Disabled");
+                }
+            }
+            println!("\nSwitch mode with:");
+            println!("  vortex mode tunnel   (enable full system VPN)");
+            println!("  vortex mode proxy    (enable local user-space proxy)");
+            println!("  vortex mode toggle   (switch between tunnel and proxy)");
+        }
+        Some("toggle") => {
+            let next = match cur {
+                OperationalMode::Tunnel => OperationalMode::Proxy,
+                OperationalMode::Proxy => OperationalMode::Tunnel,
+            };
+            set_mode_internal(next)?;
+        }
+        Some("tunnel") | Some("tun") | Some("vpn") => {
+            set_mode_internal(OperationalMode::Tunnel)?;
+        }
+        Some("proxy") | Some("socks") | Some("http") => {
+            set_mode_internal(OperationalMode::Proxy)?;
+        }
+        Some(other) => {
+            bail!(
+                "unknown mode '{other}' — valid modes are 'tunnel', 'proxy', 'toggle', or 'status'"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn set_mode_internal(mode: OperationalMode) -> Result<()> {
+    storage::set_mode_preference(mode)?;
+    if let Some(client) = get_ipc() {
+        let _ = client.request_sync(&IpcRequest::SetMode { mode });
+    }
+    match mode {
+        OperationalMode::Tunnel => {
+            println!("\x1b[1;32m✔ Switched to TUNNEL MODE\x1b[0m (Whole-system VPN via vx0)");
+            println!("  All system traffic routed through the encrypted virtual tunnel.");
+        }
+        OperationalMode::Proxy => {
+            println!("\x1b[1;33m✔ Switched to PROXY MODE\x1b[0m (Local unprivileged SOCKS5/HTTP on 127.0.0.1:1080)");
+            println!(
+                "  No root privileges required. Set your browser or terminal to 127.0.0.1:1080."
+            );
+            println!("  Shell setup: eval $(vortex proxy env)");
+        }
+    }
+    send_notification(
+        "Vortex Mode Changed",
+        match mode {
+            OperationalMode::Tunnel => "Operational Mode: TUNNEL (Whole-system VPN)",
+            OperationalMode::Proxy => "Operational Mode: PROXY (127.0.0.1:1080)",
+        },
+        Some("network-vpn"),
+    );
     Ok(())
 }
 
@@ -690,7 +807,7 @@ fn format_node_with_flag(name: &str, max_len: usize) -> String {
 fn reexec_sudo(args: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let err = Command::new("sudo")
-        .arg("--preserve-env=WAYLAND_DISPLAY,XDG_RUNTIME_DIR,TERM,COLORTERM,LANG")
+        .arg("--preserve-env=WAYLAND_DISPLAY,XDG_RUNTIME_DIR,TERM,COLORTERM,LANG,VORTEX_SOCK,VORTEX_BACKEND,VORTEX_MODE,VORTEX_RUN_DIR")
         .arg(exe)
         .args(args)
         .exec();
@@ -713,13 +830,25 @@ fn connect_profile(p: &store::Profile) -> Result<()> {
                 return Ok(());
             }
             IpcResponse::Error(e) => {
+                let e_lower = e.to_lowercase();
+                if (e_lower.contains("cap_net_admin")
+                    || e_lower.contains("tunsetiff")
+                    || e_lower.contains("privilege")
+                    || e_lower.contains("root")
+                    || e_lower.contains("operation not permitted")
+                    || e_lower.contains("permission denied"))
+                    && unsafe { libc::geteuid() != 0 }
+                    && !storage::get_mode_preference().is_proxy()
+                {
+                    return reexec_sudo(&["up".into(), p.id.clone()]);
+                }
                 bail!("Daemon connection error: {e}");
             }
             _ => {}
         }
     }
 
-    if unsafe { libc::geteuid() } != 0 {
+    if unsafe { libc::geteuid() } != 0 && !storage::get_mode_preference().is_proxy() {
         return reexec_sudo(&["up".into(), p.id.clone()]);
     }
 
@@ -746,6 +875,11 @@ fn handle_status(args: &[String]) -> Result<()> {
     } else {
         None
     };
+
+    let cur_mode = daemon_status
+        .as_ref()
+        .map(|st| st.mode)
+        .unwrap_or_else(storage::get_mode_preference);
 
     let (connected, name, kind_tag, server, uptime_secs, armed, is_daemon) =
         if let Some(st) = &daemon_status {
@@ -808,7 +942,8 @@ fn handle_status(args: &[String]) -> Result<()> {
             let class = format!("connected {shield_class}");
             let text = format_node_with_flag(&name, 16);
             let tooltip = format!(
-                "<b>Vortex VPN & Proxy</b>\n<b>Status:</b> Connected\n<b>Node:</b> {} ({})\n<b>Endpoint:</b> {}\n<b>Shield:</b> {}\n<b>Uptime:</b> {}\n<i>Left-click: toggle · Right-click: menu</i>",
+                "<b>Vortex VPN & Proxy</b>\n<b>Mode:</b> {}\n<b>Status:</b> Connected\n<b>Node:</b> {} ({})\n<b>Endpoint:</b> {}\n<b>Shield:</b> {}\n<b>Uptime:</b> {}\n<i>Left-click: toggle · Right-click: menu</i>",
+                cur_mode.display_name(),
                 name,
                 kind_tag,
                 server,
@@ -822,6 +957,7 @@ fn handle_status(args: &[String]) -> Result<()> {
                 "tooltip": tooltip,
                 "class": class,
                 "connected": true,
+                "mode": cur_mode.as_str(),
                 "node": name,
                 "protocol": kind_tag,
                 "server": server,
@@ -837,7 +973,8 @@ fn handle_status(args: &[String]) -> Result<()> {
                 "󰌙 Off"
             };
             let tooltip = format!(
-                "<b>Vortex VPN & Proxy</b>\n<b>Status:</b> Disconnected\n<b>Shield:</b> {}\n<i>Left-click: connect · Right-click: menu</i>",
+                "<b>Vortex VPN & Proxy</b>\n<b>Mode:</b> {}\n<b>Status:</b> Disconnected\n<b>Shield:</b> {}\n<i>Left-click: connect · Right-click: menu</i>",
+                cur_mode.display_name(),
                 if armed { "ARMED 🛡️" } else { "OFF" }
             );
 
@@ -847,6 +984,7 @@ fn handle_status(args: &[String]) -> Result<()> {
                 "tooltip": tooltip,
                 "class": class,
                 "connected": false,
+                "mode": cur_mode.as_str(),
                 "shield": armed,
             });
             println!("{}", serde_json::to_string(&json)?);
@@ -866,15 +1004,23 @@ fn handle_status(args: &[String]) -> Result<()> {
         "\x1b[2m[SHIELD: OFF]\x1b[0m"
     };
 
+    let mode_str = match cur_mode {
+        OperationalMode::Tunnel => "\x1b[1;36m[TUNNEL]\x1b[0m",
+        OperationalMode::Proxy => "\x1b[1;33m[PROXY]\x1b[0m",
+    };
+
     if connected {
         println!(
-            "● {} ({}) via {}  {}  [{daemon_str}]",
-            name, kind_tag, server, shield_str
+            "● {} ({}) via {}  {}  {}  [{daemon_str}]",
+            name, kind_tag, server, mode_str, shield_str
         );
         println!("  uptime {}s · exit {}", uptime_secs, tunnel::public_ip());
         println!("  proxy bridge: socks5://127.0.0.1:1080 · http://127.0.0.1:1080");
     } else {
-        println!("○ disconnected  {}  [{daemon_str}]", shield_str);
+        println!(
+            "○ disconnected  {}  {}  [{daemon_str}]",
+            mode_str, shield_str
+        );
     }
     Ok(())
 }
@@ -1170,7 +1316,7 @@ _vortex_completions() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="add list ls up down toggle best ping pick qr conf proxy shield leaks recon speed flows route history sub update auth rename rm status completion"
+    opts="add list ls up down toggle best ping pick qr conf proxy mode shield leaks recon speed flows route history sub update auth rename rm status completion"
 
     if [[ ${COMP_CWORD} -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
@@ -1181,6 +1327,10 @@ _vortex_completions() {
         up|recon|qr|conf|auth|rename|rm|pick)
             local profiles=$(vortex list 2>/dev/null | awk '{print $3}')
             COMPREPLY=( $(compgen -W "${profiles}" -- ${cur}) )
+            return 0
+            ;;
+        mode)
+            COMPREPLY=( $(compgen -W "tunnel proxy toggle status" -- ${cur}) )
             return 0
             ;;
         status)
@@ -1219,6 +1369,7 @@ _vortex() {
         'qr:display terminal QR code for mobile import'
         'conf:show raw configuration text'
         'proxy:manage local SOCKS5/HTTP proxy bridge (:1080)'
+        'mode:set or inspect operational mode (tunnel vs proxy)'
         'shield:toggle nftables stealth kill switch'
         'leaks:run comprehensive DNS, IPv6, and STUN leak audit'
         'recon:perform deep node reconnaissance'
@@ -1246,6 +1397,8 @@ complete -c vortex -n "__fish_use_subcommand" -a "toggle" -d "Toggle tunnel conn
 complete -c vortex -n "__fish_use_subcommand" -a "best" -d "Connect to fastest node"
 complete -c vortex -n "__fish_use_subcommand" -a "ping" -d "Test latency of all nodes"
 complete -c vortex -n "__fish_use_subcommand" -a "pick" -d "Interactive node selector"
+complete -c vortex -n "__fish_use_subcommand" -a "mode" -d "Set or inspect operational mode"
+complete -c vortex -n "__fish_seen_subcommand_from mode" -a "tunnel proxy toggle status" -d "Operational modes"
 complete -c vortex -n "__fish_use_subcommand" -a "shield" -d "Toggle kill switch shield"
 complete -c vortex -n "__fish_use_subcommand" -a "leaks" -d "Run leak audit"
 complete -c vortex -n "__fish_use_subcommand" -a "route" -d "Split tunneling rules"
@@ -1804,7 +1957,9 @@ fn handle_shield(args: &[String]) -> Result<()> {
         }
         "off" | "disable" | "disarm" => {
             if let Some(client) = get_ipc() {
-                match client.request_sync(&IpcRequest::ToggleShield { enable: Some(false) })? {
+                match client.request_sync(&IpcRequest::ToggleShield {
+                    enable: Some(false),
+                })? {
                     IpcResponse::Status(st) => {
                         let armed = st.shield_armed;
                         println!(
@@ -1874,6 +2029,208 @@ fn handle_shield(args: &[String]) -> Result<()> {
     }
 }
 
+fn handle_check() -> Result<()> {
+    let rep = vortex_core::privilege::run_preflight_check();
+    println!("\x1b[1;36m◈ VORTEX // PREFLIGHT PRIVILEGE & CAPABILITY AUDIT\x1b[0m");
+    println!("──────────────────────────────────────────────────────────");
+    println!(
+        "  Root Privilege       : {}",
+        if rep.is_root {
+            "\x1b[1;32mYES (UID 0)\x1b[0m"
+        } else {
+            "\x1b[2mNO (Unprivileged user)\x1b[0m"
+        }
+    );
+    println!(
+        "  Process Capabilities : {}",
+        if rep.has_process_caps {
+            "\x1b[1;32mCAP_NET_ADMIN present in process\x1b[0m"
+        } else {
+            "\x1b[2mNo ambient CAP_NET_ADMIN\x1b[0m"
+        }
+    );
+    println!(
+        "  Linux TUN Device     : {} {}",
+        if rep.tun_device_exists {
+            "\x1b[1;32m/dev/net/tun present\x1b[0m"
+        } else {
+            "\x1b[1;31m/dev/net/tun MISSING\x1b[0m"
+        },
+        if rep.tun_accessible {
+            "(read/write accessible)"
+        } else {
+            "(access restricted)"
+        }
+    );
+    println!(
+        "  Sing-Box Binary      : {}",
+        rep.singbox_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "\x1b[1;31mNOT FOUND\x1b[0m".into())
+    );
+    println!(
+        "  Managed Binary       : {}",
+        if rep.is_managed_binary {
+            "\x1b[1;32mYES (~/.local/share/vortex/bin/sing-box)\x1b[0m"
+        } else {
+            "\x1b[2mNO (using system binary)\x1b[0m"
+        }
+    );
+    println!(
+        "  File Capabilities    : {}",
+        if rep.singbox_has_caps {
+            "\x1b[1;32mVALID (cap_net_admin enabled)\x1b[0m"
+        } else {
+            "\x1b[1;33mNONE (missing cap_net_admin)\x1b[0m"
+        }
+    );
+    println!(
+        "  Sudo Elevation       : {}",
+        if rep.can_sudo_passwordless {
+            "\x1b[1;32mPASSWORDLESS (sudo -n active)\x1b[0m"
+        } else {
+            "\x1b[2mPassword prompt required\x1b[0m"
+        }
+    );
+    println!(
+        "  Polkit Elevation     : {}",
+        if rep.has_pkexec {
+            "\x1b[1;32mAVAILABLE (pkexec found)\x1b[0m"
+        } else {
+            "\x1b[2mNOT FOUND\x1b[0m"
+        }
+    );
+    println!(
+        "  Privilege Strategy   : \x1b[1;35m{:?}\x1b[0m",
+        rep.strategy
+    );
+    println!("──────────────────────────────────────────────────────────");
+    println!(
+        "  TUN Tunnel Readiness : {}",
+        if rep.ready_for_tun {
+            "\x1b[1;32m[PASS] OPERATIONAL FOR TUNNELING\x1b[0m"
+        } else {
+            "\x1b[1;31m[WARN] ELEVATION / CAPABILITIES NEEDED\x1b[0m"
+        }
+    );
+    if let Some(rec) = rep.recommendation {
+        println!("\n  \x1b[1mActionable Solution:\x1b[0m\n  👉 {rec}");
+    }
+    println!();
+    Ok(())
+}
+
+fn handle_doctor() -> Result<()> {
+    println!("\x1b[1;36m◈ VORTEX // SYSTEM & ENVIRONMENT DOCTOR\x1b[0m");
+    println!("──────────────────────────────────────────────────────────");
+
+    // 1. Core binaries
+    let xray_rep = vortex_core::xray::run_xray_doctor();
+    println!("  [CORES & BINARIES]");
+    println!(
+        "  • Xray-Core Binary   : {}",
+        xray_rep
+            .binary_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "\x1b[1;31mNOT FOUND (run `vortex xray install`)\x1b[0m".into())
+    );
+    if let Some(v) = &xray_rep.binary_version {
+        println!("  • Xray-Core Version  : \x1b[1;32m{v}\x1b[0m");
+    }
+    let singbox = vortex_core::privilege::resolve_singbox_binary();
+    println!(
+        "  • Sing-Box Binary    : {}",
+        singbox
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "\x1b[2mNot installed (optional)\x1b[0m".into())
+    );
+
+    // 2. Network device & Firewall
+    println!("\n  [NETWORK STACK & FIREWALL]");
+    let tun_ok = std::path::Path::new("/dev/net/tun").exists();
+    println!(
+        "  • Linux TUN Device   : {}",
+        if tun_ok {
+            "\x1b[1;32mAVAILABLE (/dev/net/tun)\x1b[0m"
+        } else {
+            "\x1b[1;31mMISSING (run `sudo modprobe tun`)\x1b[0m"
+        }
+    );
+    let nft_ok = vortex_core::shield::is_nftables_active()
+        || std::process::Command::new("nft")
+            .arg("--version")
+            .output()
+            .is_ok();
+    println!(
+        "  • NFTables Firewall  : {}",
+        if nft_ok {
+            "\x1b[1;32mREADY (table inet vortex supported)\x1b[0m"
+        } else {
+            "\x1b[1;33mNFT not found (iptables fallback active)\x1b[0m"
+        }
+    );
+    let iptables_ok = std::process::Command::new("iptables")
+        .arg("--version")
+        .output()
+        .is_ok();
+    println!(
+        "  • Legacy IPtables    : {}",
+        if iptables_ok {
+            "\x1b[1;32mAVAILABLE\x1b[0m"
+        } else {
+            "\x1b[2mNOT FOUND\x1b[0m"
+        }
+    );
+
+    // 3. DNS Configuration
+    println!("\n  [DNS RESOLUTION & PRIVILEGES]");
+    let resolvers = vortex_core::leak::get_system_dns_resolvers();
+    println!("  • System Resolvers   : {}", resolvers.join(", "));
+    let preflight = vortex_core::privilege::run_preflight_check();
+    println!(
+        "  • Tunnel Readiness   : {}",
+        if preflight.ready_for_tun {
+            "\x1b[1;32m[PASS] OPERATIONAL FOR WHOLE-SYSTEM TUNNEL\x1b[0m"
+        } else {
+            "\x1b[1;33m[WARN] CAPABILITIES OR ROOT NEEDED (run `vortex setup`)\x1b[0m"
+        }
+    );
+
+    // 4. Daemon IPC Socket
+    let sock_path = vortex_core::ipc::active_socket_path();
+    let sock_active = sock_path.exists();
+    println!(
+        "  • Vortex Daemon IPC  : {}",
+        if sock_active {
+            format!("\x1b[1;32mONLINE ({})\x1b[0m", sock_path.display())
+        } else {
+            format!("\x1b[2mOFFLINE ({})\x1b[0m", sock_path.display())
+        }
+    );
+
+    println!("──────────────────────────────────────────────────────────\n");
+    Ok(())
+}
+
+fn handle_setup(_args: &[String]) -> Result<()> {
+    println!("\x1b[1;36m◈ VORTEX // MANAGED CORE CAPABILITY SETUP\x1b[0m");
+    println!("  Assigning network capabilities to sing-box and Xray binaries...\n");
+
+    let paths = vortex_core::privilege::setup_managed_caps()?;
+    for path in &paths {
+        println!(
+            "\x1b[1;32m✔ SUCCESS // Binary endowed with capabilities:\x1b[0m\n  {}",
+            path.display()
+        );
+    }
+    println!("\n  Cap spec: cap_net_admin,cap_net_bind_service,cap_net_raw+ep");
+    println!("  Future whole-system TUN tunnel connections will run without root or sudo prompts!");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(
@@ -1893,25 +2250,29 @@ fn main() -> Result<()> {
 
     // Diagnostic, proxy, status, inspection, and desktop commands that do not require root:
     match args.first().map(String::as_str) {
+        Some("doctor") => return handle_doctor(),
+        Some("check") | Some("--check") => return handle_check(),
+        Some("setup") => return handle_setup(&args),
         Some("proxy") => return handle_proxy(&args),
+        Some("mode") => return handle_mode(&args),
         Some("speed") | Some("benchmark") => return handle_speed(),
         Some("flows") | Some("net") | Some("connections") => return handle_flows(),
         Some("status") => return handle_status(&args),
         Some("toggle") => return handle_toggle(),
-        Some("down") => return handle_down(),
+        Some("down") | Some("disconnect") => return handle_down(),
         Some("pick") => return handle_pick(&args),
-        Some("shield") | Some("killswitch") => return handle_shield(&args),
+        Some("shield") | Some("killswitch") | Some("kill-switch") => return handle_shield(&args),
         Some("history") | Some("hist") => return handle_history(&args),
         Some("completion") => return handle_completion(&args),
         Some("list") | Some("ls") => return handle_list(),
-        Some("ping") => return handle_ping(),
+        Some("ping") | Some("test") => return handle_ping(),
         Some("qr") => return handle_qr(&args),
-        Some("conf") | Some("config") => return handle_conf(&args),
+        Some("conf") | Some("config") | Some("export") => return handle_conf(&args),
         Some("recon") | Some("inspect") => return handle_recon(&args),
         Some("leaks") | Some("leak") => return handle_leaks(),
-        Some("route") | Some("routing") => return handle_route(&args),
+        Some("route") | Some("routing") | Some("routes") => return handle_route(&args),
         Some("sub") | Some("subs") => return handle_sub(&args),
-        Some("add") => return handle_add(&args),
+        Some("add") | Some("import") => return handle_add(&args),
         Some("rm") | Some("remove") => return handle_rm(&args),
         Some("rename") => return handle_rename(&args),
         Some("update") | Some("sync") => return handle_update(),
@@ -2033,8 +2394,8 @@ fn main() -> Result<()> {
         }
     }
 
-    // Direct mode fallback: requires root for modifying tunnels/firewall
-    if unsafe { libc::geteuid() } != 0 {
+    // Direct mode fallback: requires root for modifying tunnels/firewall (bypassed in Proxy Mode)
+    if unsafe { libc::geteuid() } != 0 && !storage::get_mode_preference().is_proxy() {
         match args.first().map(String::as_str) {
             None | Some("up") | Some("best") | Some("auth") => {
                 let exe = std::env::current_exe()?;

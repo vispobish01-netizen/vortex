@@ -1,1 +1,30 @@
+# Rust build artifacts
+target/
 /target
+
+# Archives
+*.zip
+*.tar.gz
+*.tar.xz
+
+# Downloaded core binaries & geo databases
+xray
+xray.exe
+sing-box
+sing-box.exe
+*.dat
+geoip.dat
+geosite.dat
+
+# Editor & OS files
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Vortex runtime & logs
+*.log
+*.sock
+*.pid

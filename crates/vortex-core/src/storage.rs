@@ -1,6 +1,6 @@
 use crate::crypto::{decrypt_secret, encrypt_secret, get_or_create_master_key, user_config_dir};
 use crate::error::VortexError;
-use crate::model::{Auth, Kind, Profile, Subscription};
+use crate::model::{Auth, Kind, OperationalMode, Profile, Subscription};
 use crate::parser::parse_any;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,50 @@ pub fn subs_file() -> PathBuf {
 
 pub fn last_file() -> PathBuf {
     config_dir().join("last")
+}
+
+pub fn mode_file() -> PathBuf {
+    config_dir().join("mode")
+}
+
+pub fn get_mode_preference() -> OperationalMode {
+    if let Ok(m) = std::env::var("VORTEX_MODE") {
+        let m = m.trim().to_ascii_lowercase();
+        if m == "proxy" || m == "socks" || m == "http" {
+            return OperationalMode::Proxy;
+        }
+        if m == "tunnel" || m == "tun" || m == "vpn" {
+            return OperationalMode::Tunnel;
+        }
+    }
+    let user_path = mode_file();
+    if let Ok(content) = fs::read_to_string(&user_path) {
+        let m = content.trim().to_ascii_lowercase();
+        if m == "proxy" || m == "socks" || m == "http" {
+            return OperationalMode::Proxy;
+        }
+        if m == "tunnel" || m == "tun" || m == "vpn" {
+            return OperationalMode::Tunnel;
+        }
+    }
+    let sys_path = Path::new("/etc/vortex/mode");
+    if let Ok(content) = fs::read_to_string(sys_path) {
+        let m = content.trim().to_ascii_lowercase();
+        if m == "proxy" || m == "socks" || m == "http" {
+            return OperationalMode::Proxy;
+        }
+    }
+    OperationalMode::Tunnel
+}
+
+pub fn set_mode_preference(mode: OperationalMode) -> Result<(), VortexError> {
+    let _ = ensure_dirs();
+    let path = mode_file();
+    atomic_write(&path, mode.as_str().as_bytes())?;
+    if unsafe { libc::geteuid() == 0 } {
+        let _ = fs::write("/etc/vortex/mode", mode.as_str());
+    }
+    Ok(())
 }
 
 pub fn ensure_dirs() -> Result<(), VortexError> {

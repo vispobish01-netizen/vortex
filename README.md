@@ -137,3 +137,13 @@ bind = $mainMod ALT, V, exec, vortex shield
 - `r` : Deep node reconnaissance report
 - `q` : Safe quit (tunnel continues running in background)
 - `Q` : Quit and disconnect tunnel
+
+---
+
+## Documentation
+
+- [Architecture & Design](docs/ARCHITECTURE.md)
+- [Protocols & Engines](docs/PROTOCOLS.md)
+- [Security & Threat Model](docs/SECURITY.md)
+- [Implementation & Verification Plan](docs/PLAN.md)
+- [Desktop & Bar Integration](docs/DESKTOP.md)

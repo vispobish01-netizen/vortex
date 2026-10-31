@@ -72,6 +72,10 @@ pub struct RuleItem {
     pub protocols: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uids: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cgroups: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fwmark: Option<u32>,
 }
@@ -91,6 +95,8 @@ impl Default for RuleItem {
             ports: Vec::new(),
             protocols: Vec::new(),
             process_names: Vec::new(),
+            uids: Vec::new(),
+            cgroups: Vec::new(),
             fwmark: None,
         }
     }
@@ -164,6 +170,8 @@ impl Default for RulesConfig {
                     ports: Vec::new(),
                     protocols: Vec::new(),
                     process_names: Vec::new(),
+                    uids: Vec::new(),
+                    cgroups: Vec::new(),
                     fwmark: None,
                 },
                 RuleItem {
@@ -183,6 +191,8 @@ impl Default for RulesConfig {
                     ports: Vec::new(),
                     protocols: Vec::new(),
                     process_names: Vec::new(),
+                    uids: Vec::new(),
+                    cgroups: Vec::new(),
                     fwmark: None,
                 },
             ],
@@ -380,6 +390,15 @@ impl RulesConfig {
             }
             if !r.process_names.is_empty() {
                 obj.insert("process_name".into(), serde_json::json!(r.process_names));
+            }
+            if !r.uids.is_empty() {
+                obj.insert("user_id".into(), serde_json::json!(r.uids));
+            }
+            if !r.cgroups.is_empty() {
+                obj.insert("cgroup_path".into(), serde_json::json!(r.cgroups));
+            }
+            if let Some(mark) = r.fwmark {
+                obj.insert("wifi_ssid".into(), serde_json::json!(mark));
             }
 
             rules.push(serde_json::Value::Object(obj));
@@ -608,5 +627,42 @@ mod tests {
         let cfg = RulesConfig::default();
         let res = cfg.explain("github.com", None, None, None);
         assert_eq!(res.action, RuleAction::Proxy);
+    }
+
+    #[test]
+    fn test_app_and_cgroup_split_tunneling_rule_generation() {
+        let mut cfg = RulesConfig::default();
+        cfg.custom_rules.push(RuleItem {
+            id: "per_app_bypass".into(),
+            description: Some("Per-app bypass for steam and torrents".into()),
+            enabled: true,
+            action: RuleAction::Direct,
+            target_group: None,
+            domains: Vec::new(),
+            ip_cidrs: Vec::new(),
+            geoip: Vec::new(),
+            geosite: Vec::new(),
+            ports: vec!["8080".into()],
+            protocols: vec!["tcp".into()],
+            process_names: vec!["steam".into(), "qbittorrent".into()],
+            uids: vec![1000],
+            cgroups: vec!["/sys/fs/cgroup/bypass".into()],
+            fwmark: Some(0x100),
+        });
+        let sb_rules = cfg.to_singbox_rules();
+        let custom_rule = sb_rules
+            .iter()
+            .find(|r| r.get("process_name").is_some())
+            .expect("Rule with process_name should exist");
+        assert_eq!(custom_rule["outbound"], "direct");
+        assert_eq!(
+            custom_rule["process_name"],
+            serde_json::json!(["steam", "qbittorrent"])
+        );
+        assert_eq!(custom_rule["user_id"], serde_json::json!([1000]));
+        assert_eq!(
+            custom_rule["cgroup_path"],
+            serde_json::json!(["/sys/fs/cgroup/bypass"])
+        );
     }
 }

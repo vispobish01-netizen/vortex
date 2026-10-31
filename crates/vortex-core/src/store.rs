@@ -15,7 +15,7 @@ pub const ROOT: &str = "/etc/vortex";
 pub const STORE: &str = "/etc/vortex/profiles";
 pub const SUBS_FILE: &str = "/etc/vortex/subscriptions.json";
 
-pub use crate::model::{Auth, Kind, Profile, Security, Subscription, Transport};
+pub use crate::model::{Auth, Kind, OperationalMode, Profile, Security, Subscription, Transport};
 
 // ───────────────────────── storage ─────────────────────────
 
@@ -344,7 +344,7 @@ pub fn export_to_file(p: &Profile) -> Result<PathBuf> {
     let target = user_home().join(&filename);
 
     let content = if p.kind == Kind::Xray || p.backend_type.as_deref() == Some("xray") {
-        if let Ok(cfg) = crate::xray::generate_xray_config(p, "vx0", 1080, 54321, None) {
+        if let Ok(cfg) = crate::xray::generate_xray_config(p, "vx0", 1080, 54321, None, false) {
             format!(
                 "{}\n\n// Xray-core configuration:\n{}\n",
                 p.data,
@@ -520,6 +520,12 @@ fn parse_any(input: &str) -> Result<Vec<Profile>> {
     }
     if s.starts_with("http://") || s.starts_with("https://") {
         return import_sub(s);
+    }
+    // Universal parser covers Xray/sing-box JSON, VLESS xhttp, etc.
+    if let Ok(profs) = crate::parser::parse_any(s) {
+        if !profs.is_empty() {
+            return Ok(profs);
+        }
     }
     let p = expand(s);
     if p.is_file() {
@@ -729,7 +735,15 @@ fn transport(q: &HashMap<String, String>) -> Result<Option<Value>> {
             }
             Some(t)
         }
-        other => bail!("transport '{other}' is not supported by sing-box"),
+        "xhttp" | "splithttp" => {
+            let p = norm(&path);
+            let mut t = json!({"type": "xhttp", "path": p});
+            if let Some(h) = host {
+                t["host"] = json!(h);
+            }
+            Some(t)
+        }
+        other => bail!("transport '{other}' is not supported"),
     })
 }
 
@@ -974,6 +988,11 @@ fn parse_link(l: &str) -> Result<Vec<Profile>> {
     let l = l.trim();
     if l.to_ascii_lowercase().starts_with("vpn://") {
         return amnezia(l);
+    }
+    if let Ok(profs) = crate::parser::parse_any(l) {
+        if !profs.is_empty() {
+            return Ok(profs);
+        }
     }
     let (k, _, name, server) = outbound(l)?;
     let mut p = Profile {

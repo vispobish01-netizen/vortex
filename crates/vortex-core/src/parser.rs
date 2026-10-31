@@ -449,7 +449,7 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_default();
             p.transport = match net.as_str() {
-                "xhttp" => Transport::Xhttp,
+                "xhttp" | "splithttp" => Transport::Xhttp,
                 "tcp" | "" => Transport::Tcp,
                 "ws" | "websocket" => Transport::Ws,
                 "grpc" => Transport::Grpc,
@@ -458,6 +458,9 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 "quic" => Transport::Quic,
                 _ => Transport::Unknown,
             };
+            if p.transport == Transport::Xhttp {
+                p.backend_type = Some("xray".into());
+            }
             let sec = q
                 .get("security")
                 .map(|s| s.to_ascii_lowercase())
@@ -503,9 +506,13 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                     "grpc" => Transport::Grpc,
                     "h2" | "http" => Transport::H2,
                     "httpupgrade" => Transport::HttpUpgrade,
+                    "xhttp" | "splithttp" => Transport::Xhttp,
                     "quic" => Transport::Quic,
                     _ => Transport::Unknown,
                 };
+                if p.transport == Transport::Xhttp {
+                    p.backend_type = Some("xray".into());
+                }
                 let tls = val["tls"].as_str().unwrap_or("none").to_ascii_lowercase();
                 p.security = match tls.as_str() {
                     "tls" => Security::Tls,
@@ -538,8 +545,12 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 "grpc" => Transport::Grpc,
                 "h2" | "http" => Transport::H2,
                 "httpupgrade" => Transport::HttpUpgrade,
+                "xhttp" | "splithttp" => Transport::Xhttp,
                 _ => Transport::Unknown,
             };
+            if p.transport == Transport::Xhttp {
+                p.backend_type = Some("xray".into());
+            }
             let sec = q
                 .get("security")
                 .map(|s| s.to_ascii_lowercase())
@@ -575,8 +586,12 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 "grpc" => Transport::Grpc,
                 "h2" | "http" => Transport::H2,
                 "httpupgrade" => Transport::HttpUpgrade,
+                "xhttp" | "splithttp" => Transport::Xhttp,
                 _ => Transport::Unknown,
             };
+            if p.transport == Transport::Xhttp {
+                p.backend_type = Some("xray".into());
+            }
             let sec = q
                 .get("security")
                 .map(|s| s.to_ascii_lowercase())
@@ -1122,15 +1137,17 @@ pub fn parse_any(input: &str) -> Result<Vec<Profile>, VortexError> {
         }
     }
 
-    // 5. Plain line-delimited links
-    let mut list = vec![];
-    for line in trimmed.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if let Ok(mut sub_profiles) = parse_any(line) {
-            list.append(&mut sub_profiles);
+    // 5. Plain line-delimited links (only if input contains multiple lines)
+    if trimmed.contains('\n') {
+        let mut list = vec![];
+        for line in trimmed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if let Ok(mut sub_profiles) = parse_any(line) {
+                list.append(&mut sub_profiles);
+            }
         }
-    }
-    if !list.is_empty() {
-        return Ok(list);
+        if !list.is_empty() {
+            return Ok(list);
+        }
     }
 
     Err(VortexError::Parse(format!(
@@ -1319,5 +1336,17 @@ mod tests {
         assert_eq!(profs[0].transport, Transport::Tcp);
         assert_eq!(profs[0].display_transport(), "TCP");
         assert_eq!(profs[0].port, Some(443));
+    }
+
+    #[test]
+    fn test_malformed_inputs_graceful_error() {
+        assert!(parse_any("").is_err());
+        assert!(parse_any("   ").is_err());
+        assert!(parse_any("vless://").is_err());
+        assert!(parse_any("vmess://invalid_base64!!!").is_err());
+        assert!(parse_any("trojan://").is_err());
+        assert!(parse_any("ss://").is_err());
+        assert!(parse_any("hy2://").is_err());
+        assert!(parse_any("random junk string that is not a config").is_err());
     }
 }

@@ -61,6 +61,7 @@ impl DaemonState {
             pid: current_sess.as_ref().and_then(|s| s.pid),
             xray_version,
             backend,
+            mode: vortex_core::storage::get_mode_preference(),
         };
 
         DaemonState {
@@ -98,6 +99,7 @@ impl DaemonState {
                 "sing-box".to_string()
             }
         });
+        self.status.mode = vortex_core::storage::get_mode_preference();
         if let Some(s) = &current_sess {
             self.status.uptime_secs = tunnel::now().saturating_sub(s.since);
             if self.status.active_profile.as_ref().map(|p| &p.id) != Some(&s.id) {
@@ -165,9 +167,30 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("Failed to bind Unix domain socket at {:?}", sock_path))?;
 
-    // Set socket permissions to 0600 (owner only)
-    if let Err(e) = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)) {
-        warn!("Could not set socket permissions to 0600: {e}");
+    // Set socket permissions (0660 with vortex group if available, else 0600)
+    let perm_mode = if unsafe { libc::geteuid() == 0 } {
+        0o660
+    } else {
+        0o600
+    };
+    if let Err(e) = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(perm_mode))
+    {
+        warn!("Could not set socket permissions to {:o}: {e}", perm_mode);
+    }
+    // Attempt to set group ownership to 'vortex' if group exists
+    if unsafe { libc::geteuid() == 0 } {
+        use std::ffi::CString;
+        if let Ok(grp_name) = CString::new("vortex") {
+            unsafe {
+                let grp = libc::getgrnam(grp_name.as_ptr());
+                if !grp.is_null() {
+                    let gid = (*grp).gr_gid;
+                    let cpath = CString::new(sock_path.to_string_lossy().as_bytes()).unwrap();
+                    let _ = libc::chown(cpath.as_ptr(), libc::uid_t::MAX, gid);
+                    info!("Set socket group ownership to 'vortex' (gid {gid})");
+                }
+            }
+        }
     }
 
     info!("Vortex daemon listening on {:?}", sock_path);
@@ -182,9 +205,12 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         let mut last_bytes: Option<(u64, u64)> = None;
         let mut tick_counter: u64 = 0;
+        let mut last_time = tokio::time::Instant::now();
         loop {
             interval.tick().await;
             tick_counter += 1;
+            let elapsed_secs = last_time.elapsed().as_secs_f64().max(0.001);
+            last_time = tokio::time::Instant::now();
             let (iface, is_connected) = {
                 let mut st = bg_state.lock().await;
                 st.refresh_status();
@@ -195,7 +221,10 @@ async fn main() -> Result<()> {
                 if let Some(ifc) = iface {
                     if let Some((rx, tx)) = tunnel::bytes(&ifc) {
                         let (rx_sec, tx_sec) = if let Some((prev_rx, prev_tx)) = last_bytes {
-                            (rx.saturating_sub(prev_rx), tx.saturating_sub(prev_tx))
+                            (
+                                ((rx.saturating_sub(prev_rx) as f64) / elapsed_secs).round() as u64,
+                                ((tx.saturating_sub(prev_tx) as f64) / elapsed_secs).round() as u64,
+                            )
                         } else {
                             (0, 0)
                         };
@@ -680,6 +709,21 @@ async fn process_request(
                 version: doc.binary_version,
                 issues: doc.issues,
             })
+        }
+        IpcRequest::GetMode => {
+            let mode = vortex_core::storage::get_mode_preference();
+            Some(IpcResponse::Mode(mode))
+        }
+        IpcRequest::SetMode { mode } => {
+            if let Err(e) = vortex_core::storage::set_mode_preference(mode) {
+                return Some(IpcResponse::Error(format!("Failed to persist mode: {e}")));
+            }
+            let mut st = state.lock().await;
+            st.refresh_status();
+            let _ = st
+                .subscribers
+                .send(DaemonEvent::StatusChanged(st.status.clone()));
+            Some(IpcResponse::Mode(mode))
         }
     }
 }

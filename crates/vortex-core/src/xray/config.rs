@@ -16,7 +16,8 @@ pub fn generate_xray_outbound(p: &Profile) -> Result<Value> {
     // Check if profile data is already a complete or partial Xray JSON outbound
     if trimmed_data.starts_with('{') {
         if let Ok(mut val) = serde_json::from_str::<Value>(trimmed_data) {
-            if let Some(mut first_ob) = val["outbounds"].as_array().and_then(|a| a.first()).cloned() {
+            if let Some(mut first_ob) = val["outbounds"].as_array().and_then(|a| a.first()).cloned()
+            {
                 if first_ob.get("tag").is_none() {
                     first_ob["tag"] = json!("proxy");
                 }
@@ -40,14 +41,17 @@ pub fn generate_xray_outbound(p: &Profile) -> Result<Value> {
     let outbound = match p.kind {
         Kind::Vless => {
             let uuid = extract_credential_from_uri(&p.data).unwrap_or_else(|| p.id.clone());
-            let flow = p.flow.clone().unwrap_or_else(|| {
-                // If XTLS or Vision is detected or profile security is Reality/TLS
-                if p.data.contains("xtls-rprx-vision") {
-                    "xtls-rprx-vision".to_string()
-                } else {
-                    "".to_string()
-                }
-            });
+            let flow = if p.transport == Transport::Xhttp {
+                "".to_string()
+            } else {
+                p.flow.clone().unwrap_or_else(|| {
+                    if p.data.contains("xtls-rprx-vision") {
+                        "xtls-rprx-vision".to_string()
+                    } else {
+                        "".to_string()
+                    }
+                })
+            };
 
             json!({
                 "tag": "proxy",
@@ -166,14 +170,19 @@ fn generate_stream_settings(p: &Profile) -> Result<Value> {
     // Transport specific settings
     match p.transport {
         Transport::Xhttp => {
+            let mode = extract_query_param(&p.data, "mode").unwrap_or_else(|| "auto".to_string());
             let mut xhttp_settings = json!({
-                "mode": "auto"
+                "mode": mode
             });
-            if let Some(path) = extract_query_param(&p.data, "path") {
-                xhttp_settings["path"] = json!(path);
-            }
+            let path = extract_query_param(&p.data, "path").unwrap_or_else(|| "/".to_string());
+            xhttp_settings["path"] = json!(path);
             if let Some(host) = extract_query_param(&p.data, "host").or_else(|| p.sni.clone()) {
                 xhttp_settings["host"] = json!(host);
+            }
+            if let Some(extra) = extract_query_param(&p.data, "extra") {
+                if let Ok(extra_val) = serde_json::from_str::<Value>(&extra) {
+                    xhttp_settings["extra"] = extra_val;
+                }
             }
             stream["xhttpSettings"] = xhttp_settings;
         }
@@ -334,6 +343,7 @@ pub fn generate_xray_config(
     mixed_proxy_port: u16,
     api_port: u16,
     log_path: Option<&Path>,
+    is_proxy_only: bool,
 ) -> Result<Value> {
     let outbound = generate_xray_outbound(profile)?;
     let (host, port_opt) = parse_endpoint(&profile.server);
@@ -420,6 +430,54 @@ pub fn generate_xray_config(
         }));
     }
 
+    // 9. Custom User Rules from RulesConfig
+    for r in &rules_cfg.custom_rules {
+        if !r.enabled {
+            continue;
+        }
+        let tag = match r.action {
+            crate::routing::RuleAction::Direct => "direct",
+            crate::routing::RuleAction::Block => "block",
+            crate::routing::RuleAction::Proxy | crate::routing::RuleAction::ProxyGroup => "proxy",
+        };
+        let mut domains = Vec::new();
+        for d in &r.domains {
+            match d {
+                crate::routing::DomainMatcher::Exact(e) => domains.push(format!("full:{e}")),
+                crate::routing::DomainMatcher::Suffix(s) => domains.push(format!("domain:{s}")),
+                crate::routing::DomainMatcher::Keyword(k) => domains.push(format!("keyword:{k}")),
+                crate::routing::DomainMatcher::Regex(rx) => domains.push(format!("regexp:{rx}")),
+            }
+        }
+        for gs in &r.geosite {
+            domains.push(format!("geosite:{gs}"));
+        }
+        let mut ips = r.ip_cidrs.clone();
+        for gi in &r.geoip {
+            ips.push(format!("geoip:{gi}"));
+        }
+
+        let mut rule_obj = serde_json::Map::new();
+        rule_obj.insert("type".into(), json!("field"));
+        rule_obj.insert("outboundTag".into(), json!(tag));
+        if !domains.is_empty() {
+            rule_obj.insert("domain".into(), json!(domains));
+        }
+        if !ips.is_empty() {
+            rule_obj.insert("ip".into(), json!(ips));
+        }
+        if !r.ports.is_empty() {
+            rule_obj.insert("port".into(), json!(r.ports.join(",")));
+        }
+        if !r.protocols.is_empty() {
+            rule_obj.insert("network".into(), json!(r.protocols.join(",")));
+        }
+        if !domains.is_empty() || !ips.is_empty() || !r.ports.is_empty() || !r.protocols.is_empty()
+        {
+            routing_rules.push(Value::Object(rule_obj));
+        }
+    }
+
     // 7. Default proxy rule
     routing_rules.push(json!({
         "type": "field",
@@ -440,12 +498,63 @@ pub fn generate_xray_config(
         })
     };
 
+    let mut inbounds = Vec::new();
+    if !is_proxy_only {
+        inbounds.push(json!({
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {
+                "name": tun_interface,
+                "mtu": 1500,
+                "gateway": ["172.28.0.1/30"],
+                "autoSystemRoutingTable": ["0.0.0.0/0"],
+                "autoOutboundsInterface": "auto"
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic", "fakedns"]
+            }
+        }));
+    }
+    inbounds.push(json!({
+        "tag": "socks-in",
+        "listen": "127.0.0.1",
+        "port": mixed_proxy_port,
+        "protocol": "socks",
+        "settings": {
+            "udp": true
+        }
+    }));
+    inbounds.push(json!({
+        "tag": "http-in",
+        "listen": "127.0.0.1",
+        "port": mixed_proxy_port + 1,
+        "protocol": "http"
+    }));
+    inbounds.push(json!({
+        "tag": "api-in",
+        "listen": "127.0.0.1",
+        "port": api_port,
+        "protocol": "dokodemo-door",
+        "settings": {
+            "address": "127.0.0.1"
+        }
+    }));
+
     let config = json!({
         "log": log_config,
         "stats": {},
         "api": {
             "tag": "api",
             "services": ["StatsService"]
+        },
+        "policy": {
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": true,
+                "statsOutboundUplink": true,
+                "statsOutboundDownlink": true
+            }
         },
         "dns": {
             "servers": [
@@ -459,51 +568,7 @@ pub fn generate_xray_config(
             ],
             "queryStrategy": "UseIPv4"
         },
-        "inbounds": [
-            // TUN Inbound for system-wide tunneling
-            {
-                "tag": "tun-in",
-                "protocol": "tun",
-                "settings": {
-                    "name": tun_interface,
-                    "mtu": 1500,
-                    "gateway": ["172.19.0.1/30"],
-                    "autoSystemRoutingTable": ["0.0.0.0/0"],
-                    "autoOutboundsInterface": "auto"
-                },
-                "sniffing": {
-                    "enabled": true,
-                    "destOverride": ["http", "tls", "quic", "fakedns"]
-                }
-            },
-            // Local SOCKS5 / mixed proxy
-            {
-                "tag": "socks-in",
-                "listen": "127.0.0.1",
-                "port": mixed_proxy_port,
-                "protocol": "socks",
-                "settings": {
-                    "udp": true
-                }
-            },
-            // Local HTTP proxy
-            {
-                "tag": "http-in",
-                "listen": "127.0.0.1",
-                "port": mixed_proxy_port + 1,
-                "protocol": "http"
-            },
-            // gRPC API inbound on random or fixed loopback port
-            {
-                "tag": "api-in",
-                "listen": "127.0.0.1",
-                "port": api_port,
-                "protocol": "dokodemo-door",
-                "settings": {
-                    "address": "127.0.0.1"
-                }
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": [
             outbound,
             {
@@ -629,7 +694,7 @@ mod tests {
         p.reality_public_key = Some("1111222233334444555566667777888899990000111=".into());
         p.reality_short_id = Some("1234".into());
 
-        let cfg = generate_xray_config(&p, "vx0", 1080, 54321, None).unwrap();
+        let cfg = generate_xray_config(&p, "vx0", 1080, 54321, None, false).unwrap();
 
         assert_eq!(cfg["log"]["loglevel"], "warning");
         assert!(cfg["stats"].is_object());
@@ -639,6 +704,12 @@ mod tests {
         assert!(inbounds.iter().any(|i| i["tag"] == "tun-in"));
         assert!(inbounds.iter().any(|i| i["tag"] == "socks-in"));
         assert!(inbounds.iter().any(|i| i["tag"] == "api-in"));
+
+        // Test proxy mode generation
+        let proxy_cfg = generate_xray_config(&p, "vx0", 1080, 54321, None, true).unwrap();
+        let proxy_inbounds = proxy_cfg["inbounds"].as_array().unwrap();
+        assert!(!proxy_inbounds.iter().any(|i| i["tag"] == "tun-in"));
+        assert!(proxy_inbounds.iter().any(|i| i["tag"] == "socks-in"));
 
         let outbounds = cfg["outbounds"].as_array().unwrap();
         let proxy_ob = outbounds.iter().find(|o| o["tag"] == "proxy").unwrap();

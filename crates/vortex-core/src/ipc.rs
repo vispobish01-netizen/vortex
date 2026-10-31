@@ -9,7 +9,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
+pub const SYSTEM_SOCKET_PATH: &str = "/run/vortex/vortex.sock";
+
 pub fn default_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("VORTEX_SOCK") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    if unsafe { libc::geteuid() == 0 } {
+        return PathBuf::from(SYSTEM_SOCKET_PATH);
+    }
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir).join("vortex.sock");
@@ -24,6 +34,17 @@ pub fn active_socket_path() -> PathBuf {
         if !path.is_empty() {
             return PathBuf::from(path);
         }
+    }
+    if unsafe { libc::geteuid() == 0 } {
+        let sys = PathBuf::from(SYSTEM_SOCKET_PATH);
+        if sys.exists() {
+            return sys;
+        }
+        let root_tmp = PathBuf::from("/tmp/vortex-0.sock");
+        if root_tmp.exists() {
+            return root_tmp;
+        }
+        return default_socket_path();
     }
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !dir.is_empty() {
@@ -118,6 +139,10 @@ pub enum IpcRequest {
     XrayUpdate,
     XrayVersion,
     XrayDoctor,
+    GetMode,
+    SetMode {
+        mode: crate::model::OperationalMode,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -126,6 +151,7 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     Ok,
     Error(String),
+    Mode(crate::model::OperationalMode),
     Version {
         version: u32,
         app_version: String,
@@ -207,6 +233,8 @@ pub struct DaemonStatus {
     pub xray_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    #[serde(default)]
+    pub mode: crate::model::OperationalMode,
 }
 
 // ───────────────────────── Async Frame I/O ─────────────────────────

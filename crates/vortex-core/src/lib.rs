@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod backends;
 pub mod benchmark;
 pub mod crypto;
 pub mod error;
@@ -8,6 +9,7 @@ pub mod leak;
 pub mod model;
 pub mod parser;
 pub mod ping;
+pub mod privilege;
 pub mod probe;
 pub mod recon;
 pub mod routing;

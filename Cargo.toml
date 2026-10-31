@@ -3,13 +3,21 @@ members = [
     "crates/vortex-core",
     "crates/vortexd",
     "crates/vortex",
+    "crates/vortex-tui",
 ]
 default-members = [
     "crates/vortex-core",
     "crates/vortexd",
     "crates/vortex",
+    "crates/vortex-tui",
 ]
 resolver = "2"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 opt-level = 3

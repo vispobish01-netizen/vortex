@@ -114,7 +114,7 @@ fn test_xray_config_generation_full_snapshot() {
     let link = "vless://00000000-1111-2222-3333-444444444444@gateway.internal:443?type=xhttp&security=reality&sni=dl.google.com&pbk=AAAA&sid=1234&flow=xtls-rprx-vision#Node1";
     let p = parse_vless(link).unwrap();
 
-    let cfg = generate_xray_config(&p, "vx0", 1080, 49152, None)
+    let cfg = generate_xray_config(&p, "vx0", 1080, 49152, None, false)
         .expect("Config generation should succeed");
 
     // Validate top-level keys
@@ -122,6 +122,8 @@ fn test_xray_config_generation_full_snapshot() {
     assert!(cfg["stats"].is_object());
     assert_eq!(cfg["api"]["tag"], "api");
     assert_eq!(cfg["api"]["services"], serde_json::json!(["StatsService"]));
+    assert_eq!(cfg["policy"]["system"]["statsInboundDownlink"], true);
+    assert_eq!(cfg["policy"]["system"]["statsOutboundUplink"], true);
 
     // Validate inbounds
     let inbounds = cfg["inbounds"]
@@ -157,10 +159,8 @@ fn test_xray_config_generation_full_snapshot() {
     assert_eq!(proxy_ob["protocol"], "vless");
     assert_eq!(proxy_ob["streamSettings"]["network"], "xhttp");
     assert_eq!(proxy_ob["streamSettings"]["security"], "reality");
-    assert_eq!(
-        proxy_ob["settings"]["vnext"][0]["users"][0]["flow"],
-        "xtls-rprx-vision"
-    );
+    // Xray requires flow to be empty on XHTTP transport (Vision only applies to TCP)
+    assert_eq!(proxy_ob["settings"]["vnext"][0]["users"][0]["flow"], "");
 
     assert!(outbounds.iter().any(|o| o["tag"] == "direct"));
     assert!(outbounds.iter().any(|o| o["tag"] == "block"));

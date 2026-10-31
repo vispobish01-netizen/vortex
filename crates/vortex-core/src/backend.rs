@@ -26,3 +26,22 @@ pub trait Backend: Send + Sync {
     /// Queries live traffic metrics (total_rx, total_tx) in bytes
     fn query_traffic(&self, session: &Session) -> Result<(u64, u64)>;
 }
+
+/// Resolves the appropriate backend implementation for a profile.
+pub fn resolve_backend(profile: &Profile) -> Box<dyn Backend> {
+    use crate::backends::{AmneziaBackend, Hysteria2Backend, OpenVpnBackend, WireGuardBackend};
+    use crate::model::Kind;
+    use crate::xray::XrayBackend;
+
+    if profile.kind == Kind::Wg {
+        Box::new(WireGuardBackend::new())
+    } else if profile.kind == Kind::Awg {
+        Box::new(AmneziaBackend::new())
+    } else if profile.kind == Kind::Ovpn {
+        Box::new(OpenVpnBackend::new())
+    } else if profile.kind == Kind::Hy2 {
+        Box::new(Hysteria2Backend::new())
+    } else {
+        Box::new(XrayBackend::new())
+    }
+}

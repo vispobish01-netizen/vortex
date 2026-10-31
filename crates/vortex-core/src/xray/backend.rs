@@ -103,7 +103,7 @@ impl XrayBackend {
         let temp_port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let api_port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
 
-        let cfg = generate_xray_config(profile, "vxtmp0", temp_port, api_port, None)?;
+        let cfg = generate_xray_config(profile, "vxtmp0", temp_port, api_port, None, true)?;
 
         let temp_dir = std::env::temp_dir().join(format!(
             "vortex_probe_{}_{}",
@@ -145,7 +145,9 @@ impl XrayBackend {
                 "http://www.google.com/generate_204",
                 "http://connectivitycheck.gstatic.com/generate_204",
             ];
-            let mut probe_res = Err(anyhow::anyhow!("HTTP probe through Xray proxy timed out or failed"));
+            let mut probe_res = Err(anyhow::anyhow!(
+                "HTTP probe through Xray proxy timed out or failed"
+            ));
 
             for url in test_urls {
                 let start = Instant::now();
@@ -220,11 +222,24 @@ impl Backend for XrayBackend {
         let mixed_port = DEFAULT_XRAY_PROXY_PORT;
         let api_port = Self::pick_random_api_port();
 
-        let log_path = runtime_dir.join("core.log");
+        let is_proxy_only = crate::storage::get_mode_preference().is_proxy()
+            || profile.backend_type.as_deref() == Some("proxy")
+            || std::env::var("VORTEX_MODE")
+                .map(|m| m.eq_ignore_ascii_case("proxy"))
+                .unwrap_or(false);
+
         let conf_path = runtime_dir.join("xray.json");
+        let log_path = runtime_dir.join("xray.log");
         let api_port_path = runtime_dir.join("xray_api_port");
 
-        let cfg = generate_xray_config(profile, tun_iface, mixed_port, api_port, Some(&log_path))?;
+        let cfg = generate_xray_config(
+            profile,
+            tun_iface,
+            mixed_port,
+            api_port,
+            Some(&log_path),
+            is_proxy_only,
+        )?;
 
         let cfg_str = serde_json::to_string_pretty(&cfg)?;
         Self::write_secret(&conf_path, &cfg_str)?;
@@ -240,21 +255,60 @@ impl Backend for XrayBackend {
             .truncate(true)
             .open(&log_path)?;
 
-        let mut cmd = Command::new(&xray_bin);
+        let mut cmd = if is_proxy_only {
+            Command::new(&xray_bin)
+        } else {
+            let preflight = crate::privilege::run_preflight_check();
+            if !preflight.tun_device_exists {
+                bail!("Linux TUN device /dev/net/tun is missing (run `sudo modprobe tun` to enable the kernel TUN driver)");
+            }
+
+            let (has_caps, _) = crate::privilege::check_file_caps(&xray_bin);
+            if unsafe { libc::geteuid() == 0 } || has_caps {
+                Command::new(&xray_bin)
+            } else if crate::privilege::check_sudo_passwordless() {
+                let mut c = Command::new("sudo");
+                c.args(["-n", &xray_bin.to_string_lossy()]);
+                c
+            } else {
+                bail!(
+                    "Xray requires CAP_NET_ADMIN or root to configure TUN interface. Run `vortex setup` to grant passwordless capabilities, authenticate via sudo, or switch to proxy mode using `vortex mode proxy`."
+                );
+            }
+        };
+
+        if let Some(asset_dir) = crate::xray::install::geo_assets_dir() {
+            cmd.env("XRAY_LOCATION_ASSET", asset_dir);
+        }
+
         cmd.args(["run", "-c", conf_path.to_str().unwrap()]);
 
         let pid = Self::spawn_detached(&mut cmd, log_file)?;
 
         // Wait for tunnel interface or sockets
-        for count in 0..80 {
+        for _ in 0..80 {
             if !Self::is_alive(pid) {
                 let log_tail = fs::read_to_string(&log_path).unwrap_or_default();
                 let last_err = log_tail.lines().rev().take(3).collect::<Vec<_>>().join(" ");
                 bail!("Xray process exited unexpectedly (pid {pid}): {last_err}");
             }
 
-            // Check if tun interface or local proxy is up
-            if Path::new(&format!("/sys/class/net/{tun_iface}")).exists() || count >= 20 {
+            // Check if local proxy or tun interface is up
+            if is_proxy_only {
+                if std::net::TcpStream::connect(format!("127.0.0.1:{mixed_port}")).is_ok() {
+                    let session = Session {
+                        id: profile.id.clone(),
+                        name: profile.name.clone(),
+                        kind: profile.kind,
+                        server: profile.server.clone(),
+                        iface: format!("127.0.0.1:{mixed_port}"),
+                        pid: Some(pid),
+                        since: now(),
+                        conf: conf_path.to_string_lossy().to_string(),
+                    };
+                    return Ok(session);
+                }
+            } else if Path::new(&format!("/sys/class/net/{tun_iface}")).exists() {
                 let session = Session {
                     id: profile.id.clone(),
                     name: profile.name.clone(),
@@ -323,10 +377,12 @@ impl Backend for XrayBackend {
                             for s in stats {
                                 let name = s["name"].as_str().unwrap_or("");
                                 let value = s["value"].as_u64().unwrap_or(0);
-                                if name.contains("downlink") {
-                                    rx = rx.saturating_add(value);
-                                } else if name.contains("uplink") {
-                                    tx = tx.saturating_add(value);
+                                if name.starts_with("outbound>>>") && !name.contains(">>>api>>>") {
+                                    if name.ends_with(">>>downlink") {
+                                        rx = rx.saturating_add(value);
+                                    } else if name.ends_with(">>>uplink") {
+                                        tx = tx.saturating_add(value);
+                                    }
                                 }
                             }
                             if rx > 0 || tx > 0 {

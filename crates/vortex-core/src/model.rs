@@ -2,6 +2,38 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 #[serde(rename_all = "lowercase")]
+pub enum OperationalMode {
+    #[default]
+    Tunnel,
+    Proxy,
+}
+
+impl OperationalMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OperationalMode::Tunnel => "tunnel",
+            OperationalMode::Proxy => "proxy",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            OperationalMode::Tunnel => "TUNNEL (Full System VPN · vx0)",
+            OperationalMode::Proxy => "PROXY (SOCKS5/HTTP · 127.0.0.1:1080)",
+        }
+    }
+
+    pub fn is_proxy(&self) -> bool {
+        matches!(self, OperationalMode::Proxy)
+    }
+
+    pub fn is_tunnel(&self) -> bool {
+        matches!(self, OperationalMode::Tunnel)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     #[default]
     Vless,
@@ -127,11 +159,14 @@ impl Security {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Auth {
     pub username: String,
     pub password: String,
     #[serde(default = "default_true")]
+    #[zeroize(skip)]
     pub save: bool,
 }
 
@@ -442,5 +477,18 @@ mod tests {
         let red = redact_link(uri);
         assert!(!red.contains("b6a03649-61f4-41aa-a51b-402c3cc6c547"));
         assert!(red.contains("@example.com:443"));
+    }
+
+    #[test]
+    fn test_auth_zeroize() {
+        let mut auth = Auth {
+            username: "admin".into(),
+            password: "supersecretpassword".into(),
+            save: true,
+        };
+        auth.zeroize();
+        assert_eq!(auth.username, "");
+        assert_eq!(auth.password, "");
+        assert!(auth.save);
     }
 }

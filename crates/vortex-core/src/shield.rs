@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 pub const SHIELD_STATE: &str = "/run/vortex/shield.json";
 pub const SHIELD_ENABLED_FLAG: &str = "/etc/vortex/shield_enabled";
-pub const NFT_TABLE_NAME: &str = "vortex_shield";
+pub const NFT_TABLE_NAME: &str = "vortex";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShieldStatus {
@@ -134,9 +134,9 @@ pub fn generate_nftables_ruleset(
 ) -> String {
     let mut out = String::new();
     out.push_str("# Vortex Stealth Kill Switch — Strict Leak Protection Ruleset\n");
-    out.push_str("table inet vortex_shield\n");
-    out.push_str("delete table inet vortex_shield\n");
-    out.push_str("table inet vortex_shield {\n");
+    out.push_str("table inet vortex\n");
+    out.push_str("delete table inet vortex\n");
+    out.push_str("table inet vortex {\n");
     out.push_str("    chain output {\n");
     out.push_str("        type filter hook output priority 0; policy drop;\n\n");
 
@@ -247,10 +247,17 @@ pub fn disarm_nftables() -> Result<()> {
         .args(["delete", "table", "inet", NFT_TABLE_NAME])
         .output();
 
-    if let Ok(o) = out {
+    if let Ok(ref o) = out {
         if o.status.success() {
             info!("Deleted nftables table '{NFT_TABLE_NAME}'");
+            return Ok(());
         }
+    }
+
+    if unsafe { libc::geteuid() != 0 } {
+        let _ = Command::new("sudo")
+            .args(["-n", "nft", "delete", "table", "inet", NFT_TABLE_NAME])
+            .output();
     }
     Ok(())
 }
@@ -259,34 +266,48 @@ pub fn disarm_nftables() -> Result<()> {
 pub fn cleanup_stale_rules() -> Result<()> {
     let _ = disarm_nftables();
 
-    if have("iptables") {
-        while Command::new("iptables")
-            .args(["-D", "OUTPUT", "-j", "VORTEX_SHIELD"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {}
-        let _ = Command::new("iptables")
-            .args(["-F", "VORTEX_SHIELD"])
-            .output();
-        let _ = Command::new("iptables")
-            .args(["-X", "VORTEX_SHIELD"])
-            .output();
-    }
+    if unsafe { libc::geteuid() == 0 } {
+        if have("iptables") {
+            while Command::new("iptables")
+                .args(["-D", "OUTPUT", "-j", "VORTEX_SHIELD"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {}
+            let _ = Command::new("iptables")
+                .args(["-F", "VORTEX_SHIELD"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+            let _ = Command::new("iptables")
+                .args(["-X", "VORTEX_SHIELD"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+        }
 
-    if have("ip6tables") {
-        while Command::new("ip6tables")
-            .args(["-D", "OUTPUT", "-j", "VORTEX_SHIELD"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {}
-        let _ = Command::new("ip6tables")
-            .args(["-F", "VORTEX_SHIELD"])
-            .output();
-        let _ = Command::new("ip6tables")
-            .args(["-X", "VORTEX_SHIELD"])
-            .output();
+        if have("ip6tables") {
+            while Command::new("ip6tables")
+                .args(["-D", "OUTPUT", "-j", "VORTEX_SHIELD"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {}
+            let _ = Command::new("ip6tables")
+                .args(["-F", "VORTEX_SHIELD"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+            let _ = Command::new("ip6tables")
+                .args(["-X", "VORTEX_SHIELD"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+        }
     }
 
     let _ = fs::remove_file(SHIELD_STATE);
@@ -479,8 +500,8 @@ mod tests {
     fn test_generate_nftables_ruleset_structure() {
         let ruleset = generate_nftables_ruleset(Some("tun0"), Some("198.51.100.25:8443"), true);
 
-        assert!(ruleset.contains("table inet vortex_shield"));
-        assert!(ruleset.contains("delete table inet vortex_shield"));
+        assert!(ruleset.contains("table inet vortex"));
+        assert!(ruleset.contains("delete table inet vortex"));
         assert!(ruleset.contains("policy drop"));
         assert!(ruleset.contains("oifname \"lo\" accept"));
         assert!(ruleset.contains("ct state established,related accept"));
@@ -496,7 +517,7 @@ mod tests {
     fn test_generate_nftables_ruleset_lan_disabled() {
         let ruleset = generate_nftables_ruleset(None, Some("203.0.113.50:443"), false);
 
-        assert!(ruleset.contains("table inet vortex_shield"));
+        assert!(ruleset.contains("table inet vortex"));
         assert!(
             !ruleset.contains("192.168.0.0/16"),
             "LAN subnets should not be present when allow_lan is false"

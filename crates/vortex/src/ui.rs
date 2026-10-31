@@ -1,7 +1,10 @@
 use crate::keymap::{self, Action, ConfirmKind, Mode};
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyEvent, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -19,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use vortex_core::benchmark::{self, SpeedResult};
+use vortex_core::model::OperationalMode;
 use vortex_core::ping::{self, Ping};
 use vortex_core::recon::{self, ReconReport};
 use vortex_core::shield;
@@ -26,6 +30,8 @@ use vortex_core::store::{self, Kind, Profile, Security, Transport};
 use vortex_core::tunnel::{self, ActiveFlow, Session};
 
 // Elite Black-Hat Cyber Palette
+const BLACK: Color = Color::Rgb(0x00, 0x0a, 0x0d);
+const BG_DARK: Color = Color::Rgb(0x06, 0x17, 0x1c);
 const FG: Color = Color::Rgb(0xd2, 0xf7, 0xee); // Phosphor Ice-White
 const FG_DIM: Color = Color::Rgb(0x60, 0x8a, 0x8e); // Tactical Cyan-Gray
 const DIM: Color = Color::Rgb(0x2a, 0x46, 0x4c); // Dark Matrix Dim
@@ -229,14 +235,29 @@ impl App {
             a.spawn_ip();
         } else {
             a.test(false); // fresh latency numbers on launch
+            let preflight = vortex_core::privilege::run_preflight_check();
+            if !preflight.is_root && !preflight.singbox_has_caps {
+                if !preflight.tun_device_exists {
+                    a.toast = Some((
+                        "PREFLIGHT: /dev/net/tun missing — run `sudo modprobe tun`".into(),
+                        false,
+                        Instant::now(),
+                    ));
+                } else if !preflight.can_sudo_passwordless {
+                    a.toast = Some((
+                        "PREFLIGHT: sing-box lacks CAP_NET_ADMIN — run `vortex setup` for passwordless TUN".into(),
+                        false,
+                        Instant::now(),
+                    ));
+                }
+            }
         }
         a
     }
 
     fn cur(&self) -> Option<&Profile> {
-        self.view
-            .get(self.list.selected()?)
-            .map(|&i| &self.profiles[i])
+        let idx = *self.view.get(self.list.selected()?)?;
+        self.profiles.get(idx)
     }
 
     fn toast(&mut self, m: impl Into<String>, ok: bool) {
@@ -301,9 +322,16 @@ impl App {
             }
         }
         self.view = v;
-        let idx = keep
-            .and_then(|id| self.view.iter().position(|&i| self.profiles[i].id == id))
-            .unwrap_or(0);
+        let idx = if self.sort_ping {
+            0
+        } else {
+            keep.and_then(|id| {
+                self.view
+                    .iter()
+                    .position(|&i| self.profiles.get(i).map(|p| &p.id) == Some(&id))
+            })
+            .unwrap_or(0)
+        };
         self.list.select(if self.view.is_empty() {
             None
         } else {
@@ -398,6 +426,39 @@ impl App {
         } else {
             None
         };
+
+        let is_proxy_only = vortex_core::storage::get_mode_preference().is_proxy()
+            || p.backend_type.as_deref() == Some("proxy")
+            || std::env::var("VORTEX_MODE")
+                .map(|m| m.eq_ignore_ascii_case("proxy"))
+                .unwrap_or(false);
+
+        if !is_proxy_only && p.kind != Kind::Ovpn {
+            let preflight = vortex_core::privilege::run_preflight_check();
+            if !preflight.is_root && !preflight.singbox_has_caps && !preflight.can_sudo_passwordless
+            {
+                let _ = restore();
+                println!(
+                    "\r\n\x1b[1;36m◈ VORTEX // ELEVATION REQUIRED FOR SYSTEM TUN TUNNEL\x1b[0m"
+                );
+                println!("  sing-box requires root privileges (or CAP_NET_ADMIN) to configure network interfaces.");
+                println!("  (Tip: Run `vortex setup` to grant passwordless capabilities so you won't be prompted.)\r\n");
+                let status = std::process::Command::new("sudo").arg("-v").status();
+                let _ = enable_raw_mode();
+                let _ = execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste);
+                match status {
+                    Ok(s) if s.success() => {}
+                    _ => {
+                        self.toast(
+                            "ELEVATION CANCELLED // ROOT PRIVILEGES REQUIRED FOR TUN",
+                            false,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
         self.start("connecting");
         self.ip.clear();
         let tx = self.tx.clone();
@@ -618,7 +679,15 @@ impl App {
                 Msg::Connected(Err(e)) => {
                     self.busy = None;
                     self.session = tunnel::load_session();
-                    self.toast(format!("BREACH/AUTH FAIL: {e}"), false);
+                    let toast_msg = if e.contains("CAP_NET_ADMIN")
+                        || e.contains("TUNSETIFF")
+                        || e.contains("PRIVILEGE ERROR")
+                    {
+                        "PRIVILEGE ERROR: sing-box needs CAP_NET_ADMIN for TUN. Run `vortex setup` or press 'l' for log".to_string()
+                    } else {
+                        format!("CONNECT ERROR: {e} [press 'l' for log]")
+                    };
+                    self.toast(toast_msg, false);
                 }
                 Msg::Disconnected(r) => {
                     self.busy = None;
@@ -738,6 +807,7 @@ impl App {
         if self.last_tick.elapsed() < Duration::from_secs(1) || self.busy.is_some() {
             return changed;
         }
+        let elapsed_secs = self.last_tick.elapsed().as_secs_f64();
         self.last_tick = Instant::now();
         if self.session.is_none() {
             return changed;
@@ -750,13 +820,24 @@ impl App {
                 self.rtt = None;
                 self.down_peak = 0;
                 self.up_peak = 0;
+                self.last = None;
+                self.down.clear();
+                self.up.clear();
                 self.toast("TUNNEL SEVERED BY KERNEL", false);
             }
             Some(s) => {
                 if let Some((rb, tb)) = tunnel::bytes(&s.iface) {
                     if let Some((lr, lt)) = self.last {
-                        let d = rb.saturating_sub(lr);
-                        let u = tb.saturating_sub(lt);
+                        let d = if elapsed_secs > 0.0 {
+                            ((rb.saturating_sub(lr) as f64) / elapsed_secs).round() as u64
+                        } else {
+                            rb.saturating_sub(lr)
+                        };
+                        let u = if elapsed_secs > 0.0 {
+                            ((tb.saturating_sub(lt) as f64) / elapsed_secs).round() as u64
+                        } else {
+                            tb.saturating_sub(lt)
+                        };
                         if d > self.down_peak {
                             self.down_peak = d;
                         }
@@ -765,8 +846,15 @@ impl App {
                         }
                         push(&mut self.down, d);
                         push(&mut self.up, u);
+                    } else {
+                        self.base = (rb, tb);
+                        push(&mut self.down, 0);
+                        push(&mut self.up, 0);
                     }
                     self.last = Some((rb, tb));
+                } else {
+                    push(&mut self.down, 0);
+                    push(&mut self.up, 0);
                 }
             }
         }
@@ -814,6 +902,63 @@ impl App {
         }
     }
 
+    fn toggle_mode(&mut self) {
+        let cur = vortex_core::storage::get_mode_preference();
+        let next = match cur {
+            OperationalMode::Tunnel => OperationalMode::Proxy,
+            OperationalMode::Proxy => OperationalMode::Tunnel,
+        };
+        self.set_operational_mode(next);
+        if self.mode == Mode::ModeSelect {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    fn set_operational_mode(&mut self, mode: OperationalMode) {
+        let _ = vortex_core::storage::set_mode_preference(mode);
+        let client = vortex_core::ipc::IpcClient::new();
+        if client.is_daemon_running() {
+            let _ = client.request_sync(&vortex_core::ipc::IpcRequest::SetMode { mode });
+        }
+        match mode {
+            OperationalMode::Tunnel => {
+                self.toast("ACTIVATED: TUNNEL MODE (Whole-system VPN via vx0)", true);
+            }
+            OperationalMode::Proxy => {
+                self.toast(
+                    "ACTIVATED: PROXY MODE (Local SOCKS5/HTTP 127.0.0.1:1080 · No Root)",
+                    true,
+                );
+            }
+        }
+        if self.session.is_some() {
+            self.reconnect();
+        }
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) -> bool {
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            match &self.mode {
+                Mode::ModeSelect => {
+                    if m.row >= 3 && m.row <= 7 {
+                        self.set_operational_mode(OperationalMode::Tunnel);
+                        self.mode = Mode::Normal;
+                    } else if m.row >= 8 && m.row <= 13 {
+                        self.set_operational_mode(OperationalMode::Proxy);
+                        self.mode = Mode::Normal;
+                    } else {
+                        self.mode = Mode::Normal;
+                    }
+                }
+                Mode::Normal if m.row <= 1 || m.row >= 23 => {
+                    self.toggle_mode();
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Primary key event handler: delegates purely to keymap::map_key and apply
     pub fn handle_key(&mut self, k: KeyEvent) -> bool {
         if let Some(action) = keymap::map_key(&self.mode, k) {
@@ -825,7 +970,10 @@ impl App {
 
     pub fn apply(&mut self, action: Action) -> bool {
         match action {
-            Action::ForceQuit => return true,
+            Action::ForceQuit => {
+                let _ = tunnel::disconnect();
+                return true;
+            }
             Action::Quit => {
                 if self.session.is_some() {
                     self.mode = Mode::Confirm(ConfirmKind::QuitWhileConnected);
@@ -943,6 +1091,18 @@ impl App {
             }
             Action::Reconnect => self.reconnect(),
             Action::ToggleShield => self.toggle_shield(),
+            Action::ToggleMode => self.toggle_mode(),
+            Action::OpenModeSelect => {
+                self.mode = Mode::ModeSelect;
+            }
+            Action::SetModeTunnel => {
+                self.set_operational_mode(OperationalMode::Tunnel);
+                self.mode = Mode::Normal;
+            }
+            Action::SetModeProxy => {
+                self.set_operational_mode(OperationalMode::Proxy);
+                self.mode = Mode::Normal;
+            }
             Action::AddNode => {
                 self.mode = Mode::Add(String::new());
             }
@@ -1213,12 +1373,31 @@ impl App {
 
 pub fn run() -> Result<()> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |i| {
+        let _ = tunnel::disconnect();
         let _ = restore();
         default_hook(i);
     }));
+
+    extern "C" fn sig_cleanup(_: libc::c_int) {
+        let _ = tunnel::disconnect();
+        let _ = restore();
+        unsafe {
+            libc::_exit(130);
+        }
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, sig_cleanup as *const () as usize);
+        libc::signal(libc::SIGTERM, sig_cleanup as *const () as usize);
+        libc::signal(libc::SIGHUP, sig_cleanup as *const () as usize);
+    }
     let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
     let mut app = App::new();
     let res = (|| -> Result<()> {
@@ -1238,6 +1417,12 @@ pub fn run() -> Result<()> {
                 match event::read()? {
                     Event::Key(k) => {
                         if app.handle_key(k) {
+                            break;
+                        }
+                        dirty = true;
+                    }
+                    Event::Mouse(m) => {
+                        if app.handle_mouse(m) {
                             break;
                         }
                         dirty = true;
@@ -1276,7 +1461,12 @@ pub fn run() -> Result<()> {
 
 fn restore() -> Result<()> {
     disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(
+        stdout(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    )?;
     Ok(())
 }
 
@@ -1432,6 +1622,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         }
         Mode::Speed => speed_popup(f, area, app.speed_result.as_ref(), app.speed_running),
         Mode::Rules => rules_popup(f, area, &app.rules_cfg, &mut app.rules_list),
+        Mode::ModeSelect => mode_select_popup(f, area),
         _ => {}
     }
 }
@@ -1440,7 +1631,20 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
     if a.height == 0 {
         return;
     }
-    let left_title = Line::from(vec![
+    let cur_mode = vortex_core::storage::get_mode_preference();
+    let mode_btn = match cur_mode {
+        OperationalMode::Tunnel => vec![
+            Span::styled(" [m] ", Style::new().fg(BLACK).bg(CYAN).bold()),
+            Span::styled("● TUNNEL ", Style::new().fg(BLACK).bg(CYAN).bold()),
+            Span::styled("○ proxy ", Style::new().fg(FG_DIM).bg(BG_DARK)),
+        ],
+        OperationalMode::Proxy => vec![
+            Span::styled(" [m] ", Style::new().fg(BLACK).bg(YELLOW).bold()),
+            Span::styled("○ tunnel ", Style::new().fg(FG_DIM).bg(BG_DARK)),
+            Span::styled("● PROXY ", Style::new().fg(BLACK).bg(YELLOW).bold()),
+        ],
+    };
+    let mut left_spans = vec![
         Span::styled("⚡ VORTEX", Style::new().fg(GREEN).bold()),
         Span::styled(" // ", Style::new().fg(BORDER)),
         Span::styled("CYBER WARFARE NETWORK TUNNEL", Style::new().fg(CYAN).bold()),
@@ -1448,7 +1652,10 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
             format!("  v{}", env!("CARGO_PKG_VERSION")),
             Style::new().fg(FG_DIM),
         ),
-    ]);
+        Span::styled("  ", Style::new()),
+    ];
+    left_spans.extend(mode_btn);
+    let left_title = Line::from(left_spans);
 
     let right_status = if let Some(b) = app.busy {
         let sp = SPIN[(app.busy_since.elapsed().as_millis() / 90) as usize % SPIN.len()];
@@ -1525,27 +1732,37 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
         ("  SYS: ", "sing-box/bpf".to_string())
     };
 
+    let kernel_val = if cur_mode.is_tunnel() {
+        "vx0"
+    } else {
+        "none (proxy)"
+    };
+    let (mode_lbl, mode_lbl_color) = match cur_mode {
+        OperationalMode::Tunnel => ("TUNNEL", CYAN),
+        OperationalMode::Proxy => ("PROXY", YELLOW),
+    };
+
     let (sub_line, right_sub) = if a.width >= 100 {
         (
             Line::from(vec![
                 Span::styled(core_tag, Style::new().fg(DIM).bold()),
                 Span::styled(core_val.clone(), Style::new().fg(CYAN)),
                 Span::styled("  ◈  KERNEL: ", Style::new().fg(DIM).bold()),
-                Span::styled("vx0", Style::new().fg(FG)),
+                Span::styled(kernel_val, Style::new().fg(FG)),
                 Span::styled("  ◈  PROXY: ", Style::new().fg(DIM).bold()),
                 Span::styled("127.0.0.1:1080", Style::new().fg(CYAN)),
                 Span::styled("  ◈  DNS: ", Style::new().fg(DIM).bold()),
                 Span::styled("1.1.1.1:DoH", Style::new().fg(GREEN)),
             ]),
             Line::from(vec![
-                Span::styled("[SHIELD: ", Style::new().fg(DIM)),
+                Span::styled("[MODE: ", Style::new().fg(DIM)),
+                Span::styled(mode_lbl, Style::new().fg(mode_lbl_color).bold()),
+                Span::styled(" · SHIELD: ", Style::new().fg(DIM)),
                 if armed {
-                    Span::styled("ARMED", Style::new().fg(GREEN).bold())
+                    Span::styled("ARMED] ", Style::new().fg(GREEN).bold())
                 } else {
-                    Span::styled("OFF", Style::new().fg(RED).bold())
+                    Span::styled("OFF] ", Style::new().fg(RED).bold())
                 },
-                Span::styled(" · PROXY: ", Style::new().fg(DIM)),
-                Span::styled(":1080] ", Style::new().fg(PURPLE).bold()),
             ]),
         )
     } else {
@@ -1556,7 +1773,9 @@ fn header(f: &mut Frame, a: Rect, app: &App) {
                 Span::styled("  ◈  PROXY: :1080  ◈  DNS: DoH", Style::new().fg(FG_DIM)),
             ]),
             Line::from(vec![
-                Span::styled("[SHIELD: ", Style::new().fg(DIM)),
+                Span::styled("[", Style::new().fg(DIM)),
+                Span::styled(mode_lbl, Style::new().fg(mode_lbl_color).bold()),
+                Span::styled(" · SHIELD: ", Style::new().fg(DIM)),
                 if armed {
                     Span::styled("ARMED] ", Style::new().fg(GREEN).bold())
                 } else {
@@ -2112,14 +2331,14 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
             .unwrap_or((0, 0));
         let line = if inner.width >= 62 {
             Line::from(vec![
-                Span::styled("RX SPEED ► ", Style::new().fg(CYAN).bold()),
+                Span::styled("RX (DOWN) ▼ ", Style::new().fg(CYAN).bold()),
                 Span::styled(format!("{}/s", fmt_bytes(dn)), Style::new().fg(FG).bold()),
                 Span::styled(
                     format!(" [PEAK: {}/s]", fmt_bytes(app.down_peak)),
                     Style::new().fg(FG_DIM),
                 ),
                 Span::raw("   "),
-                Span::styled("TX SPEED ▲ ", Style::new().fg(PURPLE).bold()),
+                Span::styled("TX (UP) ▲ ", Style::new().fg(PURPLE).bold()),
                 Span::styled(format!("{}/s", fmt_bytes(upn)), Style::new().fg(FG).bold()),
                 Span::styled(
                     format!(" [PEAK: {}/s]", fmt_bytes(app.up_peak)),
@@ -2128,7 +2347,7 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
             ])
         } else {
             Line::from(vec![
-                Span::styled("RX ► ", Style::new().fg(CYAN).bold()),
+                Span::styled("RX ▼ ", Style::new().fg(CYAN).bold()),
                 Span::styled(format!("{}/s ", fmt_bytes(dn)), Style::new().fg(FG).bold()),
                 Span::styled("  TX ▲ ", Style::new().fg(PURPLE).bold()),
                 Span::styled(format!("{}/s", fmt_bytes(upn)), Style::new().fg(FG).bold()),
@@ -2138,7 +2357,7 @@ fn info(f: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::styled("CUMULATIVE: ", Style::new().fg(DIM).bold()),
                 Span::styled(
-                    format!("RX {} · TX {}", fmt_bytes(tot.0), fmt_bytes(tot.1)),
+                    format!("RX (DOWN) {} · TX (UP) {}", fmt_bytes(tot.0), fmt_bytes(tot.1)),
                     Style::new().fg(FG_DIM),
                 ),
                 Span::styled("  │  MTU: 9000  │  BBR: ENGAGED", Style::new().fg(GREEN)),
@@ -2476,6 +2695,7 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
         _ => {
             let is_connected = app.session.is_some();
             let shield_armed = app.shield_armed || shield::is_armed();
+            let cur_mode = vortex_core::storage::get_mode_preference();
 
             let space_desc = if is_connected {
                 "disconnect"
@@ -2487,26 +2707,46 @@ fn footer(f: &mut Frame, a: Rect, app: &App) {
             } else {
                 "shield:off"
             };
+            let (mode_btn_txt, mode_btn_color) = match cur_mode {
+                OperationalMode::Tunnel => ("TUNNEL⇄proxy", CYAN),
+                OperationalMode::Proxy => ("PROXY⇄tunnel", YELLOW),
+            };
 
-            let hints: [(&str, &str); 9] = [
+            let hints: [(&str, &str); 10] = [
                 ("Enter", "connect"),
                 ("Space", space_desc),
+                ("m", mode_btn_txt),
+                ("M", "modes"),
                 ("t", "test"),
                 ("p", "filter"),
                 ("a", "add"),
-                ("/", "search"),
                 ("K", shield_desc),
                 ("?", "help"),
                 ("q", "quit"),
             ];
 
+            let (prompt_user, prompt_bracket, prompt_sym) = match cur_mode {
+                OperationalMode::Tunnel => (" root@vortex", "[TUN]# ", CYAN),
+                OperationalMode::Proxy => (" user@vortex", "[PROXY]$ ", YELLOW),
+            };
             let mut spans = vec![
-                Span::styled(" root@vortex", Style::new().fg(GREEN).bold()),
-                Span::styled("[SYS]# ", Style::new().fg(CYAN).bold()),
+                Span::styled(prompt_user, Style::new().fg(GREEN).bold()),
+                Span::styled(prompt_bracket, Style::new().fg(prompt_sym).bold()),
             ];
             for (k, d) in hints {
-                spans.push(Span::styled(format!("[{k}]"), Style::new().fg(CYAN).bold()));
-                spans.push(Span::styled(format!(" {d}  "), Style::new().fg(FG_DIM)));
+                if k == "m" {
+                    spans.push(Span::styled(
+                        format!("[{k}]"),
+                        Style::new().fg(BLACK).bg(mode_btn_color).bold(),
+                    ));
+                    spans.push(Span::styled(
+                        format!(" {d}  "),
+                        Style::new().fg(mode_btn_color).bold(),
+                    ));
+                } else {
+                    spans.push(Span::styled(format!("[{k}]"), Style::new().fg(CYAN).bold()));
+                    spans.push(Span::styled(format!(" {d}  "), Style::new().fg(FG_DIM)));
+                }
             }
             f.render_widget(Paragraph::new(Line::from(spans)), a);
         }
@@ -3084,6 +3324,145 @@ fn rules_popup(
         Span::styled("DISMISS ROUTING MODAL", Style::new().fg(FG_DIM)),
     ]);
     f.render_widget(Paragraph::new(vec![hints]), rows[3]);
+}
+
+fn mode_select_popup(f: &mut Frame, area: Rect) {
+    let cur_mode = vortex_core::storage::get_mode_preference();
+    let w = (area.width.saturating_sub(4)).min(78);
+    let h = (area.height.saturating_sub(4)).min(18);
+    let r = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let blk = block("0xMODE // SELECT & ACTIVATE OPERATIONAL MODE", true);
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+
+    let rows = Layout::vertical([
+        Constraint::Length(1), // Subtitle
+        Constraint::Length(5), // Tunnel mode card
+        Constraint::Length(5), // Proxy mode card
+        Constraint::Min(1),    // Spacer
+        Constraint::Length(2), // Controls
+    ])
+    .split(inner);
+
+    let sub = Line::from(vec![
+        Span::styled(" Direct Mode Switcher: ", Style::new().fg(FG_DIM)),
+        Span::styled("[1/t]", Style::new().fg(CYAN).bold()),
+        Span::styled(" Activate Tunnel  ", Style::new().fg(FG)),
+        Span::styled("[2/p]", Style::new().fg(YELLOW).bold()),
+        Span::styled(" Activate Proxy  ", Style::new().fg(FG)),
+        Span::styled("[m]", Style::new().fg(GREEN).bold()),
+        Span::styled(" Toggle", Style::new().fg(FG)),
+    ]);
+    f.render_widget(Paragraph::new(sub), rows[0]);
+
+    // 1. Tunnel Card
+    let is_tun = cur_mode.is_tunnel();
+    let tun_title = if is_tun {
+        Line::from(vec![
+            Span::styled(" [ACTIVE] ", Style::new().fg(BLACK).bg(CYAN).bold()),
+            Span::styled(
+                " [1] ◈ TUNNEL MODE (Full System VPN) ",
+                Style::new().fg(CYAN).bold(),
+            ),
+            Span::styled("• Currently running", Style::new().fg(FG_DIM)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" [INACTIVE] ", Style::new().fg(FG_DIM).bg(BG_DARK)),
+            Span::styled(
+                " [1] ◈ TUNNEL MODE (Full System VPN) ",
+                Style::new().fg(FG).bold(),
+            ),
+            Span::styled("• Press 1 or t to activate", Style::new().fg(CYAN).bold()),
+        ])
+    };
+    let tun_desc = vec![
+        tun_title,
+        Line::from(Span::styled(
+            "     • Whole-system kernel routing via virtual interface (vx0)",
+            Style::new().fg(if is_tun { FG } else { FG_DIM }),
+        )),
+        Line::from(Span::styled(
+            "     • Stealth Kill-Switch, IPv6 protection & DNS leak shield",
+            Style::new().fg(if is_tun { FG } else { FG_DIM }),
+        )),
+        Line::from(Span::styled(
+            "     • Requires CAP_NET_ADMIN / sudo (or run `vortex setup`)",
+            Style::new().fg(FG_DIM),
+        )),
+    ];
+    let tun_blk = Block::bordered()
+        .border_style(Style::new().fg(if is_tun { CYAN } else { BORDER }))
+        .border_type(if is_tun {
+            BorderType::Double
+        } else {
+            BorderType::Plain
+        });
+    f.render_widget(Paragraph::new(tun_desc).block(tun_blk), rows[1]);
+
+    // 2. Proxy Card
+    let is_proxy = cur_mode.is_proxy();
+    let proxy_title = if is_proxy {
+        Line::from(vec![
+            Span::styled(" [ACTIVE] ", Style::new().fg(BLACK).bg(YELLOW).bold()),
+            Span::styled(
+                " [2] ◈ PROXY MODE (Local SOCKS5 / HTTP Bridge) ",
+                Style::new().fg(YELLOW).bold(),
+            ),
+            Span::styled("• Currently running", Style::new().fg(FG_DIM)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" [INACTIVE] ", Style::new().fg(FG_DIM).bg(BG_DARK)),
+            Span::styled(
+                " [2] ◈ PROXY MODE (Local SOCKS5 / HTTP Bridge) ",
+                Style::new().fg(FG).bold(),
+            ),
+            Span::styled("• Press 2 or p to activate", Style::new().fg(YELLOW).bold()),
+        ])
+    };
+    let proxy_desc = vec![
+        proxy_title,
+        Line::from(Span::styled(
+            "     • Mixed SOCKS5 & HTTP listener at 127.0.0.1:1080",
+            Style::new().fg(if is_proxy { FG } else { FG_DIM }),
+        )),
+        Line::from(Span::styled(
+            "     • Zero root privileges needed — completely unprivileged & safe",
+            Style::new().fg(if is_proxy { FG } else { FG_DIM }),
+        )),
+        Line::from(Span::styled(
+            "     • Use with browser extensions or terminal: eval $(vortex proxy env)",
+            Style::new().fg(FG_DIM),
+        )),
+    ];
+    let proxy_blk = Block::bordered()
+        .border_style(Style::new().fg(if is_proxy { YELLOW } else { BORDER }))
+        .border_type(if is_proxy {
+            BorderType::Double
+        } else {
+            BorderType::Plain
+        });
+    f.render_widget(Paragraph::new(proxy_desc).block(proxy_blk), rows[2]);
+
+    // 3. Footer controls
+    let controls = Line::from(vec![
+        Span::styled(" [1/t] ", Style::new().fg(CYAN).bold()),
+        Span::styled("ACTIVATE TUNNEL   ", Style::new().fg(FG)),
+        Span::styled("[2/p] ", Style::new().fg(YELLOW).bold()),
+        Span::styled("ACTIVATE PROXY   ", Style::new().fg(FG)),
+        Span::styled("[m/Space] ", Style::new().fg(GREEN).bold()),
+        Span::styled("TOGGLE   ", Style::new().fg(FG)),
+        Span::styled("[Esc/q] ", Style::new().fg(RED).bold()),
+        Span::styled("CLOSE", Style::new().fg(FG_DIM)),
+    ]);
+    f.render_widget(Paragraph::new(vec![Line::from(""), controls]), rows[4]);
 }
 
 fn recon_popup(f: &mut Frame, area: Rect, report_res: &Result<ReconReport, String>) {

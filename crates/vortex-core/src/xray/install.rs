@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
+pub const PINNED_XRAY_VERSION: &str = "v26.9.30";
 pub const XRAY_RELEASES_API: &str = "https://api.github.com/repos/XTLS/Xray-core/releases";
 pub const GEOIP_URL: &str = "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat";
 pub const GEOSITE_URL: &str =
@@ -94,16 +95,49 @@ pub fn target_asset_names() -> (&'static str, &'static str) {
 pub fn xray_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("VORTEX_DATA_DIR") {
         if !dir.is_empty() {
-            return PathBuf::from(dir).join("xray");
+            let p = PathBuf::from(dir).join("xray");
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    if unsafe { libc::geteuid() == 0 } {
+        let sys_path = PathBuf::from("/var/lib/vortex/cores/xray");
+        if sys_path.exists() {
+            return sys_path;
+        }
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            if !sudo_user.is_empty() {
+                let candidate =
+                    PathBuf::from(format!("/home/{sudo_user}/.local/share/vortex/xray"));
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
         }
     }
     if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
         if !data_home.is_empty() {
-            return PathBuf::from(data_home).join("vortex").join("xray");
+            let p = PathBuf::from(data_home).join("vortex").join("xray");
+            if p.exists() {
+                return p;
+            }
         }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".local/share/vortex/xray")
+    let default_path = PathBuf::from(home).join(".local/share/vortex/xray");
+    if default_path.exists() {
+        return default_path;
+    }
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if !sudo_user.is_empty() {
+            let candidate = PathBuf::from(format!("/home/{sudo_user}/.local/share/vortex/xray"));
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    default_path
 }
 
 /// Symlink path to active managed Xray
@@ -114,6 +148,22 @@ pub fn current_symlink_path() -> PathBuf {
 /// Path to the managed xray binary (~/.local/share/vortex/xray/current/xray)
 pub fn managed_xray_binary() -> PathBuf {
     current_symlink_path().join("xray")
+}
+
+/// Resolves directory containing geoip.dat and geosite.dat databases
+pub fn geo_assets_dir() -> Option<PathBuf> {
+    let search_dirs = [
+        current_symlink_path(),
+        xray_data_dir(),
+        PathBuf::from("/var/lib/vortex/cores/xray"),
+        PathBuf::from("/usr/share/xray"),
+        PathBuf::from("/usr/local/share/xray"),
+        PathBuf::from("/var/lib/xray"),
+        PathBuf::from("/usr/share/v2ray"),
+    ];
+    search_dirs
+        .into_iter()
+        .find(|d| d.join("geoip.dat").exists())
 }
 
 /// Queries all releases from XTLS/Xray-core and determines the highest version release
@@ -252,11 +302,7 @@ pub fn verify_checksum(bytes: &[u8], dgst_content: &str) -> Result<()> {
 
 /// Downloads and installs Xray-core to ~/.local/share/vortex/xray/<version>/ with atomic symlink update
 pub fn install_xray(target_release: Option<XrayReleaseInfo>) -> Result<String> {
-    // Security check: Never run download as root
-    if unsafe { libc::geteuid() } == 0 {
-        bail!("Never run vortex xray install as root! Run without sudo; only tunnel setup requires privileges.");
-    }
-
+    // If running as root (e.g. systemd or daemon setup), installs into /var/lib/vortex/cores/xray
     let rel = match target_release {
         Some(r) => r,
         None => fetch_latest_release_info(None)?,
@@ -518,13 +564,7 @@ pub fn which_in_path(bin: &str) -> Option<PathBuf> {
             }
         }
     }
-    for standard in [
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-        "/usr/sbin",
-        "/sbin",
-    ] {
+    for standard in ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
         let candidate = Path::new(standard).join(bin);
         if candidate.is_file() {
             return Some(candidate);
@@ -557,6 +597,16 @@ pub fn resolve_xray_binary() -> Result<PathBuf> {
         (Some(sys), false) => Ok(sys),
         (None, true) => Ok(managed),
         (None, false) => {
+            if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+                if !sudo_user.is_empty() {
+                    let fallback = PathBuf::from(format!(
+                        "/home/{sudo_user}/.local/share/vortex/xray/current/xray"
+                    ));
+                    if fallback.exists() {
+                        return Ok(fallback);
+                    }
+                }
+            }
             bail!("Xray-core binary not found. Run `vortex xray install` to install it.")
         }
     }
@@ -621,6 +671,7 @@ pub fn run_xray_doctor() -> DoctorReport {
     let search_dirs = [
         current_symlink_path(),
         xray_data_dir(),
+        PathBuf::from("/var/lib/vortex/cores/xray"),
         PathBuf::from("/usr/share/xray"),
         PathBuf::from("/usr/local/share/xray"),
         PathBuf::from("/var/lib/xray"),

@@ -12,6 +12,7 @@ pub enum ConfirmKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Mode {
     Normal,
     Search(String),
@@ -24,6 +25,7 @@ pub enum Mode {
     Recon,
     Speed,
     Rules,
+    ModeSelect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,6 +44,10 @@ pub enum Action {
     ToggleConnection,
     Reconnect,
     ToggleShield,
+    ToggleMode,
+    OpenModeSelect,
+    SetModeTunnel,
+    SetModeProxy,
 
     // Nodes
     AddNode,
@@ -116,6 +122,10 @@ impl Action {
             Action::ToggleConnection => "toggle_connection",
             Action::Reconnect => "reconnect",
             Action::ToggleShield => "toggle_shield",
+            Action::ToggleMode => "toggle_mode",
+            Action::OpenModeSelect => "open_mode_select",
+            Action::SetModeTunnel => "set_mode_tunnel",
+            Action::SetModeProxy => "set_mode_proxy",
             Action::AddNode => "add_node",
             Action::EditNode => "edit_node",
             Action::DeleteNode => "delete_node",
@@ -156,6 +166,10 @@ impl Action {
 
     pub fn from_snake_case(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
+            "toggle_mode" | "mode" => Some(Action::ToggleMode),
+            "open_mode_select" | "mode_menu" => Some(Action::OpenModeSelect),
+            "set_mode_tunnel" | "tunnel_mode" => Some(Action::SetModeTunnel),
+            "set_mode_proxy" | "proxy_mode" => Some(Action::SetModeProxy),
             "next_node" => Some(Action::NextNode),
             "prev_node" => Some(Action::PrevNode),
             "first_node" => Some(Action::FirstNode),
@@ -309,6 +323,24 @@ pub const HELP_ENTRIES: &[KeyHelp] = &[
         key: "K (Shift+k)",
         description: "Toggle stealth shield / kill-switch",
         action: Action::ToggleShield,
+    },
+    KeyHelp {
+        category: "CONNECTION",
+        key: "m",
+        description: "Toggle mode (TUNNEL VPN vx0 ⇄ PROXY 127.0.0.1:1080)",
+        action: Action::ToggleMode,
+    },
+    KeyHelp {
+        category: "CONNECTION",
+        key: "M (Shift+m)",
+        description: "Open operational mode menu & activator",
+        action: Action::OpenModeSelect,
+    },
+    KeyHelp {
+        category: "CONNECTION",
+        key: "F2",
+        description: "Quick toggle mode (TUNNEL ⇄ PROXY)",
+        action: Action::ToggleMode,
     },
     // Nodes
     KeyHelp {
@@ -619,6 +651,10 @@ pub fn map_key(mode: &Mode, key: KeyEvent) -> Option<Action> {
                 KeyCode::Esc => Some(Action::Cancel),
                 KeyCode::Char('c') if !ctrl => Some(Action::ManageAuth),
                 KeyCode::Char('v') => Some(Action::PasteClipboard),
+                KeyCode::Char('m') if !shift => Some(Action::ToggleMode),
+                KeyCode::Char('M') => Some(Action::OpenModeSelect),
+                KeyCode::Char('m') if shift => Some(Action::OpenModeSelect),
+                KeyCode::F(2) => Some(Action::ToggleMode),
                 _ => None,
             }
         }
@@ -709,6 +745,19 @@ pub fn map_key(mode: &Mode, key: KeyEvent) -> Option<Action> {
             KeyCode::Char('j') | KeyCode::Down => Some(Action::NextNode),
             KeyCode::Char('k') | KeyCode::Up => Some(Action::PrevNode),
             KeyCode::Char(' ') | KeyCode::Enter => Some(Action::ToggleRule),
+            _ => None,
+        },
+        Mode::ModeSelect => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => Some(Action::Cancel),
+            KeyCode::Char('1') | KeyCode::Char('t') | KeyCode::Char('T') => {
+                Some(Action::SetModeTunnel)
+            }
+            KeyCode::Char('2') | KeyCode::Char('p') | KeyCode::Char('P') => {
+                Some(Action::SetModeProxy)
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Char(' ') | KeyCode::Enter => {
+                Some(Action::ToggleMode)
+            }
             _ => None,
         },
     }
@@ -1024,10 +1073,40 @@ mod tests {
             Mode::Subs,
             Mode::Recon,
             Mode::Speed,
+            Mode::Rules,
+            Mode::ModeSelect,
         ];
         for mode in &modes {
             assert_eq!(map_key(mode, press(KeyCode::Esc)), Some(Action::Cancel));
         }
+    }
+
+    #[test]
+    fn test_mode_select_keys() {
+        assert_eq!(
+            map_key(&Mode::ModeSelect, press(KeyCode::Char('1'))),
+            Some(Action::SetModeTunnel)
+        );
+        assert_eq!(
+            map_key(&Mode::ModeSelect, press(KeyCode::Char('t'))),
+            Some(Action::SetModeTunnel)
+        );
+        assert_eq!(
+            map_key(&Mode::ModeSelect, press(KeyCode::Char('2'))),
+            Some(Action::SetModeProxy)
+        );
+        assert_eq!(
+            map_key(&Mode::ModeSelect, press(KeyCode::Char('p'))),
+            Some(Action::SetModeProxy)
+        );
+        assert_eq!(
+            map_key(&Mode::ModeSelect, press(KeyCode::Char('m'))),
+            Some(Action::ToggleMode)
+        );
+        assert_eq!(
+            map_key(&Mode::ModeSelect, press(KeyCode::Esc)),
+            Some(Action::Cancel)
+        );
     }
 
     #[test]

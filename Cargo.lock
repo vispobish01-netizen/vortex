@@ -3647,6 +3647,22 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "url",
+ "zeroize",
+]
+
+[[package]]
+name = "vortex-tui"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vortex-core",
 ]
 
 [[package]]
