@@ -1,12 +1,20 @@
-// Waybar module configuration for Vortex
-// Add "custom/vortex" to "modules-right" or "modules-left" in your ~/.config/waybar/config.jsonc
+// Waybar module configuration snippet for Vortex
+//
+// Setup instructions:
+// 1. Add "custom/vortex" to "modules-right" (or "modules-left") in ~/.config/waybar/config.jsonc
+// 2. Copy and paste the snippet below into the root JSON object of ~/.config/waybar/config.jsonc
+// 3. Append the CSS styles from packaging/waybar/style.css to ~/.config/waybar/style.css
+// 4. Ensure the vortexd ambient user service is active:
+//      systemctl --user enable --now vortexd
+// 5. Restart Waybar to apply:
+//      omarchy-restart-waybar || pkill -SIGUSR2 waybar
 
-"custom/vortex": {
-    "format": "{}",
-    "return-type": "json",
-    "interval": 2,
-    "exec": "vortex status --json",
-    "on-click": "vortex toggle",
-    "on-click-right": "vortex pick",
-    "tooltip": true
-}
+    "custom/vortex": {
+        "format": "{}",
+        "return-type": "json",
+        "interval": 2,
+        "exec": "vortex status --json",
+        "on-click": "vortex toggle",
+        "on-click-right": "vortex pick",
+        "tooltip": true
+    }

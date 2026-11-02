@@ -99,18 +99,58 @@ vortex completion <shell>      # Generate shell completions (bash, zsh, fish)
 
 See [docs/DESKTOP.md](docs/DESKTOP.md) for full configuration guides.
 
-### Waybar Module (`~/.config/waybar/config.jsonc`)
-```jsonc
-"custom/vortex": {
-    "format": "{}",
-    "return-type": "json",
-    "interval": 2,
-    "exec": "vortex status --json",
-    "on-click": "vortex toggle",
-    "on-click-right": "vortex pick",
-    "tooltip": true
-}
-```
+### Waybar Module Integration
+1. Ensure the `vortexd` ambient user service is running:
+   ```bash
+   systemctl --user enable --now vortexd
+   ```
+2. Add `"custom/vortex"` to `modules-right` (or `modules-left`) in `~/.config/waybar/config.jsonc`:
+   ```jsonc
+   "modules-right": [
+       // ... existing modules
+       "custom/vortex"
+   ],
+   ```
+3. Copy-paste the module snippet from `packaging/waybar/config.jsonc` into `~/.config/waybar/config.jsonc`:
+   ```jsonc
+   "custom/vortex": {
+       "format": "{}",
+       "return-type": "json",
+       "interval": 2,
+       "exec": "vortex status --json",
+       "on-click": "vortex toggle",
+       "on-click-right": "vortex pick",
+       "tooltip": true
+   }
+   ```
+4. Append CSS styles from `packaging/waybar/style.css` into `~/.config/waybar/style.css`:
+   ```css
+   #custom-vortex {
+       padding: 0 10px;
+       margin: 0 4px;
+       font-weight: bold;
+       border-radius: 6px;
+       transition: all 0.2s ease-in-out;
+   }
+   #custom-vortex.connected {
+       color: #00ffcc;
+       background: rgba(0, 240, 255, 0.12);
+       border: 1px solid rgba(0, 240, 255, 0.35);
+   }
+   #custom-vortex.connected.shield-armed {
+       border-bottom: 2px solid #00f0ff;
+       box-shadow: 0 0 8px rgba(0, 240, 255, 0.25);
+   }
+   #custom-vortex.disconnected {
+       color: #608a8e;
+       background: rgba(22, 61, 68, 0.25);
+       border: 1px solid rgba(96, 138, 142, 0.2);
+   }
+   ```
+5. Restart Waybar:
+   ```bash
+   omarchy-restart-waybar || pkill -SIGUSR2 waybar
+   ```
 
 ### Hyprland Bindings (`~/.config/hypr/bindings.lua` or `hyprland.conf`)
 ```conf

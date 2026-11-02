@@ -560,7 +560,7 @@ fn send_notification(summary: &str, body: &str, icon: Option<&str>) {
         cmd.arg("-i").arg(i);
     }
     cmd.arg(summary).arg(body);
-    let _ = cmd.spawn();
+    let _ = cmd.status();
 }
 
 fn detect_country_flag(name: &str) -> String {
@@ -805,6 +805,18 @@ fn format_node_with_flag(name: &str, max_len: usize) -> String {
 }
 
 fn reexec_sudo(args: &[String]) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        if get_ipc().is_none() {
+            send_notification(
+                "Vortex",
+                "start vortexd: systemctl --user enable --now vortexd",
+                Some("dialog-error"),
+            );
+            bail!("start vortexd: systemctl --user enable --now vortexd");
+        }
+        bail!("sudo re-exec is not supported when stdin is not a TTY");
+    }
     let exe = std::env::current_exe()?;
     let err = Command::new("sudo")
         .arg("--preserve-env=WAYLAND_DISPLAY,XDG_RUNTIME_DIR,TERM,COLORTERM,LANG,VORTEX_SOCK,VORTEX_BACKEND,VORTEX_MODE,VORTEX_RUN_DIR")
@@ -862,10 +874,177 @@ fn connect_profile(p: &store::Profile) -> Result<()> {
     Ok(())
 }
 
+pub fn escape_pango(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+pub fn format_status_json(
+    connected: bool,
+    name: &str,
+    kind_tag: &str,
+    server: &str,
+    uptime_secs: u64,
+    armed: bool,
+    mode: OperationalMode,
+) -> serde_json::Value {
+    let shield_class = if armed { "shield-armed" } else { "shield-off" };
+    if connected {
+        let uptime_fmt = if uptime_secs < 60 {
+            format!("{uptime_secs}s")
+        } else if uptime_secs < 3600 {
+            format!("{}m {}s", uptime_secs / 60, uptime_secs % 60)
+        } else {
+            format!("{}h {}m", uptime_secs / 3600, (uptime_secs % 3600) / 60)
+        };
+
+        let raw_text = format_node_with_flag(name, 16);
+        let text = escape_pango(&raw_text);
+        let tooltip = format!(
+            "<b>Vortex VPN &amp; Proxy</b>\n<b>Mode:</b> {}\n<b>Status:</b> Connected\n<b>Node:</b> {} ({})\n<b>Endpoint:</b> {}\n<b>Shield:</b> {}\n<b>Uptime:</b> {}\n<i>Left-click: toggle · Right-click: menu</i>",
+            escape_pango(mode.display_name()),
+            escape_pango(name),
+            escape_pango(kind_tag),
+            escape_pango(server),
+            if armed { "ARMED 🛡️" } else { "OFF" },
+            uptime_fmt
+        );
+
+        serde_json::json!({
+            "text": text,
+            "alt": "connected",
+            "tooltip": tooltip,
+            "class": ["connected", shield_class],
+            "connected": true,
+            "mode": mode.as_str(),
+            "node": name,
+            "protocol": kind_tag,
+            "server": server,
+            "shield": armed,
+            "uptime_secs": uptime_secs,
+        })
+    } else {
+        let text = if armed {
+            "󰌙 Off 🛡️"
+        } else {
+            "󰌙 Off"
+        };
+        let tooltip = format!(
+            "<b>Vortex VPN &amp; Proxy</b>\n<b>Mode:</b> {}\n<b>Status:</b> Disconnected\n<b>Shield:</b> {}\n<i>Left-click: connect · Right-click: menu</i>",
+            escape_pango(mode.display_name()),
+            if armed { "ARMED 🛡️" } else { "OFF" }
+        );
+
+        serde_json::json!({
+            "text": text,
+            "alt": "disconnected",
+            "tooltip": tooltip,
+            "class": ["disconnected", shield_class],
+            "connected": false,
+            "mode": mode.as_str(),
+            "shield": armed,
+        })
+    }
+}
+
+pub fn format_status_error_json(err: &str) -> serde_json::Value {
+    serde_json::json!({
+        "text": "vortex ?",
+        "class": ["error"],
+        "tooltip": escape_pango(err),
+    })
+}
+
 fn handle_status(args: &[String]) -> Result<()> {
     let json_mode = args
         .iter()
         .any(|a| a == "--json" || a == "--waybar" || a == "-j");
+
+    if json_mode {
+        let res = (|| -> Result<()> {
+            let daemon_status = if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::GetStatus) {
+                    Ok(IpcResponse::Status(st)) => Some(st),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let cur_mode = daemon_status
+                .as_ref()
+                .map(|st| st.mode)
+                .unwrap_or_else(storage::get_mode_preference);
+
+            let (connected, name, kind_tag, server, uptime_secs, armed) =
+                if let Some(st) = &daemon_status {
+                    let (name, kind_tag) = if let Some(p) = &st.active_profile {
+                        (p.name.clone(), p.kind.tag().to_string())
+                    } else if let Some(s) = tunnel::load_session() {
+                        (s.name, s.kind.tag().to_string())
+                    } else {
+                        ("Connected".to_string(), "".to_string())
+                    };
+                    let srv = st.server_endpoint.clone().unwrap_or_default();
+                    (
+                        st.connected,
+                        name,
+                        kind_tag,
+                        srv,
+                        st.uptime_secs,
+                        st.shield_armed,
+                    )
+                } else {
+                    let sess = tunnel::load_session();
+                    let armed = shield::is_armed();
+                    match sess {
+                        Some(s) => {
+                            let up = tunnel::now().saturating_sub(s.since);
+                            (
+                                true,
+                                s.name,
+                                s.kind.tag().to_string(),
+                                s.server,
+                                up,
+                                armed,
+                            )
+                        }
+                        None => (
+                            false,
+                            String::new(),
+                            String::new(),
+                            String::new(),
+                            0,
+                            armed,
+                        ),
+                    }
+                };
+
+            let json = format_status_json(
+                connected,
+                &name,
+                &kind_tag,
+                &server,
+                uptime_secs,
+                armed,
+                cur_mode,
+            );
+            println!("{}", serde_json::to_string(&json)?);
+            Ok(())
+        })();
+
+        if let Err(e) = res {
+            let err_json = format_status_error_json(&e.to_string());
+            println!(
+                "{}",
+                serde_json::to_string(&err_json).unwrap_or_else(|_| {
+                    "{\"class\":[\"error\"],\"text\":\"vortex ?\",\"tooltip\":\"error\"}".to_string()
+                })
+            );
+        }
+        return Ok(());
+    }
 
     let daemon_status = if let Some(client) = get_ipc() {
         match client.request_sync(&IpcRequest::GetStatus) {
@@ -927,70 +1106,6 @@ fn handle_status(args: &[String]) -> Result<()> {
                 ),
             }
         };
-
-    if json_mode {
-        let shield_class = if armed { "shield-armed" } else { "shield-off" };
-        if connected {
-            let uptime_fmt = if uptime_secs < 60 {
-                format!("{uptime_secs}s")
-            } else if uptime_secs < 3600 {
-                format!("{}m {}s", uptime_secs / 60, uptime_secs % 60)
-            } else {
-                format!("{}h {}m", uptime_secs / 3600, (uptime_secs % 3600) / 60)
-            };
-
-            let class = format!("connected {shield_class}");
-            let text = format_node_with_flag(&name, 16);
-            let tooltip = format!(
-                "<b>Vortex VPN & Proxy</b>\n<b>Mode:</b> {}\n<b>Status:</b> Connected\n<b>Node:</b> {} ({})\n<b>Endpoint:</b> {}\n<b>Shield:</b> {}\n<b>Uptime:</b> {}\n<i>Left-click: toggle · Right-click: menu</i>",
-                cur_mode.display_name(),
-                name,
-                kind_tag,
-                server,
-                if armed { "ARMED 🛡️" } else { "OFF" },
-                uptime_fmt
-            );
-
-            let json = serde_json::json!({
-                "text": text,
-                "alt": "connected",
-                "tooltip": tooltip,
-                "class": class,
-                "connected": true,
-                "mode": cur_mode.as_str(),
-                "node": name,
-                "protocol": kind_tag,
-                "server": server,
-                "shield": armed,
-                "uptime_secs": uptime_secs,
-            });
-            println!("{}", serde_json::to_string(&json)?);
-        } else {
-            let class = format!("disconnected {shield_class}");
-            let text = if armed {
-                "󰌙 Off 🛡️"
-            } else {
-                "󰌙 Off"
-            };
-            let tooltip = format!(
-                "<b>Vortex VPN & Proxy</b>\n<b>Mode:</b> {}\n<b>Status:</b> Disconnected\n<b>Shield:</b> {}\n<i>Left-click: connect · Right-click: menu</i>",
-                cur_mode.display_name(),
-                if armed { "ARMED 🛡️" } else { "OFF" }
-            );
-
-            let json = serde_json::json!({
-                "text": text,
-                "alt": "disconnected",
-                "tooltip": tooltip,
-                "class": class,
-                "connected": false,
-                "mode": cur_mode.as_str(),
-                "shield": armed,
-            });
-            println!("{}", serde_json::to_string(&json)?);
-        }
-        return Ok(());
-    }
 
     let daemon_str = if is_daemon {
         "\x1b[1;32mvortexd active\x1b[0m"
@@ -1208,6 +1323,19 @@ fn handle_pick(args: &[String]) -> Result<()> {
             return connect_profile(&p);
         }
         return Ok(());
+    }
+
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        if get_ipc().is_none() {
+            send_notification(
+                "Vortex",
+                "start vortexd: systemctl --user enable --now vortexd",
+                Some("dialog-error"),
+            );
+            bail!("start vortexd: systemctl --user enable --now vortexd");
+        }
+        bail!("no desktop menu launcher found and stdin is not a TTY");
     }
 
     println!("\x1b[1;36m◈ 0xSELECT // PICK EGRESS NODE\x1b[0m");
@@ -1904,8 +2032,65 @@ fn handle_update() -> Result<()> {
 }
 
 fn handle_shield(args: &[String]) -> Result<()> {
-    let sub = args.get(1).map(String::as_str).unwrap_or("status");
+    use std::io::IsTerminal;
+    let sub = args.get(1).map(String::as_str).unwrap_or_else(|| {
+        if !std::io::stdin().is_terminal() {
+            "toggle"
+        } else {
+            "status"
+        }
+    });
     match sub {
+        "toggle" => {
+            if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::ToggleShield { enable: None })? {
+                    IpcResponse::Status(st) => {
+                        let armed = st.shield_armed;
+                        println!(
+                            "shield: {}",
+                            if armed {
+                                "\x1b[1;32m[ARMED]\x1b[0m stealth kill-switch active"
+                            } else {
+                                "\x1b[1;33m[OFF]\x1b[0m stealth kill-switch disarmed"
+                            }
+                        );
+                        send_notification(
+                            "Vortex Shield",
+                            if armed {
+                                "Kill-switch armed"
+                            } else {
+                                "Kill-switch disarmed"
+                            },
+                            Some(if armed {
+                                "security-high"
+                            } else {
+                                "security-medium"
+                            }),
+                        );
+                        return Ok(());
+                    }
+                    IpcResponse::Error(e) => bail!("Shield toggle error: {e}"),
+                    _ => {}
+                }
+            }
+            if unsafe { libc::geteuid() } != 0 {
+                return reexec_sudo(args);
+            }
+            let is_armed = shield::is_armed();
+            if is_armed {
+                shield::set_enabled_preference(false);
+                shield::disarm()?;
+                println!("\x1b[1;33m○ Stealth Shield DISARMED // Firewall rules cleared\x1b[0m");
+            } else {
+                let sess = tunnel::load_session();
+                let iface = sess.as_ref().map(|s| s.iface.as_str());
+                let srv = sess.as_ref().map(|s| s.server.as_str());
+                shield::set_enabled_preference(true);
+                shield::arm(iface, srv)?;
+                println!("\x1b[1;32m✔ Stealth Shield ARMED // Zero-leak killswitch engaged\x1b[0m");
+            }
+            Ok(())
+        }
         "on" | "enable" | "arm" => {
             if let Some(client) = get_ipc() {
                 match client.request_sync(&IpcRequest::ToggleShield { enable: Some(true) })? {
@@ -2398,13 +2583,7 @@ fn main() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 && !storage::get_mode_preference().is_proxy() {
         match args.first().map(String::as_str) {
             None | Some("up") | Some("best") | Some("auth") => {
-                let exe = std::env::current_exe()?;
-                let err = Command::new("sudo")
-                    .arg("--preserve-env=WAYLAND_DISPLAY,XDG_RUNTIME_DIR,TERM,COLORTERM,LANG")
-                    .arg(exe)
-                    .args(&args)
-                    .exec();
-                bail!("could not run sudo: {err}");
+                return reexec_sudo(&args);
             }
             Some(x) => bail!("unknown command '{x}' — try `vortex --help`"),
         }
@@ -2968,5 +3147,74 @@ mod tests {
             format_node_with_flag("Frankfurt Fast", 20),
             "🇩🇪 Frankfurt Fast"
         );
+    }
+
+    #[test]
+    fn test_status_json_waybar_format() {
+        let node_name = "A & <B>";
+        let val = format_status_json(
+            true,
+            node_name,
+            "vless",
+            "1.2.3.4:443",
+            120,
+            true,
+            OperationalMode::Tunnel,
+        );
+
+        let json_str = serde_json::to_string(&val).expect("must be valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("must parse back");
+
+        // 1. class is an array of strings
+        let class = parsed["class"].as_array().expect("class must be a JSON array");
+        assert_eq!(
+            class,
+            serde_json::json!(["connected", "shield-armed"]).as_array().unwrap()
+        );
+
+        // 2. text and tooltip contain no raw & or < from node names
+        let text = parsed["text"].as_str().expect("text must be string");
+        let tooltip = parsed["tooltip"].as_str().expect("tooltip must be string");
+
+        assert!(text.contains("A &amp; &lt;B&gt;"));
+        assert!(!text.contains("A & <B>"));
+        assert!(!text.contains('<'));
+
+        assert!(tooltip.contains("A &amp; &lt;B&gt;"));
+        assert!(!tooltip.contains("A & <B>"));
+        assert!(tooltip.contains("<b>Vortex VPN &amp; Proxy</b>"));
+
+        // Verify no raw & in text
+        for part in text.split('&').skip(1) {
+            assert!(part.starts_with("amp;") || part.starts_with("lt;") || part.starts_with("gt;"));
+        }
+
+        // Test disconnected
+        let disc_val = format_status_json(
+            false,
+            "",
+            "",
+            "",
+            0,
+            false,
+            OperationalMode::Proxy,
+        );
+        let disc_parsed: serde_json::Value = serde_json::from_str(&disc_val.to_string()).unwrap();
+        assert_eq!(
+            disc_parsed["class"].as_array().unwrap(),
+            serde_json::json!(["disconnected", "shield-off"]).as_array().unwrap()
+        );
+
+        // Test error format
+        let err_val = format_status_error_json("internal error: connection to <daemon> & socket failed");
+        let err_parsed: serde_json::Value = serde_json::from_str(&err_val.to_string()).unwrap();
+        assert_eq!(
+            err_parsed["class"].as_array().unwrap(),
+            serde_json::json!(["error"]).as_array().unwrap()
+        );
+        assert_eq!(err_parsed["text"], "vortex ?");
+        let err_tip = err_parsed["tooltip"].as_str().unwrap();
+        assert!(err_tip.contains("&lt;daemon&gt; &amp; socket failed"));
+        assert!(!err_tip.contains('<'));
     }
 }

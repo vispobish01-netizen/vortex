@@ -26,50 +26,61 @@ systemctl --user enable --now vortexd.service
 
 Vortex outputs native Waybar-compatible JSON with `vortex status --json` (or `vortex status --waybar`).
 
-### Waybar Configuration (`~/.config/waybar/config.jsonc`)
+### Quick Setup Steps
+1. **Ensure `vortexd` user service is running:**
+   ```bash
+   systemctl --user enable --now vortexd
+   ```
+2. **Add `"custom/vortex"` to `modules-right`** (or `modules-left`) in `~/.config/waybar/config.jsonc`:
+   ```jsonc
+   "modules-right": [
+       // ... existing modules
+       "custom/vortex"
+   ],
+   ```
+3. **Add the module configuration** to `~/.config/waybar/config.jsonc`:
+   ```jsonc
+   "custom/vortex": {
+       "format": "{}",
+       "return-type": "json",
+       "interval": 2,
+       "exec": "vortex status --json",
+       "on-click": "vortex toggle",
+       "on-click-right": "vortex pick",
+       "tooltip": true
+   }
+   ```
+4. **Add the styling from `packaging/waybar/style.css`** to `~/.config/waybar/style.css`:
+   ```css
+   #custom-vortex {
+       padding: 0 10px;
+       margin: 0 4px;
+       font-weight: bold;
+       border-radius: 6px;
+       transition: all 0.2s ease-in-out;
+   }
 
-Add `"custom/vortex"` to your `modules-right` or `modules-left` array:
+   #custom-vortex.connected {
+       color: #00ffcc;
+       background: rgba(0, 240, 255, 0.12);
+       border: 1px solid rgba(0, 240, 255, 0.35);
+   }
 
-```jsonc
-"custom/vortex": {
-    "format": "{}",
-    "return-type": "json",
-    "interval": 2,
-    "exec": "vortex status --json",
-    "on-click": "vortex toggle",
-    "on-click-right": "vortex pick",
-    "tooltip": true
-}
-```
+   #custom-vortex.connected.shield-armed {
+       border-bottom: 2px solid #00f0ff;
+       box-shadow: 0 0 8px rgba(0, 240, 255, 0.25);
+   }
 
-### Waybar Stylesheet (`~/.config/waybar/style.css`)
-
-```css
-#custom-vortex {
-    padding: 0 10px;
-    margin: 0 4px;
-    font-weight: bold;
-    border-radius: 6px;
-    transition: all 0.2s ease-in-out;
-}
-
-#custom-vortex.connected {
-    color: #00ffcc;
-    background: rgba(0, 240, 255, 0.12);
-    border: 1px solid rgba(0, 240, 255, 0.35);
-}
-
-#custom-vortex.connected.shield-armed {
-    border-bottom: 2px solid #00f0ff;
-    box-shadow: 0 0 8px rgba(0, 240, 255, 0.25);
-}
-
-#custom-vortex.disconnected {
-    color: #608a8e;
-    background: rgba(22, 61, 68, 0.25);
-    border: 1px solid rgba(96, 138, 142, 0.2);
-}
-```
+   #custom-vortex.disconnected {
+       color: #608a8e;
+       background: rgba(22, 61, 68, 0.25);
+       border: 1px solid rgba(96, 138, 142, 0.2);
+   }
+   ```
+5. **Restart Waybar** to apply the configuration:
+   ```bash
+   omarchy-restart-waybar || pkill -SIGUSR2 waybar
+   ```
 
 ---
 
