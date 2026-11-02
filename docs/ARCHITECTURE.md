@@ -6,24 +6,21 @@ Vortex is a terminal VPN and proxy manager engineered for Linux systems (specifi
 
 ## 1. High-Level Workspace Architecture
 
-The system is organized as a Cargo workspace with four distinct crates:
+The system is organized as a Cargo workspace with three crates:
 
 ```mermaid
 graph TD
-    User([User / Shell]) --> CLI[vortex CLI (clap)]
-    User --> TUI[vortex-tui (ratatui)]
+    User([User / Shell]) --> Client[vortex CLI & TUI (clap / ratatui)]
     
     subgraph "Unprivileged Client Domain"
-        CLI
-        TUI
+        Client
     end
     
     subgraph "Inter-Process Communication"
         UDS["/run/vortex/vortex.sock<br/>Mode: 0660 (Group: vortex)<br/>JSON-RPC Frame Protocol"]
     end
     
-    CLI <-->|UDS Requests / Events| UDS
-    TUI <-->|UDS Requests / Events| UDS
+    Client <-->|UDS Requests / Events| UDS
     
     subgraph "Privileged System Daemon (vortexd)"
         UDS <--> IPC[IPC Server & Dispatcher]
@@ -51,8 +48,7 @@ graph TD
         CryptoStorage["Encrypted Storage (age / Argon2id)"]
     end
 
-    CLI -.-> CoreTypes
-    TUI -.-> CoreTypes
+    Client -.-> CoreTypes
     vortexd -.-> CoreTypes
 ```
 
@@ -80,29 +76,11 @@ graph TD
   - Manages the privileged Unix domain socket at `/run/vortex/vortex.sock` (mode `0660`, owned by group `vortex`).
   - Safely monitors background backend processes and handles clean exit hooks (SIGTERM/SIGINT) to prevent network blackholes.
 
-### `vortex` (CLI)
-- **Purpose**: Command-line interface for scripting, system automation, and direct operations.
-- **Subcommands**:
-  - `add` / `import`: Ingests links, QR codes, or configuration files.
-  - `list`: Lists stored and imported profiles.
-  - `connect` / `up`, `disconnect` / `down`: Activates or deactivates tunnels.
-  - `status`: Displays daemon and connection status.
-  - `test` / `ping`: Runs multi-layer latency and handshake probes.
-  - `kill-switch` / `shield`: Controls the nftables kill-switch.
-  - `routes` / `route`: Configures split tunneling and bypass policies.
-  - `export`: Exports configs to file or terminal.
-  - `doctor`: Comprehensive system diagnostic tool.
-  - `completion`: Shell completion generation for bash, zsh, and fish.
-
-### `vortex-tui`
-- **Purpose**: Interactive, terminal user interface built with `ratatui`.
-- **Constraint**: Pure client of `vortexd` — never manipulates network interfaces, firewall tables, or routes directly. Communicates exclusively over IPC.
-- **Views**:
-  - **Dashboard**: Live traffic charts, connection state, egress IP, country, latency.
-  - **Servers**: Server list grouped by tags and latency, fuzzy search and filtering.
-  - **Routes**: Dynamic split tunneling, bypass rules, and active socket flows.
-  - **Logs**: Real-time event and error logs.
-  - **Settings**: Protocol preferences, DNS fallback, theme selection (Omarchy integration).
+### `vortex` (CLI & Interactive TUI)
+- **Purpose**: Combined command-line interface and full-screen terminal user interface (`ratatui`).
+- **Modes**:
+  - **CLI Subcommands**: Scripting and automation (`add`, `list`, `up`, `down`, `toggle`, `status`, `pick`, `shield`, `route`, `ping`, `doctor`, `completion`, etc.).
+  - **Interactive TUI**: When invoked with no subcommand (`vortex`), launches the interactive full-screen dashboard with Omarchy theme detection, live telemetry, spectrum charts, active socket flows, subscription management, and node switching. Communicates with `vortexd` over IPC.
 
 ---
 

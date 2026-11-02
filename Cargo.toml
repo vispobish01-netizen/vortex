@@ -3,13 +3,11 @@ members = [
     "crates/vortex-core",
     "crates/vortexd",
     "crates/vortex",
-    "crates/vortex-tui",
 ]
 default-members = [
     "crates/vortex-core",
     "crates/vortexd",
     "crates/vortex",
-    "crates/vortex-tui",
 ]
 resolver = "2"
 

@@ -32,7 +32,7 @@ Vortex is designed to operate safely in adversarial environments characterized b
 - Private keys and passwords are wiped immediately after handshake initialization.
 
 ### 2.3 Privilege Separation & Capability Bounding
-- Unprivileged clients (`vortex`, `vortex-tui`) have **zero** network administration privileges. They interact with `vortexd` strictly via a Unix domain socket at `/run/vortex/vortex.sock`.
+- The unprivileged client (`vortex`) has **zero** network administration privileges. It interacts with `vortexd` strictly via a Unix domain socket at `/run/vortex/vortex.sock`.
 - The Unix domain socket permissions are enforced at `0660` owned by group `vortex` (or `0600` for user fallback).
 - Systemd service hardening for `vortexd.service`:
   ```ini

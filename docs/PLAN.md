@@ -2,7 +2,7 @@
 
 **Version:** 1.0.0  
 **Project:** Vortex VPN & Proxy Terminal Manager (Linux / Omarchy / Arch)  
-**Workspace:** `vortex-core`, `vortexd`, `vortex` (CLI), `vortex-tui`  
+**Workspace:** `vortex-core`, `vortexd`, `vortex`
 
 ---
 
@@ -11,8 +11,7 @@
 Vortex is a terminal VPN/proxy manager designed for Linux environments. The codebase features a Cargo workspace composed of:
 1. `vortex-core`: Core data models, serialization, error types (`thiserror`), IPC protocols (`serde`), cryptographic storage (`age` / `argon2id` / `keyring`), link and QR parsing, multi-layer probing, `nftables` leak protection, and protocol backends implementing the `Backend` trait.
 2. `vortexd`: Privileged background daemon executing with minimal capabilities, managing core lifecycles, routing, failover, and metrics. Exposes a versioned JSON-RPC Unix domain socket (`/run/vortex/vortex.sock`).
-3. `vortex`: Full-featured `clap`-based CLI exposing subcommands (`add`/`import`, `list`, `connect`, `disconnect`, `status`, `test`, `kill-switch`, `routes`, `export`, `doctor`, etc.).
-4. `vortex-tui`: Terminal client (`ratatui`) communicating strictly with `vortexd` via IPC; never touches the network stack directly. Includes Omarchy theme detection and fallback dark teal/purple palette.
+3. `vortex`: Unified client binary providing full-featured CLI subcommands and a rich interactive TUI (`ratatui`) communicating strictly with `vortexd` via IPC; never touches the network stack directly. Includes Omarchy theme detection and fallback dark teal/purple palette.
 
 ---
 
@@ -20,7 +19,7 @@ Vortex is a terminal VPN/proxy manager designed for Linux environments. The code
 
 | Section | Feature Area | Description & Status | Target File(s) |
 |---|---|---|---|
-| **§ 1** | Workspace Architecture | Workspace crates (`vortex-core`, `vortexd`, `vortex`, `vortex-tui`), systemd service, Unix socket at `/run/vortex/vortex.sock` (0660 group vortex), versioned JSON-RPC protocol | `crates/vortex-core/src/ipc.rs`, `crates/vortexd/src/main.rs`, `packaging/vortexd.service` |
+| **§ 1** | Workspace Architecture | Workspace crates (`vortex-core`, `vortexd`, `vortex`), systemd service, Unix socket at `/run/vortex/vortex.sock` (0660 group vortex), versioned JSON-RPC protocol | `crates/vortex-core/src/ipc.rs`, `crates/vortexd/src/main.rs`, `packaging/vortexd.service` |
 | **§ 2** | Protocol Backends (`trait Backend`) | Common trait (`start`, `stop`, `status`, `stats`/`query_traffic`, `validate_config`). Isolated backends: Xray-core (VLESS, VMess, Trojan, SS), WireGuard (netlink/wg-quick), OpenVPN (subprocess/management), Hysteria2 (native/subprocess), Amnezia (AWG) | `crates/vortex-core/src/backend.rs`, `crates/vortex-core/src/xray/`, `crates/vortex-core/src/backends/` |
 | **§ 3** | Config Import | Parsers for share links (`vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://`, `.conf`, `.ovpn`), subscriptions, clipboard, QR images (`rqrr`). Dedupe, name, tag, group. | `crates/vortex-core/src/parser.rs`, `crates/vortex-core/src/storage.rs` |
 | **§ 4** | Whole-system Tunnel | Transparent tunnel via TUN / policy routing, DNS leak prevention, IPv6 isolation, server IP bypass, clean teardown on SIGTERM/crash. | `crates/vortex-core/src/tunnel.rs`, `crates/vortex-core/src/routing.rs` |

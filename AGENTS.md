@@ -7,6 +7,6 @@
 - Never ask clarifying or confirmation questions unless a destructive, irreversible action is required.
 
 ## 2. Engineering Standards
-- Maintain high-performance, asynchronous Rust paradigms across `vortex-core`, `vortexd`, and `vortex-tui`.
+- Maintain high-performance, asynchronous Rust paradigms across `vortex-core`, `vortexd`, and `vortex`.
 - Ensure zero packet/DNS leakage under all failure scenarios via `nftables` and local resolvers.
 - Keep CLI and TUI lightweight, responsive, and ergonomic.

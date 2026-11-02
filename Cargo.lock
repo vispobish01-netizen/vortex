@@ -3619,8 +3619,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
  "vortex-core",
 ]
 
@@ -3651,28 +3649,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "vortex-tui"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "ratatui",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vortex-core",
-]
-
-[[package]]
 name = "vortexd"
 version = "0.3.0"
 dependencies = [
  "anyhow",
  "libc",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
