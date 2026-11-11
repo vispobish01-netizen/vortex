@@ -8,9 +8,9 @@ pub mod theme;
 #[cfg(test)]
 mod tests;
 
-pub use event_loop::{run, App, SortMode, TransportFilter};
 #[cfg(test)]
 pub(crate) use event_loop::draw;
+pub use event_loop::{run, App, SortMode, TransportFilter};
 pub(crate) use flows::*;
 pub(crate) use matrix::*;
 pub(crate) use modals::*;

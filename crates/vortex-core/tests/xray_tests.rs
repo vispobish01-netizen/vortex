@@ -320,3 +320,127 @@ exit 0
     // Clean up
     let _ = fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn test_throne_bridge_xray_and_singbox_configs_validate_with_real_binaries() {
+    use vortex_core::backend::Backend;
+    use vortex_core::backends::SingBoxBackend;
+    use vortex_core::model::{CoreEngine, Kind, Profile, ProfilePayloadKind, Transport};
+    use vortex_core::privilege::resolve_singbox_binary;
+    use vortex_core::xray::config::generate_xray_bridge_config;
+    use vortex_core::xray::install::resolve_xray_binary;
+
+    let tmp_dir = std::env::temp_dir().join(format!("vortex_bridge_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    // 1. CustomConfig with fragment + dialerProxy chain
+    let custom_xray = r#"{
+        "inbounds": [{"port": 10808, "listen": "127.0.0.1", "protocol": "socks"}],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "198.51.100.10", "port": 443, "users": [{"id": "b6a03649-61f4-41aa-a51b-402c3cc6c547", "encryption": "none"}]}]},
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "reality",
+                    "realitySettings": {"serverName": "example.com", "fingerprint": "chrome", "publicKey": "1111222233334444555566667777888899990000111", "shortId": "1234"},
+                    "sockopt": {"dialerProxy": "frag"}
+                }
+            },
+            {
+                "tag": "frag",
+                "protocol": "freedom",
+                "settings": {"fragment": {"packets": "tlshello", "length": "100-200", "interval": "10-20"}}
+            }
+        ],
+        "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"}]}
+    }"#;
+
+    let mut p = Profile::new(
+        "bridge-custom",
+        "Bridge Custom",
+        Kind::Xray,
+        "198.51.100.10:443",
+        custom_xray,
+    );
+    p.engine = CoreEngine::Xray;
+    p.payload_kind = ProfilePayloadKind::CustomConfig;
+
+    let bridge_cfg = generate_xray_bridge_config(&p, 20808, 20809, None, Some("lo")).unwrap();
+    assert_eq!(bridge_cfg["inbounds"][0]["tag"], "vortex-bridge-in");
+    assert_eq!(bridge_cfg["inbounds"][0]["port"], 20808);
+    assert_eq!(bridge_cfg["inbounds"][1]["tag"], "api-in");
+    assert_eq!(
+        bridge_cfg["outbounds"][0]["streamSettings"]["sockopt"]["dialerProxy"],
+        "frag"
+    );
+    assert!(
+        bridge_cfg["outbounds"][0]["streamSettings"]["sockopt"]
+            .get("interface")
+            .is_none(),
+        "dialerProxy hop must not have interface bound directly"
+    );
+    assert_eq!(
+        bridge_cfg["outbounds"][1]["streamSettings"]["sockopt"]["interface"],
+        "lo"
+    );
+
+    if let Ok(xray_bin) = resolve_xray_binary() {
+        let p_xray = tmp_dir.join("xray_bridge.json");
+        fs::write(&p_xray, serde_json::to_string_pretty(&bridge_cfg).unwrap()).unwrap();
+        validate_xray_config_file(&xray_bin, &p_xray).unwrap();
+
+        // Also validate PQ XDrive VLESS config against real Xray binary
+        let pq_uri = "vless://b6a03649-61f4-41aa-a51b-402c3cc6c547@198.51.100.20:443?type=xdrive&encryption=mlkem768x25519plus.native.0rtt.LVtlu3hiYcMGgbA-SU19PvPMMzNHWW_knxo1c0AkxU8#PQ";
+        let mut pq_p = Profile::new(
+            "pq-xdrive",
+            "PQ XDrive",
+            Kind::Vless,
+            "198.51.100.20:443",
+            pq_uri,
+        );
+        pq_p.transport = Transport::Xdrive;
+        let pq_cfg = generate_xray_bridge_config(&pq_p, 20810, 20811, None, None).unwrap();
+        let p_pq = tmp_dir.join("xray_pq.json");
+        fs::write(&p_pq, serde_json::to_string_pretty(&pq_cfg).unwrap()).unwrap();
+        validate_xray_config_file(&xray_bin, &p_pq).unwrap();
+    }
+
+    if resolve_singbox_binary().is_some() {
+        let sb_cfg = SingBoxBackend::build_config_with_outbound(
+            serde_json::json!({
+                "type": "socks",
+                "tag": "proxy",
+                "server": "127.0.0.1",
+                "server_port": 20808
+            }),
+            &["198.51.100.10".to_string()],
+            &["198.51.100.10/32".to_string()],
+            &tmp_dir.join("core.log"),
+            false,
+        );
+        let sb_str = serde_json::to_string_pretty(&sb_cfg).unwrap();
+        SingBoxBackend::new().validate_config(&sb_str).unwrap();
+    }
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_hysteria2_resolves_to_hysteria2_and_rejected_by_xray() {
+    use vortex_core::backend::resolve_backend;
+    use vortex_core::model::{Kind, Profile};
+    use vortex_core::xray::config::generate_xray_outbound;
+
+    let p = Profile::new(
+        "hy2-node",
+        "Hy2 Node",
+        Kind::Hy2,
+        "1.2.3.4:443",
+        "hy2://secret@1.2.3.4:443#Hy2",
+    );
+    assert_eq!(resolve_backend(&p).name(), "hysteria2");
+    assert!(generate_xray_outbound(&p).is_err());
+}

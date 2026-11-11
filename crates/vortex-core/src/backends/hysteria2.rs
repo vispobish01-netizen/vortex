@@ -1,15 +1,15 @@
 use crate::backend::Backend;
+use crate::backends::singbox::SingBoxBackend;
 use crate::model::Profile;
-use crate::tunnel::{bytes, now, Session};
+use crate::tunnel::{
+    bytes, have, kill_pid, now, spawn_detached_with_log, write_secret_path, Session,
+};
 use anyhow::{bail, Result};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::Duration;
+use std::process::Command;
 
-/// Hysteria2 backend using hysteria client binary or sing-box/xray engine.
+/// Hysteria2 backend delegating share URIs / JSON to `SingBoxBackend`, or native `hysteria` for YAML configs.
 pub struct Hysteria2Backend;
 
 impl Hysteria2Backend {
@@ -18,28 +18,7 @@ impl Hysteria2Backend {
     }
 
     fn have_hy2(&self) -> bool {
-        ["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"]
-            .iter()
-            .any(|d| Path::new(d).join("hysteria").is_file())
-    }
-
-    fn is_alive(pid: u32) -> bool {
-        Path::new(&format!("/proc/{pid}")).exists()
-    }
-
-    fn kill_process(pid: u32) {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-        for _ in 0..20 {
-            if !Self::is_alive(pid) {
-                return;
-            }
-            sleep(Duration::from_millis(50));
-        }
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
+        have("hysteria")
     }
 }
 
@@ -55,29 +34,29 @@ impl Backend for Hysteria2Backend {
     }
 
     fn is_available(&self) -> bool {
-        self.have_hy2()
-            || crate::xray::resolve_xray_binary().is_ok()
-            || crate::privilege::resolve_singbox_binary().is_some()
+        self.have_hy2() || SingBoxBackend::new().is_available()
     }
 
     fn version(&self) -> Option<String> {
         if let Ok(out) = Command::new("hysteria").arg("version").output() {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout);
-                return s.lines().next().map(String::from);
+                return s.lines().next().map(|l| l.trim().to_string());
             }
         }
-        crate::xray::active_xray_version()
+        SingBoxBackend::new().version()
     }
 
     fn validate_config(&self, config_content: &str) -> Result<()> {
-        if config_content.trim().is_empty() {
+        let trimmed = config_content.trim();
+        if trimmed.is_empty() {
             bail!("Hysteria2 configuration cannot be empty");
         }
-        if !config_content.starts_with("hy2://")
-            && !config_content.starts_with("hysteria2://")
-            && !config_content.contains("server:")
-            && !config_content.contains("\"server\"")
+        if !trimmed.starts_with("hy2://")
+            && !trimmed.starts_with("hysteria2://")
+            && !trimmed.contains("server:")
+            && !trimmed.contains("\"server\"")
+            && !trimmed.starts_with('{')
         {
             bail!("Invalid Hysteria2 configuration syntax");
         }
@@ -87,29 +66,20 @@ impl Backend for Hysteria2Backend {
     fn start(&self, profile: &Profile, runtime_dir: &Path) -> Result<Session> {
         self.validate_config(&profile.data)?;
 
-        // If Xray-core is available and profile is hy2 share link, drive via XrayBackend
-        if crate::xray::resolve_xray_binary().is_ok() {
-            let xray = crate::xray::XrayBackend::new();
-            return xray.start(profile, runtime_dir);
-        }
+        let trimmed = profile.data.trim();
+        let is_yaml = !trimmed.starts_with("hy2://")
+            && !trimmed.starts_with("hysteria2://")
+            && !trimmed.starts_with('{');
 
-        // Native hysteria client fallback
-        if self.have_hy2() {
+        if is_yaml && self.have_hy2() {
             let conf_path = runtime_dir.join("hy2.yaml");
             let log_path = runtime_dir.join("core.log");
 
-            fs::write(&conf_path, &profile.data)?;
-            let _ = fs::set_permissions(&conf_path, fs::Permissions::from_mode(0o600));
-
+            write_secret_path(&conf_path, trimmed)?;
             let log_file = fs::File::create(&log_path)?;
             let mut cmd = Command::new("hysteria");
-            cmd.args(["client", "-c", conf_path.to_str().unwrap()]);
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::from(log_file.try_clone()?))
-                .stderr(Stdio::from(log_file));
-
-            let child = cmd.spawn()?;
-            let pid = child.id();
+            cmd.args(["client", "-c", &conf_path.to_string_lossy()]);
+            let pid = spawn_detached_with_log(&mut cmd, log_file)?;
 
             return Ok(Session {
                 id: profile.id.clone(),
@@ -118,17 +88,29 @@ impl Backend for Hysteria2Backend {
                 server: profile.server.clone(),
                 iface: "vx0".into(),
                 pid: Some(pid),
+                sidecar_pid: None,
+                backend: Some("hysteria2".to_string()),
                 since: now(),
                 conf: conf_path.to_string_lossy().to_string(),
             });
         }
 
-        bail!("Neither hysteria client nor Xray/sing-box cores are available for Hysteria2")
+        if SingBoxBackend::new().is_available() {
+            return SingBoxBackend::new().start(profile, runtime_dir);
+        }
+
+        bail!(
+            "Hysteria2 requires either `sing-box` (recommended) or native `hysteria` client binary"
+        )
     }
 
     fn stop(&self, session: &Session) -> Result<()> {
+        if session.backend.as_deref() == Some("sing-box") || session.conf.ends_with("singbox.json")
+        {
+            return SingBoxBackend::new().stop(session);
+        }
         if let Some(pid) = session.pid {
-            Self::kill_process(pid);
+            kill_pid(pid);
         }
         let _ = fs::remove_file(&session.conf);
         Ok(())

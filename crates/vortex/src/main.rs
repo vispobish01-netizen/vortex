@@ -102,17 +102,20 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    // Direct mode fallback: requires root for modifying tunnels/firewall (bypassed in Proxy Mode)
-    if unsafe { libc::geteuid() } != 0 && !storage::get_mode_preference().is_proxy() {
-        match args.first().map(String::as_str) {
-            None => return reexec_sudo(&args),
-            Some(x) => bail!("unknown command '{x}' — try `vortex --help`"),
-        }
-    }
-
-    store::ensure_dirs()?;
     match args.first().map(String::as_str) {
-        None => ui::run(),
+        None => {
+            if unsafe { libc::geteuid() } != 0
+                && !storage::get_mode_preference().is_proxy()
+                && cli::get_ipc().is_none()
+            {
+                let preflight = vortex_core::privilege::run_preflight_check();
+                if !preflight.singbox_has_caps && !preflight.xray_has_caps {
+                    return reexec_sudo(&args);
+                }
+            }
+            store::ensure_dirs()?;
+            ui::run()
+        }
         Some(x) => bail!("unknown command '{x}' — try `vortex --help`"),
     }
 }

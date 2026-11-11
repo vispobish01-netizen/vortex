@@ -1,6 +1,6 @@
-use crate::model::{Kind, Profile, Security, Transport};
+use crate::model::{Kind, Profile, ProfilePayloadKind, Security, Transport};
+use crate::routing::RulesConfig;
 use crate::shield::{parse_endpoint, resolve_server_ips};
-use crate::tunnel::load_routing;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::net::IpAddr;
@@ -10,24 +10,76 @@ use std::process::Command;
 pub const DEFAULT_XRAY_TUN_IFACE: &str = "vx0";
 pub const DEFAULT_XRAY_PROXY_PORT: u16 = 1080;
 
+/// Extracts server host/IP strings embedded in an Xray JSON config or outbound.
+pub fn extract_xray_outbound_hosts(val: &Value) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let mut collect_ob = |ob: &Value| {
+        let proto = ob
+            .get("protocol")
+            .and_then(|p| p.as_str())
+            .unwrap_or_default();
+        if matches!(proto, "freedom" | "blackhole" | "dns" | "loopback") {
+            return;
+        }
+        if let Some(addr) = ob["settings"]["vnext"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v["address"].as_str())
+            .or_else(|| {
+                ob["settings"]["servers"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|s| s["address"].as_str())
+            })
+            .or_else(|| ob["settings"]["address"].as_str())
+        {
+            let trimmed = addr.trim();
+            if !trimmed.is_empty() && !hosts.iter().any(|h| h == trimmed) {
+                hosts.push(trimmed.to_string());
+            }
+        }
+    };
+
+    if let Some(arr) = val.get("outbounds").and_then(|o| o.as_array()) {
+        for ob in arr {
+            collect_ob(ob);
+        }
+    } else {
+        collect_ob(val);
+    }
+    hosts
+}
+
+fn extract_primary_xray_outbound(val: &Value) -> Option<Value> {
+    if let Some(arr) = val.get("outbounds").and_then(|a| a.as_array()) {
+        let chosen = arr
+            .iter()
+            .find(|ob| {
+                let proto = ob
+                    .get("protocol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                !proto.is_empty() && !matches!(proto, "freedom" | "blackhole" | "dns" | "loopback")
+            })
+            .or_else(|| arr.first())
+            .cloned();
+        return chosen;
+    }
+    if val.get("protocol").is_some() || val.get("type").is_some() {
+        return Some(val.clone());
+    }
+    None
+}
+
 /// Generates valid Xray outbound settings for a Profile
 pub fn generate_xray_outbound(p: &Profile) -> Result<Value> {
     let trimmed_data = p.data.trim();
-    // Check if profile data is already a complete or partial Xray JSON outbound
+    // Preserve custom Xray outbound / config JSON losslessly when present
     if trimmed_data.starts_with('{') {
-        if let Ok(mut val) = serde_json::from_str::<Value>(trimmed_data) {
-            if let Some(mut first_ob) = val["outbounds"].as_array().and_then(|a| a.first()).cloned()
-            {
-                if first_ob.get("tag").is_none() {
-                    first_ob["tag"] = json!("proxy");
-                }
-                return Ok(first_ob);
-            }
-            if val.get("protocol").is_some() || val.get("type").is_some() {
-                if val.get("tag").is_none() {
-                    val["tag"] = json!("proxy");
-                }
-                return Ok(val);
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed_data) {
+            if let Some(mut ob) = extract_primary_xray_outbound(&val) {
+                ob["tag"] = json!("proxy");
+                return Ok(ob);
             }
         }
     }
@@ -41,14 +93,24 @@ pub fn generate_xray_outbound(p: &Profile) -> Result<Value> {
     let outbound = match p.kind {
         Kind::Vless => {
             let uuid = extract_credential_from_uri(&p.data).unwrap_or_else(|| p.id.clone());
-            let flow = if p.transport == Transport::Xhttp {
-                "".to_string()
+            let encryption = extract_query_param(&p.data, "encryption")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "none".to_string());
+            let allow_vision = matches!(p.transport, Transport::Tcp | Transport::Unknown)
+                && matches!(
+                    p.security,
+                    Security::Tls | Security::Reality | Security::Unknown
+                )
+                && encryption == "none";
+            let flow = if !allow_vision {
+                String::new()
             } else {
                 p.flow.clone().unwrap_or_else(|| {
                     if p.data.contains("xtls-rprx-vision") {
                         "xtls-rprx-vision".to_string()
                     } else {
-                        "".to_string()
+                        String::new()
                     }
                 })
             };
@@ -62,7 +124,7 @@ pub fn generate_xray_outbound(p: &Profile) -> Result<Value> {
                         "port": port,
                         "users": [{
                             "id": uuid,
-                            "encryption": "none",
+                            "encryption": encryption,
                             "flow": flow
                         }]
                     }]
@@ -123,23 +185,13 @@ pub fn generate_xray_outbound(p: &Profile) -> Result<Value> {
             })
         }
         Kind::Hy2 => {
-            let password = extract_credential_from_uri(&p.data).unwrap_or_else(|| p.id.clone());
-            json!({
-                "tag": "proxy",
-                "protocol": "hysteria2",
-                "settings": {
-                    "servers": [{
-                        "address": host,
-                        "port": port,
-                        "password": password
-                    }]
-                },
-                "streamSettings": stream_settings
-            })
+            bail!("Hysteria2 is handled by sing-box or native hysteria2, not Xray-core");
         }
         Kind::Xray => {
-            // Already handled above if JSON, otherwise wrap as custom outbound
-            if let Ok(val) = serde_json::from_str::<Value>(&p.data) {
+            if let Ok(mut val) = serde_json::from_str::<Value>(&p.data) {
+                if val.get("tag").is_none() {
+                    val["tag"] = json!("proxy");
+                }
                 val
             } else {
                 bail!("Xray profile data must be valid JSON or standard proxy URI");
@@ -158,6 +210,7 @@ fn generate_stream_settings(p: &Profile) -> Result<Value> {
     // Network / Transport
     let network = match p.transport {
         Transport::Xhttp => "xhttp",
+        Transport::Xdrive => "xdrive",
         Transport::Ws => "ws",
         Transport::Grpc => "grpc",
         Transport::H2 => "h2",
@@ -185,6 +238,22 @@ fn generate_stream_settings(p: &Profile) -> Result<Value> {
                 }
             }
             stream["xhttpSettings"] = xhttp_settings;
+        }
+        Transport::Xdrive => {
+            if let Some(extra) = extract_query_param(&p.data, "extra") {
+                if let Ok(extra_val) = serde_json::from_str::<Value>(&extra) {
+                    stream["xdriveSettings"] = extra_val;
+                }
+            }
+        }
+        Transport::HttpUpgrade => {
+            let path = extract_query_param(&p.data, "path").unwrap_or_else(|| "/".to_string());
+            let host = extract_query_param(&p.data, "host").or_else(|| p.sni.clone());
+            let mut hu = json!({ "path": path });
+            if let Some(h) = host {
+                hu["host"] = json!(h);
+            }
+            stream["httpupgradeSettings"] = hu;
         }
         Transport::Ws => {
             let path = extract_query_param(&p.data, "path").unwrap_or_else(|| "/".to_string());
@@ -243,6 +312,7 @@ fn generate_stream_settings(p: &Profile) -> Result<Value> {
             .reality_public_key
             .clone()
             .or_else(|| extract_query_param(&p.data, "pbk"))
+            .or_else(|| extract_query_param(&p.data, "password"))
             .unwrap_or_default();
         let sid = p
             .reality_short_id
@@ -269,6 +339,11 @@ fn generate_stream_settings(p: &Profile) -> Result<Value> {
         });
         if !spx.is_empty() {
             reality_settings["spiderX"] = json!(spx);
+        }
+        if let Some(pqv) = extract_query_param(&p.data, "pqv") {
+            if !pqv.trim().is_empty() {
+                reality_settings["mldsa65Verify"] = json!(pqv);
+            }
         }
         stream["realitySettings"] = reality_settings;
     } else if security == "tls" {
@@ -336,30 +411,207 @@ fn generate_stream_settings(p: &Profile) -> Result<Value> {
     Ok(stream)
 }
 
-/// Generates a complete, production-grade Xray JSON configuration
-pub fn generate_xray_config(
-    profile: &Profile,
-    tun_interface: &str,
-    mixed_proxy_port: u16,
-    api_port: u16,
-    log_path: Option<&Path>,
-    is_proxy_only: bool,
-) -> Result<Value> {
-    let outbound = generate_xray_outbound(profile)?;
-    let (host, port_opt) = parse_endpoint(&profile.server);
-    let port = profile.port.or(port_opt).unwrap_or(443);
-
-    // Resolve server endpoint to avoid routing loops
-    let server_ips = resolve_server_ips(&host, port);
-    let mut server_ip_strings: Vec<String> = server_ips.iter().map(|ip| ip.to_string()).collect();
-    if server_ip_strings.is_empty() && host.parse::<IpAddr>().is_ok() {
-        server_ip_strings.push(host.clone());
+fn resolve_profile_server_ip_strings(profile: &Profile) -> Vec<String> {
+    fn push_host_ips(host: &str, port: u16, ips_out: &mut Vec<String>) {
+        let trimmed = host.trim();
+        if trimmed.is_empty() || trimmed == "custom" {
+            return;
+        }
+        for ip in resolve_server_ips(trimmed, port) {
+            let s = ip.to_string();
+            if !ips_out.contains(&s) {
+                ips_out.push(s);
+            }
+        }
+        if let Ok(ip) = trimmed.parse::<IpAddr>() {
+            let s = ip.to_string();
+            if !ips_out.contains(&s) {
+                ips_out.push(s);
+            }
+        }
     }
 
-    let rules_cfg = crate::routing::RulesConfig::load();
-    let legacy_routing = load_routing();
+    let mut ips_out = Vec::new();
+    let (host, port_opt) = parse_endpoint(&profile.server);
+    let port = profile.port.or(port_opt).unwrap_or(443);
+    push_host_ips(&host, port, &mut ips_out);
 
+    if ips_out.is_empty() && profile.data.trim().starts_with('{') {
+        if let Ok(val) = serde_json::from_str::<Value>(profile.data.trim()) {
+            for h in extract_xray_outbound_hosts(&val) {
+                push_host_ips(&h, port, &mut ips_out);
+            }
+        }
+    }
+
+    ips_out
+}
+
+fn build_xray_log_config(log_path: Option<&Path>) -> Value {
+    let log_level = "warning";
+    if let Some(lp) = log_path {
+        json!({
+            "access": "",
+            "error": lp.to_string_lossy(),
+            "loglevel": log_level
+        })
+    } else {
+        json!({
+            "loglevel": log_level
+        })
+    }
+}
+
+fn has_dialer_proxy(ob: &Value) -> bool {
+    ob.get("streamSettings")
+        .and_then(|s| s.get("sockopt"))
+        .and_then(|so| so.get("dialerProxy"))
+        .and_then(|dp| dp.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn apply_sockopt_interface(outbounds: &mut [Value], egress_iface: Option<&str>) {
+    let Some(iface) = egress_iface.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    for ob in outbounds {
+        let proto = ob
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if matches!(proto, "blackhole" | "dns" | "api" | "loopback") || has_dialer_proxy(ob) {
+            continue;
+        }
+        let Some(ob_obj) = ob.as_object_mut() else {
+            continue;
+        };
+        let stream = ob_obj
+            .entry("streamSettings")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !stream.is_object() {
+            *stream = Value::Object(serde_json::Map::new());
+        }
+        let sockopt = stream
+            .as_object_mut()
+            .unwrap()
+            .entry("sockopt")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !sockopt.is_object() {
+            *sockopt = Value::Object(serde_json::Map::new());
+        }
+        let sockopt_map = sockopt.as_object_mut().unwrap();
+        if !sockopt_map.contains_key("interface") {
+            sockopt_map.insert("interface".to_string(), json!(iface));
+        }
+    }
+}
+
+fn patch_custom_xray_config(
+    mut cfg: Value,
+    inbounds: Vec<Value>,
+    log_path: Option<&Path>,
+    egress_iface: Option<&str>,
+) -> Result<Value> {
+    let obj = cfg
+        .as_object_mut()
+        .context("Custom Xray configuration must be a JSON object")?;
+
+    // Preserve existing log fields while directing errors to Vortex log_path if provided
+    let log_val = obj
+        .entry("log")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !log_val.is_object() {
+        *log_val = build_xray_log_config(log_path);
+    } else if let Some(log_obj) = log_val.as_object_mut() {
+        log_obj
+            .entry("loglevel")
+            .or_insert_with(|| json!("warning"));
+        if let Some(lp) = log_path {
+            log_obj.insert("error".to_string(), json!(lp.to_string_lossy()));
+        }
+    }
+
+    obj.entry("stats").or_insert_with(|| json!({}));
+
+    let api_val = obj
+        .entry("api")
+        .or_insert_with(|| json!({"tag": "api", "services": ["StatsService"]}));
+    let api_tag = api_val
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("api")
+        .to_string();
+    if let Some(api_obj) = api_val.as_object_mut() {
+        api_obj.entry("tag").or_insert_with(|| json!(api_tag));
+        let services = api_obj
+            .entry("services")
+            .or_insert_with(|| json!(["StatsService"]));
+        if let Some(arr) = services.as_array_mut() {
+            if !arr.iter().any(|s| s.as_str() == Some("StatsService")) {
+                arr.push(json!("StatsService"));
+            }
+        }
+    }
+
+    let policy_val = obj
+        .entry("policy")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(policy_obj) = policy_val.as_object_mut() {
+        let sys = policy_obj
+            .entry("system")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(sys_obj) = sys.as_object_mut() {
+            for flag in [
+                "statsInboundUplink",
+                "statsInboundDownlink",
+                "statsOutboundUplink",
+                "statsOutboundDownlink",
+            ] {
+                sys_obj.entry(flag).or_insert_with(|| json!(true));
+            }
+        }
+    }
+
+    obj.insert("inbounds".to_string(), Value::Array(inbounds));
+
+    if let Some(outbounds) = obj.get_mut("outbounds").and_then(|o| o.as_array_mut()) {
+        apply_sockopt_interface(outbounds, egress_iface);
+    }
+
+    let routing = obj
+        .entry("routing")
+        .or_insert_with(|| json!({"domainStrategy": "AsIs", "rules": []}));
+    if let Some(routing_obj) = routing.as_object_mut() {
+        routing_obj
+            .entry("domainStrategy")
+            .or_insert_with(|| json!("AsIs"));
+        let rules = routing_obj.entry("rules").or_insert_with(|| json!([]));
+        if let Some(arr) = rules.as_array_mut() {
+            let has_api_in = arr.iter().any(|r| {
+                r.get("inboundTag")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some("api-in")))
+            });
+            if !has_api_in {
+                arr.insert(
+                    0,
+                    json!({
+                        "type": "field",
+                        "inboundTag": ["api-in"],
+                        "outboundTag": api_tag
+                    }),
+                );
+            }
+        }
+    }
+
+    Ok(cfg)
+}
+
+fn build_xray_routing_rules(server_ip_strings: &[String], include_user_rules: bool) -> Vec<Value> {
     let mut routing_rules = Vec::new();
+    let has_geo_assets = crate::xray::install::geo_assets_dir().is_some();
 
     // 1. API traffic rule
     routing_rules.push(json!({
@@ -377,127 +629,220 @@ pub fn generate_xray_config(
         }));
     }
 
-    // 3. DNS server exemption
-    routing_rules.push(json!({
-        "type": "field",
-        "ip": ["1.1.1.1", "8.8.8.8"],
-        "port": "53,853",
-        "outboundTag": "direct"
-    }));
+    if include_user_rules {
+        let rules_cfg = RulesConfig::load();
 
-    // 4. LAN bypass
-    if legacy_routing.bypass_lan || rules_cfg.presets.bypass_lan {
+        // 3. DNS server exemption
         routing_rules.push(json!({
             "type": "field",
-            "ip": ["geoip:private"],
+            "ip": ["1.1.1.1", "8.8.8.8"],
+            "port": "53,853",
             "outboundTag": "direct"
         }));
-    }
 
-    // 5. Block ads preset
-    if rules_cfg.presets.block_ads {
-        routing_rules.push(json!({
-            "type": "field",
-            "domain": ["geosite:category-ads-all"],
-            "outboundTag": "block"
-        }));
-    }
-
-    // 6. Direct domestic preset
-    if rules_cfg.presets.direct_domestic {
-        routing_rules.push(json!({
-            "type": "field",
-            "ip": ["geoip:cn", "geoip:ir"],
-            "outboundTag": "direct"
-        }));
-    }
-
-    // 7. Blocked domains
-    if !legacy_routing.blocked_domains.is_empty() {
-        routing_rules.push(json!({
-            "type": "field",
-            "domain": legacy_routing.blocked_domains,
-            "outboundTag": "block"
-        }));
-    }
-
-    // 8. Direct domains
-    if !legacy_routing.direct_domains.is_empty() {
-        routing_rules.push(json!({
-            "type": "field",
-            "domain": legacy_routing.direct_domains,
-            "outboundTag": "direct"
-        }));
-    }
-
-    // 9. Custom User Rules from RulesConfig
-    for r in &rules_cfg.custom_rules {
-        if !r.enabled {
-            continue;
+        // 4. LAN bypass
+        if rules_cfg.presets.bypass_lan {
+            let lan_ips = if has_geo_assets {
+                vec!["geoip:private"]
+            } else {
+                vec![
+                    "127.0.0.0/8",
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "fc00::/7",
+                    "::1/128",
+                ]
+            };
+            routing_rules.push(json!({
+                "type": "field",
+                "ip": lan_ips,
+                "outboundTag": "direct"
+            }));
         }
-        let tag = match r.action {
-            crate::routing::RuleAction::Direct => "direct",
-            crate::routing::RuleAction::Block => "block",
-            crate::routing::RuleAction::Proxy | crate::routing::RuleAction::ProxyGroup => "proxy",
-        };
-        let mut domains = Vec::new();
-        for d in &r.domains {
-            match d {
-                crate::routing::DomainMatcher::Exact(e) => domains.push(format!("full:{e}")),
-                crate::routing::DomainMatcher::Suffix(s) => domains.push(format!("domain:{s}")),
-                crate::routing::DomainMatcher::Keyword(k) => domains.push(format!("keyword:{k}")),
-                crate::routing::DomainMatcher::Regex(rx) => domains.push(format!("regexp:{rx}")),
+
+        // 5. Block ads preset
+        if rules_cfg.presets.block_ads && has_geo_assets {
+            routing_rules.push(json!({
+                "type": "field",
+                "domain": ["geosite:category-ads-all"],
+                "outboundTag": "block"
+            }));
+        }
+
+        // 6. Direct domestic preset
+        if rules_cfg.presets.direct_domestic && has_geo_assets {
+            routing_rules.push(json!({
+                "type": "field",
+                "ip": ["geoip:cn", "geoip:ir"],
+                "outboundTag": "direct"
+            }));
+        }
+
+        // 7. Custom User Rules from RulesConfig
+        for r in &rules_cfg.custom_rules {
+            if !r.enabled {
+                continue;
+            }
+            let tag = match r.action {
+                crate::routing::RuleAction::Direct => "direct",
+                crate::routing::RuleAction::Block => "block",
+                crate::routing::RuleAction::Proxy | crate::routing::RuleAction::ProxyGroup => {
+                    "proxy"
+                }
+            };
+            let mut domains = Vec::new();
+            for d in &r.domains {
+                match d {
+                    crate::routing::DomainMatcher::Exact(e) => domains.push(format!("full:{e}")),
+                    crate::routing::DomainMatcher::Suffix(s) => domains.push(format!("domain:{s}")),
+                    crate::routing::DomainMatcher::Keyword(k) => {
+                        domains.push(format!("keyword:{k}"))
+                    }
+                    crate::routing::DomainMatcher::Regex(rx) => {
+                        domains.push(format!("regexp:{rx}"))
+                    }
+                }
+            }
+            if has_geo_assets {
+                for gs in &r.geosite {
+                    domains.push(format!("geosite:{gs}"));
+                }
+            }
+            let mut ips = r.ip_cidrs.clone();
+            if has_geo_assets {
+                for gi in &r.geoip {
+                    ips.push(format!("geoip:{gi}"));
+                }
+            }
+
+            let mut rule_obj = serde_json::Map::new();
+            rule_obj.insert("type".into(), json!("field"));
+            rule_obj.insert("outboundTag".into(), json!(tag));
+            if !domains.is_empty() {
+                rule_obj.insert("domain".into(), json!(domains));
+            }
+            if !ips.is_empty() {
+                rule_obj.insert("ip".into(), json!(ips));
+            }
+            if !r.ports.is_empty() {
+                rule_obj.insert("port".into(), json!(r.ports.join(",")));
+            }
+            if !r.protocols.is_empty() {
+                rule_obj.insert("network".into(), json!(r.protocols.join(",")));
+            }
+            if !domains.is_empty()
+                || !ips.is_empty()
+                || !r.ports.is_empty()
+                || !r.protocols.is_empty()
+            {
+                routing_rules.push(Value::Object(rule_obj));
             }
         }
-        for gs in &r.geosite {
-            domains.push(format!("geosite:{gs}"));
-        }
-        let mut ips = r.ip_cidrs.clone();
-        for gi in &r.geoip {
-            ips.push(format!("geoip:{gi}"));
-        }
-
-        let mut rule_obj = serde_json::Map::new();
-        rule_obj.insert("type".into(), json!("field"));
-        rule_obj.insert("outboundTag".into(), json!(tag));
-        if !domains.is_empty() {
-            rule_obj.insert("domain".into(), json!(domains));
-        }
-        if !ips.is_empty() {
-            rule_obj.insert("ip".into(), json!(ips));
-        }
-        if !r.ports.is_empty() {
-            rule_obj.insert("port".into(), json!(r.ports.join(",")));
-        }
-        if !r.protocols.is_empty() {
-            rule_obj.insert("network".into(), json!(r.protocols.join(",")));
-        }
-        if !domains.is_empty() || !ips.is_empty() || !r.ports.is_empty() || !r.protocols.is_empty()
-        {
-            routing_rules.push(Value::Object(rule_obj));
-        }
     }
 
-    // 7. Default proxy rule
+    // Default proxy rule
     routing_rules.push(json!({
         "type": "field",
         "network": "tcp,udp",
         "outboundTag": "proxy"
     }));
 
-    let log_level = "warning";
-    let log_config = if let Some(lp) = log_path {
-        json!({
-            "access": "",
-            "error": lp.to_string_lossy(),
-            "loglevel": log_level
-        })
-    } else {
-        json!({
-            "loglevel": log_level
-        })
-    };
+    routing_rules
+}
 
+/// Generates a local Xray SOCKS5 bridge sidecar config for Throne-style execution behind sing-box.
+/// For `CustomConfig` profiles, preserves all outbounds/routing/balancers/fragment/dialerProxy
+/// losslessly while binding local `vortex-bridge-in` and `api-in` inbounds.
+pub fn generate_xray_bridge_config(
+    profile: &Profile,
+    socks_port: u16,
+    api_port: u16,
+    log_path: Option<&Path>,
+    egress_iface: Option<&str>,
+) -> Result<Value> {
+    let inbounds = vec![
+        json!({
+            "tag": "vortex-bridge-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": {
+                "udp": true
+            },
+            "sniffing": {
+                "enabled": false
+            }
+        }),
+        json!({
+            "tag": "api-in",
+            "listen": "127.0.0.1",
+            "port": api_port,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "127.0.0.1"
+            }
+        }),
+    ];
+
+    if profile.payload_kind == ProfilePayloadKind::CustomConfig {
+        let cfg: Value = serde_json::from_str(profile.data.trim())
+            .context("Failed to parse custom Xray JSON config")?;
+        return patch_custom_xray_config(cfg, inbounds, log_path, egress_iface);
+    }
+
+    let outbound = generate_xray_outbound(profile)?;
+    let server_ip_strings = resolve_profile_server_ip_strings(profile);
+    let routing_rules = build_xray_routing_rules(&server_ip_strings, false);
+    let mut outbounds = vec![
+        outbound,
+        json!({
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "UseIP"
+            }
+        }),
+        json!({
+            "tag": "block",
+            "protocol": "blackhole"
+        }),
+    ];
+    apply_sockopt_interface(&mut outbounds, egress_iface);
+
+    Ok(json!({
+        "log": build_xray_log_config(log_path),
+        "stats": {},
+        "api": {
+            "tag": "api",
+            "services": ["StatsService"]
+        },
+        "policy": {
+            "system": {
+                "statsInboundUplink": true,
+                "statsInboundDownlink": true,
+                "statsOutboundUplink": true,
+                "statsOutboundDownlink": true
+            }
+        },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": routing_rules
+        }
+    }))
+}
+
+/// Generates a complete standalone Xray JSON configuration (TUN fallback / Proxy-only)
+pub fn generate_xray_config(
+    profile: &Profile,
+    tun_interface: &str,
+    mixed_proxy_port: u16,
+    api_port: u16,
+    log_path: Option<&Path>,
+    is_proxy_only: bool,
+) -> Result<Value> {
     let mut inbounds = Vec::new();
     if !is_proxy_only {
         inbounds.push(json!({
@@ -541,8 +886,39 @@ pub fn generate_xray_config(
         }
     }));
 
+    if profile.payload_kind == ProfilePayloadKind::CustomConfig {
+        let cfg: Value = serde_json::from_str(profile.data.trim())
+            .context("Failed to parse custom Xray JSON config")?;
+        return patch_custom_xray_config(cfg, inbounds, log_path, None);
+    }
+
+    let outbound = generate_xray_outbound(profile)?;
+    let server_ip_strings = resolve_profile_server_ip_strings(profile);
+    let routing_rules = build_xray_routing_rules(&server_ip_strings, true);
+
+    let has_geo_assets = crate::xray::install::geo_assets_dir().is_some();
+    let dns_config = if has_geo_assets {
+        json!({
+            "servers": [
+                {
+                    "address": "https://1.1.1.1/dns-query",
+                    "domains": ["geosite:geolocation-!cn"]
+                },
+                "1.1.1.1",
+                "8.8.8.8",
+                "localhost"
+            ],
+            "queryStrategy": "UseIPv4"
+        })
+    } else {
+        json!({
+            "servers": ["1.1.1.1", "8.8.8.8", "localhost"],
+            "queryStrategy": "UseIPv4"
+        })
+    };
+
     let config = json!({
-        "log": log_config,
+        "log": build_xray_log_config(log_path),
         "stats": {},
         "api": {
             "tag": "api",
@@ -556,18 +932,7 @@ pub fn generate_xray_config(
                 "statsOutboundDownlink": true
             }
         },
-        "dns": {
-            "servers": [
-                {
-                    "address": "https://1.1.1.1/dns-query",
-                    "domains": ["geosite:geolocation-!cn"]
-                },
-                "1.1.1.1",
-                "8.8.8.8",
-                "localhost"
-            ],
-            "queryStrategy": "UseIPv4"
-        },
+        "dns": dns_config,
         "inbounds": inbounds,
         "outbounds": [
             outbound,
@@ -594,14 +959,26 @@ pub fn generate_xray_config(
 
 /// Validates raw Xray JSON or generated config file via `xray run -test -config <file>`
 pub fn validate_xray_config_file(xray_bin: &Path, config_path: &Path) -> Result<()> {
-    let out = Command::new(xray_bin)
-        .args(["run", "-test", "-config", config_path.to_str().unwrap()])
-        .output()
+    let geo_dir = crate::xray::install::geo_assets_dir();
+    let run_test = |args: [&str; 4]| {
+        let mut cmd = Command::new(xray_bin);
+        cmd.args(args);
+        if let Some(ref dir) = geo_dir {
+            cmd.env("XRAY_LOCATION_ASSET", dir);
+        }
+        cmd.output()
+    };
+
+    let cfg_str = config_path.to_string_lossy().to_string();
+    let out = run_test(["run", "-test", "-config", &cfg_str])
         .or_else(|_| {
             // Fallback syntax for older versions: `xray -test -config <path>`
-            Command::new(xray_bin)
-                .args(["-test", "-config", config_path.to_str().unwrap()])
-                .output()
+            let mut cmd = Command::new(xray_bin);
+            cmd.args(["-test", "-config", &cfg_str]);
+            if let Some(ref dir) = geo_dir {
+                cmd.env("XRAY_LOCATION_ASSET", dir);
+            }
+            cmd.output()
         })
         .context("Failed to execute Xray test command")?;
 

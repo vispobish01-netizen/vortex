@@ -22,12 +22,54 @@ use std::{
     time::{Duration, Instant},
 };
 use vortex_core::benchmark::{self, SpeedResult};
+use vortex_core::ipc::{DaemonStatus, IpcClient, IpcRequest, IpcResponse};
 use vortex_core::model::OperationalMode;
 use vortex_core::ping::{self, Ping};
 use vortex_core::recon::{self, ReconReport};
 use vortex_core::shield;
 use vortex_core::store::{self, Kind, Profile, Security, Transport};
 use vortex_core::tunnel::{self, ActiveFlow, Session};
+
+pub(crate) fn active_ipc() -> Option<IpcClient> {
+    if cfg!(test) {
+        None
+    } else {
+        crate::cli::get_ipc()
+    }
+}
+
+fn session_from_status(st: &DaemonStatus, fallback: &Profile) -> Session {
+    let ap = st.active_profile.as_ref().unwrap_or(fallback);
+    Session {
+        id: ap.id.clone(),
+        name: ap.name.clone(),
+        kind: ap.kind,
+        server: st
+            .server_endpoint
+            .clone()
+            .unwrap_or_else(|| ap.server.clone()),
+        iface: st.iface.clone().unwrap_or_else(|| "vx0".into()),
+        pid: st.pid,
+        sidecar_pid: None,
+        backend: st.backend.clone(),
+        since: tunnel::now().saturating_sub(st.uptime_secs),
+        conf: String::new(),
+    }
+}
+
+fn disconnect_via_ipc_or_local() -> std::result::Result<(), String> {
+    if let Some(client) = active_ipc() {
+        return match client
+            .request_sync(&IpcRequest::Disconnect)
+            .map_err(|e| format!("{e:#}"))?
+        {
+            IpcResponse::Status(_) | IpcResponse::Ok => Ok(()),
+            IpcResponse::Error(e) => Err(e),
+            _ => Ok(()),
+        };
+    }
+    tunnel::disconnect().map_err(|e| format!("{e:#}"))
+}
 
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Msg {
@@ -43,7 +85,6 @@ pub(crate) enum Msg {
     Flows(Vec<ActiveFlow>),
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortMode {
     #[default]
@@ -51,7 +92,6 @@ pub enum SortMode {
     Latency,
     Transport,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransportFilter {
@@ -94,7 +134,6 @@ impl TransportFilter {
         }
     }
 }
-
 
 pub struct App {
     pub(crate) profiles: Vec<Profile>,
@@ -145,7 +184,6 @@ pub struct App {
     pub(crate) rx: Receiver<Msg>,
 }
 
-
 pub(crate) fn push(v: &mut Vec<u64>, x: u64) {
     v.push(x);
     if v.len() > HIST {
@@ -153,12 +191,40 @@ pub(crate) fn push(v: &mut Vec<u64>, x: u64) {
     }
 }
 
-
 impl App {
     pub(crate) fn new() -> Self {
         let (tx, rx) = mpsc::channel();
+        let ipc_client = active_ipc();
+        let ipc_status = ipc_client.as_ref().and_then(|c| {
+            match c.request_sync(&IpcRequest::GetStatus).ok()? {
+                IpcResponse::Status(s) => Some(s),
+                _ => None,
+            }
+        });
+        let profiles = ipc_client
+            .as_ref()
+            .and_then(|c| match c.request_sync(&IpcRequest::GetProfiles).ok()? {
+                IpcResponse::Profiles(p) if !p.is_empty() => Some(p),
+                _ => None,
+            })
+            .unwrap_or_else(store::load_all);
+        let session = tunnel::load_session().or_else(|| {
+            ipc_status
+                .as_ref()
+                .filter(|st| st.connected)
+                .and_then(|st| {
+                    st.active_profile
+                        .as_ref()
+                        .map(|p| session_from_status(st, p))
+                })
+        });
+        let shield_armed = ipc_status
+            .as_ref()
+            .map(|st| st.shield_armed)
+            .unwrap_or_else(shield::is_armed);
+
         let mut a = App {
-            profiles: store::load_all(),
+            profiles,
             view: vec![],
             list: ListState::default(),
             filter: String::new(),
@@ -168,7 +234,7 @@ impl App {
             flows_filter: TransportFilter::All,
             mode: Mode::Normal,
             focused_panel: 1,
-            session: tunnel::load_session(),
+            session,
             busy: None,
             busy_since: Instant::now(),
             toast: None,
@@ -176,7 +242,7 @@ impl App {
             show_flows: false,
             flows: vec![],
             last_flows_tick: Instant::now(),
-            shield_armed: shield::is_armed(),
+            shield_armed,
             down: vec![],
             up: vec![],
             down_peak: 0,
@@ -221,20 +287,22 @@ impl App {
             a.spawn_ip();
         } else {
             a.test(false); // fresh latency numbers on launch
-            let preflight = vortex_core::privilege::run_preflight_check();
-            if !preflight.is_root && !preflight.singbox_has_caps {
-                if !preflight.tun_device_exists {
-                    a.toast = Some((
-                        "PREFLIGHT: /dev/net/tun missing — run `sudo modprobe tun`".into(),
-                        false,
-                        Instant::now(),
-                    ));
-                } else if !preflight.can_sudo_passwordless {
-                    a.toast = Some((
-                        "PREFLIGHT: sing-box lacks CAP_NET_ADMIN — run `vortex setup` for passwordless TUN".into(),
-                        false,
-                        Instant::now(),
-                    ));
+            if !cfg!(test) && ipc_client.is_none() {
+                let preflight = vortex_core::privilege::run_preflight_check();
+                if !preflight.is_root && !preflight.singbox_has_caps && !preflight.xray_has_caps {
+                    if !preflight.tun_device_exists {
+                        a.toast = Some((
+                            "PREFLIGHT: /dev/net/tun missing — run `sudo modprobe tun`".into(),
+                            false,
+                            Instant::now(),
+                        ));
+                    } else if !preflight.can_sudo_passwordless {
+                        a.toast = Some((
+                            "PREFLIGHT: sing-box lacks CAP_NET_ADMIN — run `vortex setup` for passwordless TUN".into(),
+                            false,
+                            Instant::now(),
+                        ));
+                    }
                 }
             }
         }
@@ -326,7 +394,12 @@ impl App {
     }
 
     pub(crate) fn reload(&mut self) {
-        self.profiles = store::load_all();
+        self.profiles = active_ipc()
+            .and_then(|c| match c.request_sync(&IpcRequest::GetProfiles).ok()? {
+                IpcResponse::Profiles(p) => Some(p),
+                _ => None,
+            })
+            .unwrap_or_else(store::load_all);
         self.pings
             .retain(|id, _| self.profiles.iter().any(|p| &p.id == id));
         self.rebuild();
@@ -382,6 +455,7 @@ impl App {
         let Some(mut p) = self.cur().cloned() else {
             return;
         };
+        let ipc_opt = active_ipc();
         let creds = if tunnel::ovpn_needs_auth(&p) {
             if let Some(ref a) = p.auth {
                 Some((a.username.clone(), a.password.clone()))
@@ -393,12 +467,20 @@ impl App {
                 match result {
                     Ok(c) => {
                         if c.save {
-                            p.auth = Some(store::Auth {
-                                username: c.username.clone(),
-                                password: c.password.clone(),
-                                save: true,
-                            });
-                            let _ = store::save(&p);
+                            if let Some(ref client) = ipc_opt {
+                                let _ = client.request_sync(&IpcRequest::SetAuth {
+                                    profile_id: p.id.clone(),
+                                    username: c.username.clone(),
+                                    password: c.password.clone(),
+                                });
+                            } else {
+                                p.auth = Some(store::Auth {
+                                    username: c.username.clone(),
+                                    password: c.password.clone(),
+                                    save: true,
+                                });
+                                let _ = store::save(&p);
+                            }
                             self.reload();
                         }
                         Some((c.username, c.password))
@@ -419,15 +501,18 @@ impl App {
                 .map(|m| m.eq_ignore_ascii_case("proxy"))
                 .unwrap_or(false);
 
-        if !is_proxy_only && p.kind != Kind::Ovpn {
+        if ipc_opt.is_none() && !is_proxy_only && p.kind != Kind::Ovpn {
             let preflight = vortex_core::privilege::run_preflight_check();
-            if !preflight.is_root && !preflight.singbox_has_caps && !preflight.can_sudo_passwordless
+            if !preflight.is_root
+                && !preflight.singbox_has_caps
+                && !preflight.xray_has_caps
+                && !preflight.can_sudo_passwordless
             {
                 let _ = restore();
                 println!(
                     "\r\n\x1b[1;36m◈ VORTEX // ELEVATION REQUIRED FOR SYSTEM TUN TUNNEL\x1b[0m"
                 );
-                println!("  sing-box requires root privileges (or CAP_NET_ADMIN) to configure network interfaces.");
+                println!("  sing-box/xray requires root privileges (or CAP_NET_ADMIN) to configure network interfaces.");
                 println!("  (Tip: Run `vortex setup` to grant passwordless capabilities so you won't be prompted.)\r\n");
                 let status = std::process::Command::new("sudo").arg("-v").status();
                 let _ = enable_raw_mode();
@@ -449,11 +534,36 @@ impl App {
         self.ip.clear();
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let r = tunnel::connect_with_credentials(
-                &p,
-                creds.as_ref().map(|(u, pw)| (u.as_str(), pw.as_str())),
-            )
-            .map_err(|e| format!("{e:#}"));
+            let r = if let Some(client) = ipc_opt {
+                let req = match creds {
+                    Some((username, password)) if p.auth.is_none() => {
+                        IpcRequest::ConnectWithCredentials {
+                            profile_id: p.id.clone(),
+                            username,
+                            password,
+                        }
+                    }
+                    _ => IpcRequest::Connect {
+                        profile_id: p.id.clone(),
+                    },
+                };
+                match client.request_sync(&req).map_err(|e| format!("{e:#}")) {
+                    Ok(IpcResponse::Status(st)) => {
+                        Ok(tunnel::load_session().unwrap_or_else(|| session_from_status(&st, &p)))
+                    }
+                    Ok(IpcResponse::Ok) => tunnel::load_session()
+                        .ok_or_else(|| "daemon connected but session missing".to_string()),
+                    Ok(IpcResponse::Error(e)) => Err(e),
+                    Ok(_) => Err("unexpected daemon response".to_string()),
+                    Err(e) => Err(e),
+                }
+            } else {
+                tunnel::connect_with_credentials(
+                    &p,
+                    creds.as_ref().map(|(u, pw)| (u.as_str(), pw.as_str())),
+                )
+                .map_err(|e| format!("{e:#}"))
+            };
             let _ = tx.send(Msg::Connected(r));
         });
     }
@@ -474,6 +584,24 @@ impl App {
         match result {
             Ok(c) => {
                 if c.save {
+                    if let Some(client) = active_ipc() {
+                        match client.request_sync(&IpcRequest::SetAuth {
+                            profile_id: p.id.clone(),
+                            username: c.username.clone(),
+                            password: c.password.clone(),
+                        }) {
+                            Ok(IpcResponse::Ok) => {
+                                self.reload();
+                                self.toast("credentials saved", true);
+                                return;
+                            }
+                            Ok(IpcResponse::Error(e)) => {
+                                self.toast(format!("could not save: {e}"), false);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
                     p.auth = Some(store::Auth {
                         username: c.username,
                         password: c.password,
@@ -486,7 +614,13 @@ impl App {
                     self.reload();
                     self.toast("credentials saved", true);
                 } else {
-                    let _ = store::clear_auth(&p.id);
+                    if let Some(client) = active_ipc() {
+                        let _ = client.request_sync(&IpcRequest::ClearAuth {
+                            profile_id: p.id.clone(),
+                        });
+                    } else {
+                        let _ = store::clear_auth(&p.id);
+                    }
                     self.reload();
                     self.toast("credentials cleared", false);
                 }
@@ -502,7 +636,7 @@ impl App {
         self.start("disconnecting");
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let r = tunnel::disconnect().map_err(|e| format!("{e:#}"));
+            let r = disconnect_via_ipc_or_local();
             let _ = tx.send(Msg::Disconnected(r));
         });
     }
@@ -514,7 +648,16 @@ impl App {
         self.start("importing");
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let r = store::import(&s).map_err(|e| format!("{e:#}"));
+            let r = if let Some(client) = active_ipc() {
+                match client.request_sync(&IpcRequest::AddProfile { raw: s.clone() }) {
+                    Ok(IpcResponse::ProfileAdded { count }) => Ok(count),
+                    Ok(IpcResponse::Error(e)) => Err(e),
+                    Err(e) => Err(format!("{e:#}")),
+                    _ => Err("unexpected daemon response".to_string()),
+                }
+            } else {
+                store::import(&s).map_err(|e| format!("{e:#}"))
+            };
             let _ = tx.send(Msg::Imported(r));
         });
     }
@@ -524,12 +667,22 @@ impl App {
         if self.session.as_ref().map(|s| s.id == p.id).unwrap_or(false) {
             return self.toast("disconnect first", false);
         }
-        match store::remove(&p.id) {
+        let res = if let Some(client) = active_ipc() {
+            match client.request_sync(&IpcRequest::RemoveProfile { id: p.id.clone() }) {
+                Ok(IpcResponse::Ok) => Ok(()),
+                Ok(IpcResponse::Error(e)) => Err(e),
+                Err(e) => Err(format!("{e:#}")),
+                _ => Err("unexpected daemon response".to_string()),
+            }
+        } else {
+            store::remove(&p.id).map_err(|e| format!("{e}"))
+        };
+        match res {
             Ok(()) => {
                 self.reload();
                 self.toast(format!("deleted {}", p.name), true);
             }
-            Err(e) => self.toast(format!("{e}"), false),
+            Err(e) => self.toast(e, false),
         }
     }
 
@@ -537,7 +690,20 @@ impl App {
         let Some(id) = self.cur().map(|p| p.id.clone()) else {
             return;
         };
-        match store::rename(&id, &name) {
+        let res = if let Some(client) = active_ipc() {
+            match client.request_sync(&IpcRequest::RenameProfile {
+                id: id.clone(),
+                new_name: name.clone(),
+            }) {
+                Ok(IpcResponse::Ok) => Ok(()),
+                Ok(IpcResponse::Error(e)) => Err(e),
+                Err(e) => Err(format!("{e:#}")),
+                _ => Err("unexpected daemon response".to_string()),
+            }
+        } else {
+            store::rename(&id, &name).map_err(|e| format!("{e:#}"))
+        };
+        match res {
             Ok(()) => {
                 if let Some(s) = self.session.as_mut().filter(|s| s.id == id) {
                     s.name = name.trim().to_string();
@@ -545,7 +711,7 @@ impl App {
                 self.reload();
                 self.toast("renamed", true);
             }
-            Err(e) => self.toast(format!("{e:#}"), false),
+            Err(e) => self.toast(e, false),
         }
     }
 
@@ -556,12 +722,22 @@ impl App {
         self.start("syncing subscriptions");
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let r = store::update_all_subs()
-                .map(|results| {
-                    let total: usize = results.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
-                    total
-                })
-                .map_err(|e| format!("{e:#}"));
+            let r = if let Some(client) = active_ipc() {
+                match client.request_sync(&IpcRequest::UpdateSubscriptions { target: None }) {
+                    Ok(IpcResponse::ProfileAdded { count }) => Ok(count),
+                    Ok(IpcResponse::Error(e)) => Err(e),
+                    Err(e) => Err(format!("{e:#}")),
+                    _ => Err("unexpected daemon response".to_string()),
+                }
+            } else {
+                store::update_all_subs()
+                    .map(|results| {
+                        let total: usize =
+                            results.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
+                        total
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            };
             let _ = tx.send(Msg::SubsUpdated(r));
         });
     }
@@ -573,9 +749,18 @@ impl App {
         self.start("updating sub");
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let r = store::update_sub(&id)
-                .map(|(_, count)| count)
-                .map_err(|e| format!("{e:#}"));
+            let r = if let Some(client) = active_ipc() {
+                match client.request_sync(&IpcRequest::UpdateSubscriptions { target: Some(id) }) {
+                    Ok(IpcResponse::ProfileAdded { count }) => Ok(count),
+                    Ok(IpcResponse::Error(e)) => Err(e),
+                    Err(e) => Err(format!("{e:#}")),
+                    _ => Err("unexpected daemon response".to_string()),
+                }
+            } else {
+                store::update_sub(&id)
+                    .map(|(_, count)| count)
+                    .map_err(|e| format!("{e:#}"))
+            };
             let _ = tx.send(Msg::SubsUpdated(r));
         });
     }
@@ -774,7 +959,14 @@ impl App {
             self.last_flows_tick = Instant::now();
             let tx = self.tx.clone();
             thread::spawn(move || {
-                let flows = tunnel::active_flows();
+                let flows = if let Some(client) = active_ipc() {
+                    match client.request_sync(&IpcRequest::GetFlows) {
+                        Ok(IpcResponse::Flows(f)) => f,
+                        _ => tunnel::active_flows(),
+                    }
+                } else {
+                    tunnel::active_flows()
+                };
                 let _ = tx.send(Msg::Flows(flows));
             });
         }
@@ -865,6 +1057,25 @@ impl App {
     }
 
     pub(crate) fn toggle_shield(&mut self) {
+        if let Some(client) = active_ipc() {
+            match client.request_sync(&IpcRequest::ToggleShield { enable: None }) {
+                Ok(IpcResponse::Status(st)) => {
+                    self.shield_armed = st.shield_armed;
+                    if st.shield_armed {
+                        self.toast("ANTI-LEAK SHIELD ARMED // PACKET LEAKAGE BLOCKED", true);
+                    } else {
+                        self.toast("ANTI-LEAK SHIELD DISARMED // KILL-SWITCH OFF", false);
+                    }
+                    return;
+                }
+                Ok(IpcResponse::Error(e)) => {
+                    self.toast(format!("SHIELD ERR: {e}"), false);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         let pref = shield::is_enabled_preference();
         if pref {
             shield::set_enabled_preference(false);
@@ -902,9 +1113,8 @@ impl App {
 
     pub(crate) fn set_operational_mode(&mut self, mode: OperationalMode) {
         let _ = vortex_core::storage::set_mode_preference(mode);
-        let client = vortex_core::ipc::IpcClient::new();
-        if client.is_daemon_running() {
-            let _ = client.request_sync(&vortex_core::ipc::IpcRequest::SetMode { mode });
+        if let Some(client) = active_ipc() {
+            let _ = client.request_sync(&IpcRequest::SetMode { mode });
         }
         match mode {
             OperationalMode::Tunnel => {
@@ -957,7 +1167,9 @@ impl App {
     pub fn apply(&mut self, action: Action) -> bool {
         match action {
             Action::ForceQuit => {
-                let _ = tunnel::disconnect();
+                if active_ipc().is_none() {
+                    let _ = tunnel::disconnect();
+                }
                 return true;
             }
             Action::Quit => {
@@ -974,7 +1186,7 @@ impl App {
                         self.mode = Mode::Normal;
                     }
                     Mode::Confirm(ConfirmKind::QuitWhileConnected) => {
-                        let _ = tunnel::disconnect();
+                        let _ = disconnect_via_ipc_or_local();
                         return true;
                     }
                     _ => {}
@@ -1168,14 +1380,18 @@ impl App {
                 self.mode = Mode::Speed;
                 let tx = self.tx.clone();
                 thread::spawn(move || {
-                    let res = benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS)
-                        .map_err(|e| format!("{e:#}"));
+                    let res = run_speed_ipc_or_local();
                     let _ = tx.send(Msg::SpeedDone(res));
                 });
             }
             Action::UpdateSubs => self.sync_subs(),
             Action::ManageSubs => {
-                self.subs = store::load_subs();
+                self.subs = active_ipc()
+                    .and_then(|c| match c.request_sync(&IpcRequest::GetSubs).ok()? {
+                        IpcResponse::Subs(s) => Some(s),
+                        _ => None,
+                    })
+                    .unwrap_or_else(store::load_subs);
                 self.subs_list = ListState::default();
                 if !self.subs.is_empty() {
                     self.subs_list.select(Some(0));
@@ -1183,7 +1399,14 @@ impl App {
                 self.mode = Mode::Subs;
             }
             Action::ManageRules => {
-                self.rules_cfg = vortex_core::routing::RulesConfig::load();
+                self.rules_cfg = active_ipc()
+                    .and_then(
+                        |c| match c.request_sync(&IpcRequest::GetRulesConfig).ok()? {
+                            IpcResponse::RulesConfig(r) => Some(r),
+                            _ => None,
+                        },
+                    )
+                    .unwrap_or_else(vortex_core::routing::RulesConfig::load);
                 self.rules_list = ListState::default();
                 if !self.rules_cfg.custom_rules.is_empty() {
                     self.rules_list.select(Some(0));
@@ -1195,7 +1418,12 @@ impl App {
                     if idx < self.rules_cfg.custom_rules.len() {
                         self.rules_cfg.custom_rules[idx].enabled =
                             !self.rules_cfg.custom_rules[idx].enabled;
-                        let _ = self.rules_cfg.save();
+                        if let Some(client) = active_ipc() {
+                            let _ = client
+                                .request_sync(&IpcRequest::SetRulesConfig(self.rules_cfg.clone()));
+                        } else {
+                            let _ = self.rules_cfg.save();
+                        }
                         self.toast("ROUTING RULE STATUS TOGGLED", true);
                     }
                 }
@@ -1203,7 +1431,12 @@ impl App {
             Action::ToggleFlows => {
                 self.show_flows = !self.show_flows;
                 if self.show_flows {
-                    self.flows = tunnel::active_flows();
+                    self.flows = active_ipc()
+                        .and_then(|c| match c.request_sync(&IpcRequest::GetFlows).ok()? {
+                            IpcResponse::Flows(f) => Some(f),
+                            _ => None,
+                        })
+                        .unwrap_or_else(tunnel::active_flows);
                     self.toast(
                         format!(
                             "FLOW SNIFFER ENGAGED // {} ACTIVE SOCKET(S)",
@@ -1222,7 +1455,7 @@ impl App {
                     self.toast(format!("LAUNCHING DEEP RECON // TARGET: {}", p.name), true);
                     let tx = self.tx.clone();
                     thread::spawn(move || {
-                        let r = recon::probe_recon(&p).map_err(|e| format!("{e:#}"));
+                        let r = run_recon_ipc_or_local(&p);
                         let _ = tx.send(Msg::ReconDone(r));
                     });
                 } else {
@@ -1314,7 +1547,14 @@ impl App {
                 if let Some(i) = self.subs_list.selected() {
                     if i < self.subs.len() {
                         let sub = self.subs.remove(i);
-                        let _ = store::remove_sub(&sub.id, true);
+                        if let Some(client) = active_ipc() {
+                            let _ = client.request_sync(&IpcRequest::RemoveSub {
+                                id: sub.id.clone(),
+                                cleanup: true,
+                            });
+                        } else {
+                            let _ = store::remove_sub(&sub.id, true);
+                        }
                         self.reload();
                         if !self.subs.is_empty() {
                             self.subs_list.select(Some(i.min(self.subs.len() - 1)));
@@ -1331,7 +1571,7 @@ impl App {
                     self.toast(format!("RE-PROBING NODE // TARGET: {}", p.name), true);
                     let tx = self.tx.clone();
                     thread::spawn(move || {
-                        let r = recon::probe_recon(&p).map_err(|e| format!("{e:#}"));
+                        let r = run_recon_ipc_or_local(&p);
                         let _ = tx.send(Msg::ReconDone(r));
                     });
                 }
@@ -1344,8 +1584,7 @@ impl App {
                     self.speed_running = true;
                     let tx = self.tx.clone();
                     thread::spawn(move || {
-                        let res = benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS)
-                            .map_err(|e| format!("{e:#}"));
+                        let res = run_speed_ipc_or_local();
                         let _ = tx.send(Msg::SpeedDone(res));
                     });
                 }
@@ -1355,8 +1594,37 @@ impl App {
     }
 }
 
-// ───────────────────────── entry ─────────────────────────
+fn run_speed_ipc_or_local() -> std::result::Result<SpeedResult, String> {
+    if let Some(client) = active_ipc() {
+        return match client
+            .request_sync(&IpcRequest::RunSpeedTest)
+            .map_err(|e| format!("{e:#}"))?
+        {
+            IpcResponse::Speed(r) => Ok(r),
+            IpcResponse::Error(e) => Err(e),
+            _ => Err("unexpected daemon response".to_string()),
+        };
+    }
+    benchmark::run_speed_test(benchmark::DEFAULT_TEST_DURATION_SECS).map_err(|e| format!("{e:#}"))
+}
 
+fn run_recon_ipc_or_local(p: &Profile) -> std::result::Result<ReconReport, String> {
+    if let Some(client) = active_ipc() {
+        return match client
+            .request_sync(&IpcRequest::RunRecon {
+                profile_id: p.id.clone(),
+            })
+            .map_err(|e| format!("{e:#}"))?
+        {
+            IpcResponse::Recon(r) => Ok(r),
+            IpcResponse::Error(e) => Err(e),
+            _ => Err("unexpected daemon response".to_string()),
+        };
+    }
+    recon::probe_recon(p).map_err(|e| format!("{e:#}"))
+}
+
+// ───────────────────────── entry ─────────────────────────
 
 pub fn run() -> Result<()> {
     enable_raw_mode()?;
@@ -1368,13 +1636,17 @@ pub fn run() -> Result<()> {
     )?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |i| {
-        let _ = tunnel::disconnect();
+        if active_ipc().is_none() {
+            let _ = tunnel::disconnect();
+        }
         let _ = restore();
         default_hook(i);
     }));
 
     extern "C" fn sig_cleanup(_: libc::c_int) {
-        let _ = tunnel::disconnect();
+        if active_ipc().is_none() {
+            let _ = tunnel::disconnect();
+        }
         let _ = restore();
         unsafe {
             libc::_exit(130);
@@ -1446,7 +1718,6 @@ pub fn run() -> Result<()> {
     res
 }
 
-
 pub(crate) fn restore() -> Result<()> {
     disable_raw_mode()?;
     execute!(
@@ -1459,7 +1730,6 @@ pub(crate) fn restore() -> Result<()> {
 }
 
 // ───────────────────────── drawing ─────────────────────────
-
 
 pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -1523,7 +1793,6 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         _ => {}
     }
 }
-
 
 pub(crate) fn footer(f: &mut Frame, a: Rect, app: &App) {
     if a.height == 0 {
@@ -1636,4 +1905,3 @@ pub(crate) fn footer(f: &mut Frame, a: Rect, app: &App) {
         }
     }
 }
-

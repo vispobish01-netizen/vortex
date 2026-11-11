@@ -5,14 +5,29 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+pub fn user_home_dir() -> PathBuf {
+    if let Ok(u) = std::env::var("SUDO_USER") {
+        if !u.is_empty() && u != "root" {
+            return PathBuf::from("/home").join(u);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from("/root")
+}
+
 pub fn user_config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("VORTEX_CONFIG_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".config").join("vortex");
+    let candidate = user_home_dir().join(".config").join("vortex");
+    if candidate.exists() || user_home_dir().as_path() != std::path::Path::new("/root") {
+        return candidate;
     }
     PathBuf::from("/etc/vortex")
 }

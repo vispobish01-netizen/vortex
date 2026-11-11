@@ -148,4 +148,3 @@ pub(crate) fn profiles(f: &mut Frame, area: Rect, app: &mut App) {
         .highlight_symbol("► ");
     f.render_stateful_widget(list, area, &mut app.list);
 }
-

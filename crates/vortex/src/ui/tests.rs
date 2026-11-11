@@ -65,8 +65,6 @@ fn layouts_do_not_panic_and_show_latency() {
     render(80, 24, &mut app);
 }
 
-
-
 fn edit(s: &mut String, k: &KeyEvent) -> bool {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
@@ -130,6 +128,8 @@ fn connected_layout_renders_properly() {
         server: "203.0.113.7:443".into(),
         iface: "vx0".into(),
         pid: Some(1337),
+        sidecar_pid: None,
+        backend: Some("sing-box+xray".into()),
         since: tunnel::now().saturating_sub(120),
         conf: "".into(),
     });
@@ -491,6 +491,8 @@ fn test_traffic_panel_split() {
         server: "1.2.3.4:443".into(),
         iface: "vx0".into(),
         pid: Some(1337),
+        sidecar_pid: None,
+        backend: Some("sing-box+xray".into()),
         since: tunnel::now().saturating_sub(60),
         conf: "".into(),
     });

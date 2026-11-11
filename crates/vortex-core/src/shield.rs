@@ -5,6 +5,7 @@ use std::{
     io::Write,
     net::{IpAddr, ToSocketAddrs},
     os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 use tracing::{info, warn};
@@ -12,6 +13,27 @@ use tracing::{info, warn};
 pub const SHIELD_STATE: &str = "/run/vortex/shield.json";
 pub const SHIELD_ENABLED_FLAG: &str = "/etc/vortex/shield_enabled";
 pub const NFT_TABLE_NAME: &str = "vortex";
+
+fn shield_state_path() -> PathBuf {
+    crate::tunnel::run_path("shield.json")
+}
+
+fn shield_enabled_flag_path() -> PathBuf {
+    crate::crypto::user_config_dir().join("shield_enabled")
+}
+
+fn read_shield_state_file() -> Option<String> {
+    let p = shield_state_path();
+    if let Ok(s) = fs::read_to_string(&p) {
+        return Some(s);
+    }
+    if p != Path::new(SHIELD_STATE) {
+        if let Ok(s) = fs::read_to_string(SHIELD_STATE) {
+            return Some(s);
+        }
+    }
+    None
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShieldStatus {
@@ -29,35 +51,53 @@ fn default_true() -> bool {
 }
 
 fn have(bin: &str) -> bool {
-    std::path::Path::new(&format!("/usr/bin/{bin}")).exists()
-        || std::path::Path::new(&format!("/usr/sbin/{bin}")).exists()
-        || std::path::Path::new(&format!("/bin/{bin}")).exists()
+    Path::new(&format!("/usr/bin/{bin}")).exists()
+        || Path::new(&format!("/usr/sbin/{bin}")).exists()
+        || Path::new(&format!("/bin/{bin}")).exists()
 }
 
 pub fn is_enabled_preference() -> bool {
-    std::path::Path::new(SHIELD_ENABLED_FLAG).exists()
+    shield_enabled_flag_path().exists() || Path::new(SHIELD_ENABLED_FLAG).exists()
 }
 
 pub fn set_enabled_preference(enabled: bool) {
+    let flag = shield_enabled_flag_path();
     if enabled {
-        let _ = fs::write(SHIELD_ENABLED_FLAG, "1");
+        if let Some(parent) = flag.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&flag, "1");
     } else {
+        let _ = fs::remove_file(&flag);
         let _ = fs::remove_file(SHIELD_ENABLED_FLAG);
     }
 }
 
-/// Checks whether the nftables table `table inet vortex_shield` is currently active.
+/// Checks whether the nftables table `table inet vortex` is currently active.
 pub fn is_nftables_active() -> bool {
     if !have("nft") {
         return false;
     }
-    Command::new("nft")
+    if Command::new("nft")
         .args(["list", "table", "inet", NFT_TABLE_NAME])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+    {
+        return true;
+    }
+    if unsafe { libc::geteuid() != 0 } && crate::privilege::check_sudo_passwordless() {
+        return Command::new("sudo")
+            .args(["-n", "nft", "list", "table", "inet", NFT_TABLE_NAME])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+    false
 }
 
 /// Checks whether legacy iptables `VORTEX_SHIELD` chain is currently active in OUTPUT.
@@ -75,7 +115,7 @@ pub fn is_iptables_active() -> bool {
 }
 
 pub fn is_armed() -> bool {
-    if let Ok(s) = fs::read_to_string(SHIELD_STATE) {
+    if let Some(s) = read_shield_state_file() {
         if let Ok(st) = serde_json::from_str::<ShieldStatus>(&s) {
             if st.armed {
                 return true;
@@ -86,7 +126,7 @@ pub fn is_armed() -> bool {
 }
 
 pub fn status() -> ShieldStatus {
-    if let Ok(s) = fs::read_to_string(SHIELD_STATE) {
+    if let Some(s) = read_shield_state_file() {
         if let Ok(st) = serde_json::from_str::<ShieldStatus>(&s) {
             return st;
         }
@@ -207,14 +247,18 @@ pub fn generate_nftables_ruleset(
     out
 }
 
-/// Applies an nftables ruleset atomically by piping to `nft -f -`.
-pub fn apply_nftables(ruleset: &str) -> Result<()> {
-    if !have("nft") {
-        bail!("nftables binary 'nft' not found in PATH");
-    }
+fn exec_nft_stdin(use_sudo: bool, ruleset: &str) -> Result<()> {
+    let mut cmd = if use_sudo {
+        let mut c = Command::new("sudo");
+        c.args(["-n", "nft", "-f", "-"]);
+        c
+    } else {
+        let mut c = Command::new("nft");
+        c.args(["-f", "-"]);
+        c
+    };
 
-    let mut child = Command::new("nft")
-        .args(["-f", "-"])
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -232,12 +276,28 @@ pub fn apply_nftables(ruleset: &str) -> Result<()> {
         let err = String::from_utf8_lossy(&output.stderr);
         bail!("nft error (exit status {}): {}", output.status, err.trim());
     }
+    Ok(())
+}
+
+/// Applies an nftables ruleset atomically by piping to `nft -f -` (with `sudo -n` fallback when non-root).
+pub fn apply_nftables(ruleset: &str) -> Result<()> {
+    if !have("nft") {
+        bail!("nftables binary 'nft' not found in PATH");
+    }
+
+    if let Err(err) = exec_nft_stdin(false, ruleset) {
+        if unsafe { libc::geteuid() != 0 } && crate::privilege::check_sudo_passwordless() {
+            exec_nft_stdin(true, ruleset)?;
+        } else {
+            return Err(err);
+        }
+    }
 
     info!("Applied atomic nftables table '{NFT_TABLE_NAME}'");
     Ok(())
 }
 
-/// Deletes the `table inet vortex_shield` atomically.
+/// Deletes the `table inet vortex` atomically.
 pub fn disarm_nftables() -> Result<()> {
     if !have("nft") {
         return Ok(());
@@ -310,6 +370,7 @@ pub fn cleanup_stale_rules() -> Result<()> {
         }
     }
 
+    let _ = fs::remove_file(shield_state_path());
     let _ = fs::remove_file(SHIELD_STATE);
     Ok(())
 }
@@ -320,35 +381,38 @@ pub fn arm_with_options(
     server_endpoint: Option<&str>,
     allow_lan: bool,
 ) -> Result<()> {
-    // 1. Clean previous state
     let _ = cleanup_stale_rules();
 
+    let clean_iface = iface.filter(|s| !s.is_empty() && !s.contains(':'));
+
     let backend = if have("nft") {
-        let ruleset = generate_nftables_ruleset(iface, server_endpoint, allow_lan);
+        let ruleset = generate_nftables_ruleset(clean_iface, server_endpoint, allow_lan);
         match apply_nftables(&ruleset) {
             Ok(_) => "nftables",
             Err(e) => {
                 warn!("nftables application failed: {e:#}; falling back to iptables");
-                arm_iptables_fallback(iface, server_endpoint, allow_lan)?;
+                arm_iptables_fallback(clean_iface, server_endpoint, allow_lan)?;
                 "iptables"
             }
         }
     } else {
-        arm_iptables_fallback(iface, server_endpoint, allow_lan)?;
+        arm_iptables_fallback(clean_iface, server_endpoint, allow_lan)?;
         "iptables"
     };
 
     let status = ShieldStatus {
         armed: true,
-        iface: iface.map(String::from),
+        iface: clean_iface.map(String::from),
         server: server_endpoint.map(String::from),
         allow_lan,
         backend: backend.to_string(),
     };
-    let _ = fs::create_dir_all("/run/vortex");
-    let _ = fs::set_permissions("/run/vortex", fs::Permissions::from_mode(0o755));
-    let _ = fs::write(SHIELD_STATE, serde_json::to_string_pretty(&status)?);
-    let _ = fs::set_permissions(SHIELD_STATE, fs::Permissions::from_mode(0o644));
+    let state_path = shield_state_path();
+    if let Some(parent) = state_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&state_path, serde_json::to_string_pretty(&status)?);
+    let _ = fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644));
     Ok(())
 }
 

@@ -45,6 +45,14 @@ pub struct PreflightReport {
     pub is_managed_binary: bool,
     pub singbox_has_caps: bool,
     pub singbox_missing_caps: Vec<String>,
+    #[serde(default)]
+    pub xray_found: bool,
+    #[serde(default)]
+    pub xray_path: Option<PathBuf>,
+    #[serde(default)]
+    pub xray_has_caps: bool,
+    #[serde(default)]
+    pub xray_missing_caps: Vec<String>,
     pub can_sudo_passwordless: bool,
     pub has_pkexec: bool,
     pub strategy: PrivilegeStrategy,
@@ -141,6 +149,31 @@ pub fn check_file_caps(binary: &Path) -> (bool, Vec<String>) {
     (ok, missing)
 }
 
+/// Returns true if the process runs as root or `binary` holds `cap_net_raw`
+/// (required for `SO_BINDTODEVICE` / Xray `sockopt.interface` loop protection).
+pub fn check_file_cap_raw(binary: &Path) -> bool {
+    if unsafe { libc::geteuid() == 0 } {
+        return true;
+    }
+    let canonical = binary
+        .canonicalize()
+        .unwrap_or_else(|_| binary.to_path_buf());
+    if !canonical.exists() {
+        return false;
+    }
+    Command::new("getcap")
+        .arg(&canonical)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_lowercase()
+                .contains("cap_net_raw")
+        })
+        .unwrap_or(false)
+}
+
 /// Checks whether /dev/net/tun exists and is accessible.
 pub fn check_tun_device() -> (bool, bool) {
     let path = Path::new("/dev/net/tun");
@@ -192,10 +225,11 @@ pub fn run_preflight_check() -> PreflightReport {
     };
 
     let xray_path = crate::xray::install::resolve_xray_binary().ok();
-    let (xray_has_caps, _) = if let Some(ref p) = xray_path {
+    let xray_found = xray_path.is_some();
+    let (xray_has_caps, xray_missing_caps) = if let Some(ref p) = xray_path {
         check_file_caps(p)
     } else {
-        (false, vec![])
+        (false, vec!["xray not found".into()])
     };
 
     let can_sudo_passwordless = check_sudo_passwordless();
@@ -203,7 +237,7 @@ pub fn run_preflight_check() -> PreflightReport {
 
     let mut issues = Vec::new();
 
-    if !singbox_found && xray_path.is_none() {
+    if !singbox_found && !xray_found {
         issues.push("neither sing-box nor Xray-core binary is installed".into());
     }
 
@@ -239,7 +273,7 @@ pub fn run_preflight_check() -> PreflightReport {
 
     let recommendation = if !tun_device_exists {
         Some("Run `sudo modprobe tun` to load the Linux virtual network TUN driver.".into())
-    } else if !singbox_found && xray_path.is_none() {
+    } else if !singbox_found && !xray_found {
         Some("Install sing-box (`sudo pacman -S sing-box`) or Xray (`vortex xray install`).".into())
     } else if is_root || singbox_has_caps || xray_has_caps || can_sudo_passwordless {
         None
@@ -257,6 +291,10 @@ pub fn run_preflight_check() -> PreflightReport {
         is_managed_binary: is_managed,
         singbox_has_caps,
         singbox_missing_caps,
+        xray_found,
+        xray_path,
+        xray_has_caps,
+        xray_missing_caps,
         can_sudo_passwordless,
         has_pkexec,
         strategy,

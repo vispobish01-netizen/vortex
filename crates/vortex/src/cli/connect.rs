@@ -15,6 +15,18 @@ pub fn handle_auth(args: &[String]) -> Result<()> {
         bail!("credentials are only applicable to OpenVPN profiles");
     }
     if args.iter().any(|a| a == "--clear" || a == "-c") {
+        if let Some(client) = get_ipc() {
+            match client.request_sync(&IpcRequest::ClearAuth {
+                profile_id: p.id.clone(),
+            })? {
+                IpcResponse::Ok => {
+                    println!("cleared saved credentials for '{}'", p.name);
+                    return Ok(());
+                }
+                IpcResponse::Error(e) => bail!("ClearAuth failed: {e}"),
+                _ => {}
+            }
+        }
         store::clear_auth(&p.id)?;
         println!("cleared saved credentials for '{}'", p.name);
         return Ok(());
@@ -22,13 +34,32 @@ pub fn handle_auth(args: &[String]) -> Result<()> {
     if let Some(ref a) = p.auth {
         println!("current saved username for '{}': {}", p.name, a.username);
     }
-    let cred =
-        tunnel::prompt_ovpn_credentials(p.auth.as_ref().map(|a| a.username.as_str()))?;
+    let cred = tunnel::prompt_ovpn_credentials(p.auth.as_ref().map(|a| a.username.as_str()))?;
     if cred.save {
+        if let Some(client) = get_ipc() {
+            match client.request_sync(&IpcRequest::SetAuth {
+                profile_id: p.id.clone(),
+                username: cred.username.clone(),
+                password: cred.password.clone(),
+            })? {
+                IpcResponse::Ok => {
+                    println!("credentials saved for '{}'", p.name);
+                    return Ok(());
+                }
+                IpcResponse::Error(e) => bail!("SetAuth failed: {e}"),
+                _ => {}
+            }
+        }
         store::set_auth(&p.id, cred.username, cred.password)?;
         println!("credentials saved for '{}'", p.name);
     } else {
-        store::clear_auth(&p.id)?;
+        if let Some(client) = get_ipc() {
+            let _ = client.request_sync(&IpcRequest::ClearAuth {
+                profile_id: p.id.clone(),
+            });
+        } else {
+            store::clear_auth(&p.id)?;
+        }
         println!("credentials entered (not saved)");
     }
     Ok(())
@@ -104,9 +135,27 @@ pub fn connect_cli(p: &store::Profile) -> Result<()> {
 
 pub fn connect_profile(p: &store::Profile) -> Result<()> {
     if let Some(client) = get_ipc() {
-        match client.request_sync(&IpcRequest::Connect {
-            profile_id: p.id.clone(),
-        })? {
+        let req = if tunnel::ovpn_needs_auth(p) && p.auth.is_none() {
+            let cred = tunnel::prompt_ovpn_credentials(None)?;
+            if cred.save {
+                let _ = client.request_sync(&IpcRequest::SetAuth {
+                    profile_id: p.id.clone(),
+                    username: cred.username.clone(),
+                    password: cred.password.clone(),
+                });
+            }
+            IpcRequest::ConnectWithCredentials {
+                profile_id: p.id.clone(),
+                username: cred.username,
+                password: cred.password,
+            }
+        } else {
+            IpcRequest::Connect {
+                profile_id: p.id.clone(),
+            }
+        };
+
+        match client.request_sync(&req)? {
             IpcResponse::Status(_) | IpcResponse::Ok => {
                 let flag = detect_country_flag(&p.name);
                 send_notification(

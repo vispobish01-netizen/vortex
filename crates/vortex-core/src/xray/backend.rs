@@ -11,8 +11,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use super::config::{
-    generate_xray_config, validate_xray_config_file, DEFAULT_XRAY_PROXY_PORT,
-    DEFAULT_XRAY_TUN_IFACE,
+    generate_xray_bridge_config, generate_xray_config, validate_xray_config_file,
+    DEFAULT_XRAY_PROXY_PORT, DEFAULT_XRAY_TUN_IFACE,
 };
 use super::install::{get_binary_version, resolve_xray_binary};
 use crate::backend::Backend;
@@ -32,12 +32,29 @@ impl XrayBackend {
         }
     }
 
-    /// Selects an unused random port on 127.0.0.1 for the Xray gRPC API
+    /// Selects an unused random port on 127.0.0.1.
     pub fn pick_random_api_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())
             .map(|a| a.port())
             .unwrap_or(54321)
+    }
+
+    /// Selects two distinct ephemeral localhost ports.
+    fn pick_two_free_ports() -> (u16, u16) {
+        let l1 = TcpListener::bind("127.0.0.1:0").ok();
+        let l2 = TcpListener::bind("127.0.0.1:0").ok();
+        let p1 = l1
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(10808);
+        let p2 = l2
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or_else(|| p1.saturating_add(1));
+        (p1, p2)
     }
 
     /// Safely writes runtime files with strict 0600 permissions
@@ -67,7 +84,6 @@ impl XrayBackend {
     /// Cleanly kills a process with SIGTERM, then SIGKILL fallback (no orphans)
     pub fn kill_cleanly(pid: u32) {
         unsafe {
-            // Signal the entire process group if detached, or the PID directly
             let _ = libc::kill(pid as i32, libc::SIGTERM);
         }
         for _ in 0..40 {
@@ -97,13 +113,92 @@ impl XrayBackend {
         Ok(child.id())
     }
 
-    /// Runs a latency test through a temporary isolated Xray client instance
+    /// Starts Xray-core as an unprivileged local SOCKS5 bridge (`127.0.0.1:<port>`)
+    /// behind the sing-box Master Router (Throne dual-core architecture).
+    pub fn start_bridge(
+        &self,
+        profile: &Profile,
+        runtime_dir: &Path,
+        egress_iface: Option<&str>,
+    ) -> Result<(u16, Session)> {
+        let xray_bin =
+            resolve_xray_binary().context("Cannot start Xray bridge: binary not found")?;
+        let (socks_port, api_port) = Self::pick_two_free_ports();
+
+        let can_bind_raw = crate::privilege::check_file_cap_raw(&xray_bin);
+        let effective_iface = if can_bind_raw { egress_iface } else { None };
+
+        let conf_path = runtime_dir.join("xray.json");
+        let log_path = runtime_dir.join("xray.log");
+        let api_port_path = runtime_dir.join("xray_api_port");
+
+        let cfg = generate_xray_bridge_config(
+            profile,
+            socks_port,
+            api_port,
+            Some(&log_path),
+            effective_iface,
+        )?;
+        let cfg_str = serde_json::to_string_pretty(&cfg)?;
+        Self::write_secret(&conf_path, &cfg_str)?;
+        Self::write_secret(&api_port_path, &api_port.to_string())?;
+
+        self.validate_config(&cfg_str)
+            .context("Xray rejected bridge configuration on startup")?;
+
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)?;
+
+        let mut cmd = Command::new(&xray_bin);
+        if let Some(asset_dir) = crate::xray::install::geo_assets_dir() {
+            cmd.env("XRAY_LOCATION_ASSET", asset_dir);
+        }
+        cmd.args(["run", "-c", conf_path.to_str().unwrap()]);
+
+        let pid = Self::spawn_detached(&mut cmd, log_file)?;
+
+        for _ in 0..80 {
+            if !Self::is_alive(pid) {
+                let log_tail = fs::read_to_string(&log_path).unwrap_or_default();
+                let last_err = log_tail.lines().rev().take(3).collect::<Vec<_>>().join(" ");
+                bail!("Xray bridge exited unexpectedly (pid {pid}): {last_err}");
+            }
+            if std::net::TcpStream::connect_timeout(
+                &SocketAddr::from(([127, 0, 0, 1], socks_port)),
+                Duration::from_millis(50),
+            )
+            .is_ok()
+            {
+                let session = Session {
+                    id: profile.id.clone(),
+                    name: profile.name.clone(),
+                    kind: profile.kind,
+                    server: profile.server.clone(),
+                    iface: format!("127.0.0.1:{socks_port}"),
+                    pid: Some(pid),
+                    sidecar_pid: None,
+                    backend: Some("xray-bridge".to_string()),
+                    since: now(),
+                    conf: conf_path.to_string_lossy().to_string(),
+                };
+                return Ok((socks_port, session));
+            }
+            sleep(Duration::from_millis(50));
+        }
+
+        Self::kill_cleanly(pid);
+        bail!("Timed out waiting for Xray SOCKS5 bridge to bind on 127.0.0.1:{socks_port}")
+    }
+
+    /// Runs a latency test through a temporary isolated Xray bridge instance
     pub fn probe_real_delay(&self, profile: &Profile, timeout: Duration) -> Result<u32> {
         let xray_bin = resolve_xray_binary()?;
-        let temp_port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-        let api_port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let (temp_port, api_port) = Self::pick_two_free_ports();
 
-        let cfg = generate_xray_config(profile, "vxtmp0", temp_port, api_port, None, true)?;
+        let cfg = generate_xray_bridge_config(profile, temp_port, api_port, None, None)?;
 
         let temp_dir = std::env::temp_dir().join(format!(
             "vortex_probe_{}_{}",
@@ -114,7 +209,11 @@ impl XrayBackend {
         let conf_file = temp_dir.join("config.json");
         Self::write_secret(&conf_file, &serde_json::to_string(&cfg)?)?;
 
-        let child = Command::new(&xray_bin)
+        let mut cmd = Command::new(&xray_bin);
+        if let Some(asset_dir) = crate::xray::install::geo_assets_dir() {
+            cmd.env("XRAY_LOCATION_ASSET", asset_dir);
+        }
+        let child = cmd
             .args(["run", "-c", conf_file.to_str().unwrap()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -124,9 +223,11 @@ impl XrayBackend {
 
         let child_pid = child.id();
 
-        // Wait for proxy port to accept connections
         let mut ready = false;
-        for _ in 0..20 {
+        for _ in 0..30 {
+            if !Self::is_alive(child_pid) {
+                break;
+            }
             if std::net::TcpStream::connect_timeout(
                 &SocketAddr::from(([127, 0, 0, 1], temp_port)),
                 Duration::from_millis(50),
@@ -155,7 +256,7 @@ impl XrayBackend {
                     .args([
                         "-s",
                         "--max-time",
-                        &timeout.as_secs().to_string(),
+                        &timeout.as_secs().max(1).to_string(),
                         "-x",
                         &format!("socks5://127.0.0.1:{temp_port}"),
                         url,
@@ -172,7 +273,9 @@ impl XrayBackend {
             }
             probe_res
         } else {
-            bail!("Temporary probe Xray instance failed to bind")
+            Err(anyhow::anyhow!(
+                "Temporary probe Xray instance failed to bind"
+            ))
         };
 
         Self::kill_cleanly(child_pid);
@@ -303,6 +406,8 @@ impl Backend for XrayBackend {
                         server: profile.server.clone(),
                         iface: format!("127.0.0.1:{mixed_port}"),
                         pid: Some(pid),
+                        sidecar_pid: None,
+                        backend: Some("xray".to_string()),
                         since: now(),
                         conf: conf_path.to_string_lossy().to_string(),
                     };
@@ -316,6 +421,8 @@ impl Backend for XrayBackend {
                     server: profile.server.clone(),
                     iface: tun_iface.to_string(),
                     pid: Some(pid),
+                    sidecar_pid: None,
+                    backend: Some("xray".to_string()),
                     since: now(),
                     conf: conf_path.to_string_lossy().to_string(),
                 };
@@ -332,17 +439,18 @@ impl Backend for XrayBackend {
         if let Some(pid) = session.pid {
             Self::kill_cleanly(pid);
         }
+        if let Some(spid) = session.sidecar_pid {
+            Self::kill_cleanly(spid);
+        }
 
-        // Clean up configuration file
         let _ = fs::remove_file(&session.conf);
 
-        // Clean up api port marker
         let r_dir = active_run_dir();
         let _ = fs::remove_file(r_dir.join("xray_api_port"));
 
-        // Clean up TUN interface if lingering
         let iface = &session.iface;
-        if Path::new(&format!("/sys/class/net/{iface}")).exists() {
+        if !iface.starts_with("127.0.0.1") && Path::new(&format!("/sys/class/net/{iface}")).exists()
+        {
             let _ = Command::new("ip")
                 .args(["link", "delete", "dev", iface])
                 .output();
@@ -352,53 +460,55 @@ impl Backend for XrayBackend {
     }
 
     fn query_traffic(&self, session: &Session) -> Result<(u64, u64)> {
-        // Query Xray gRPC API using `xray api statsquery`
-        let r_dir = active_run_dir();
-        let api_port = fs::read_to_string(r_dir.join("xray_api_port"))
-            .ok()
-            .and_then(|s| s.trim().parse::<u16>().ok())
-            .unwrap_or(DEFAULT_XRAY_PROXY_PORT);
-
-        if let Ok(xray_bin) = resolve_xray_binary() {
-            let output = Command::new(&xray_bin)
-                .args([
-                    "api",
-                    "statsquery",
-                    &format!("--server=127.0.0.1:{api_port}"),
-                ])
-                .output();
-
-            if let Ok(out) = output {
-                if out.status.success() {
-                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                        let mut rx = 0u64;
-                        let mut tx = 0u64;
-                        if let Some(stats) = val["stat"].as_array() {
-                            for s in stats {
-                                let name = s["name"].as_str().unwrap_or("");
-                                let value = s["value"].as_u64().unwrap_or(0);
-                                if name.starts_with("outbound>>>") && !name.contains(">>>api>>>") {
-                                    if name.ends_with(">>>downlink") {
-                                        rx = rx.saturating_add(value);
-                                    } else if name.ends_with(">>>uplink") {
-                                        tx = tx.saturating_add(value);
-                                    }
-                                }
-                            }
-                            if rx > 0 || tx > 0 {
-                                return Ok((rx, tx));
-                            }
-                        }
-                    }
-                }
+        if let Some((rx, tx)) = query_xray_stats() {
+            if rx > 0 || tx > 0 {
+                return Ok((rx, tx));
             }
         }
 
-        // Fallback: Read sysfs network interface statistics
         if let Some((rx, tx)) = crate::tunnel::bytes(&session.iface) {
             return Ok((rx, tx));
         }
 
         Ok((0, 0))
     }
+}
+
+/// Queries live RX/TX byte counters from Xray-core gRPC `StatsService`.
+pub(crate) fn query_xray_stats() -> Option<(u64, u64)> {
+    let r_dir = active_run_dir();
+    let api_port = fs::read_to_string(r_dir.join("xray_api_port"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())?;
+    let xray_bin = resolve_xray_binary().ok()?;
+    let out = Command::new(&xray_bin)
+        .args([
+            "api",
+            "statsquery",
+            &format!("--server=127.0.0.1:{api_port}"),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let val = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()?;
+    let stats = val["stat"].as_array()?;
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    for s in stats {
+        let name = s["name"].as_str().unwrap_or("");
+        let value = s["value"]
+            .as_u64()
+            .or_else(|| s["value"].as_str().and_then(|v| v.parse::<u64>().ok()))
+            .unwrap_or(0);
+        if name.starts_with("outbound>>>") && !name.contains(">>>api>>>") {
+            if name.ends_with(">>>downlink") {
+                rx = rx.saturating_add(value);
+            } else if name.ends_with(">>>uplink") {
+                tx = tx.saturating_add(value);
+            }
+        }
+    }
+    Some((rx, tx))
 }

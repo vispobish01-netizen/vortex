@@ -23,7 +23,6 @@ pub const SEL_FG: Color = Color::Rgb(0x00, 0xff, 0xcc); // Highlight Active
 pub const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 pub const HIST: usize = 240;
 
-
 pub fn fmt_bytes(b: u64) -> String {
     const U: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = b as f64;
@@ -126,4 +125,3 @@ pub fn kv<'a>(k: &str, v: impl Into<Cow<'a, str>>, c: Color) -> Line<'a> {
         Span::styled(v.into(), Style::new().fg(c).bold()),
     ])
 }
-

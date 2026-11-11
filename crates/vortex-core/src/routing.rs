@@ -15,17 +15,20 @@ fn default_true() -> bool {
 }
 
 pub fn rules_file_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("VORTEX_CONFIG_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir).join("rules.toml");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".config/vortex/rules.toml")
-    } else {
-        PathBuf::from("/etc/vortex/rules.toml")
-    }
+    crate::crypto::user_config_dir().join("rules.toml")
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+struct LegacyRoutingJson {
+    #[serde(default = "default_true")]
+    pub bypass_lan: bool,
+    #[serde(default)]
+    pub direct_domains: Vec<String>,
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+}
+
+const DEFAULT_LEGACY_DOMAINS: &[&str] = &["local", "lan", "home.arpa"];
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -212,21 +215,63 @@ pub struct ExplainResult {
 
 impl RulesConfig {
     /// Loads rules from the given path or defaults to `~/.config/vortex/rules.toml`.
+    /// Also performs one-time migration of custom domains from legacy `routing.json` if present.
     pub fn load_from(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            let default_cfg = Self::default();
-            default_cfg.save_to(path)?;
-            return Ok(default_cfg);
-        }
+        let mut cfg = if !path.exists() {
+            Self::default()
+        } else {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read rules config from {path:?}"))?;
+            toml::from_str(&content)
+                .with_context(|| format!("Failed to parse TOML from {path:?}"))?
+        };
 
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read rules config from {path:?}"))?;
-        let mut cfg: RulesConfig = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse TOML from {path:?}"))?;
         for r in &mut cfg.custom_rules {
             if r.id == "block_telemetry" {
                 r.geosite.retain(|g| g != "category-ads-all");
             }
+        }
+
+        // One-time import from legacy routing.json in same config dir or /etc/vortex
+        let mut migrated = false;
+        let legacy_candidates = [
+            path.parent()
+                .map(|p| p.join("routing.json"))
+                .unwrap_or_else(|| PathBuf::from("/etc/vortex/routing.json")),
+            PathBuf::from("/etc/vortex/routing.json"),
+        ];
+        for legacy_path in legacy_candidates {
+            if legacy_path.exists() {
+                if let Ok(raw) = fs::read_to_string(&legacy_path) {
+                    if let Ok(leg) = serde_json::from_str::<LegacyRoutingJson>(&raw) {
+                        if !leg.bypass_lan && cfg.presets.bypass_lan {
+                            cfg.presets.bypass_lan = false;
+                            migrated = true;
+                        }
+                        for d in leg.direct_domains {
+                            if !DEFAULT_LEGACY_DOMAINS.contains(&d.as_str()) {
+                                migrated |= cfg.add_domain_rule_in_memory(
+                                    "cli_direct",
+                                    RuleAction::Direct,
+                                    &d,
+                                );
+                            }
+                        }
+                        for d in leg.blocked_domains {
+                            migrated |=
+                                cfg.add_domain_rule_in_memory("cli_block", RuleAction::Block, &d);
+                        }
+                    }
+                }
+                if migrated {
+                    let _ = fs::rename(&legacy_path, legacy_path.with_extension("json.migrated"));
+                    break;
+                }
+            }
+        }
+
+        if !path.exists() || migrated {
+            let _ = cfg.save_to(path);
         }
         Ok(cfg)
     }
@@ -234,6 +279,83 @@ impl RulesConfig {
     pub fn load() -> Self {
         let p = rules_file_path();
         Self::load_from(&p).unwrap_or_default()
+    }
+
+    fn add_domain_rule_in_memory(
+        &mut self,
+        rule_id: &str,
+        action: RuleAction,
+        domain: &str,
+    ) -> bool {
+        let dom = domain.trim().trim_start_matches('.').to_string();
+        if dom.is_empty() {
+            return false;
+        }
+        let matcher = DomainMatcher::Suffix(dom);
+        if let Some(existing) = self.custom_rules.iter_mut().find(|r| r.id == rule_id) {
+            if existing.domains.contains(&matcher) {
+                return false;
+            }
+            existing.enabled = true;
+            existing.domains.push(matcher);
+            return true;
+        }
+        self.custom_rules.push(RuleItem {
+            id: rule_id.to_string(),
+            description: Some(match action {
+                RuleAction::Direct => "User direct bypass domains".into(),
+                RuleAction::Block => "User blocked domains".into(),
+                _ => "User custom domain rules".into(),
+            }),
+            enabled: true,
+            action,
+            domains: vec![matcher],
+            ..Default::default()
+        });
+        true
+    }
+
+    pub fn add_bypass_domain(&mut self, domain: &str) -> bool {
+        self.add_domain_rule_in_memory("cli_direct", RuleAction::Direct, domain)
+    }
+
+    pub fn add_block_domain(&mut self, domain: &str) -> bool {
+        self.add_domain_rule_in_memory("cli_block", RuleAction::Block, domain)
+    }
+
+    pub fn clear_cli_domain_rules(&mut self) -> bool {
+        let before = self.custom_rules.len();
+        self.custom_rules
+            .retain(|r| r.id != "cli_direct" && r.id != "cli_block");
+        self.custom_rules.len() != before
+    }
+
+    pub fn to_legacy_routing_config(&self) -> crate::model::RoutingConfig {
+        let mut direct_domains = Vec::new();
+        let mut blocked_domains = Vec::new();
+        for r in &self.custom_rules {
+            if !r.enabled {
+                continue;
+            }
+            for d in &r.domains {
+                let val = match d {
+                    DomainMatcher::Exact(s)
+                    | DomainMatcher::Suffix(s)
+                    | DomainMatcher::Keyword(s) => s.clone(),
+                    DomainMatcher::Regex(s) => s.clone(),
+                };
+                match r.action {
+                    RuleAction::Direct => direct_domains.push(val),
+                    RuleAction::Block => blocked_domains.push(val),
+                    _ => {}
+                }
+            }
+        }
+        crate::model::RoutingConfig {
+            bypass_lan: self.presets.bypass_lan,
+            direct_domains,
+            blocked_domains,
+        }
     }
 
     /// Saves rules atomically using temp file and rename with mode 0600.
@@ -664,5 +786,46 @@ mod tests {
             custom_rule["cgroup_path"],
             serde_json::json!(["/sys/fs/cgroup/bypass"])
         );
+    }
+
+    #[test]
+    fn test_legacy_routing_json_migration_and_domain_ops() {
+        let tmp = std::env::temp_dir().join(format!("vortex_route_mig_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let legacy_path = tmp.join("routing.json");
+        fs::write(
+            &legacy_path,
+            r#"{"bypass_lan": false, "direct_domains": ["mybank.example"], "blocked_domains": ["ads.example"]}"#,
+        )
+        .unwrap();
+
+        let rules_path = tmp.join("rules.toml");
+        let mut cfg = RulesConfig::load_from(&rules_path).unwrap();
+        assert!(!cfg.presets.bypass_lan);
+        assert!(!legacy_path.exists());
+        assert!(tmp.join("routing.json.migrated").exists());
+
+        let legacy_view = cfg.to_legacy_routing_config();
+        assert!(legacy_view
+            .direct_domains
+            .contains(&"mybank.example".to_string()));
+        assert!(legacy_view
+            .blocked_domains
+            .contains(&"ads.example".to_string()));
+
+        assert!(cfg.add_bypass_domain("extra.direct"));
+        assert!(cfg.add_block_domain("extra.block"));
+        assert!(cfg.clear_cli_domain_rules());
+        let cleared = cfg.to_legacy_routing_config();
+        assert!(!cleared
+            .direct_domains
+            .contains(&"mybank.example".to_string()));
+        assert!(!cleared.direct_domains.contains(&"extra.direct".to_string()));
+        assert!(!cleared.blocked_domains.contains(&"extra.block".to_string()));
+        assert!(cleared.direct_domains.contains(&"local".to_string()));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

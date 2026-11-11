@@ -191,4 +191,3 @@ pub(crate) fn flows_table(f: &mut Frame, area: Rect, app: &App) {
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
-

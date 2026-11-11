@@ -119,37 +119,24 @@ Under this option, `sing-box` becomes the sole engine for proxy and TUN operatio
 Under this option, `Xray-core` becomes the sole engine for proxy operation.
 
 * **Advantages**:
-  1. **Supreme Anti-Censorship**: Industry-leading VLESS Reality, XTLS Vision, XHTTP, and Post-Quantum ML-KEM support with authentic browser TLS fingerprint camouflage.
-  2. **Zero-Dependency Installation**: Fully self-contained installer (`vortex xray install`) with SHA-256 DGST validation, independent of host package managers.
-* **Disadvantages / Gaps**:
-  1. **No Native Linux TUN**: Xray is a proxy server, not a transparent VPN provider. Running system-wide VPN mode would require bundling and maintaining `tun2socks` or complex nftables/TPROXY policy routing loops.
-  2. **Loss of Protocols**: Loss of native TUIC protocol support.
-  3. **Loss of Flow Sniffing**: No native Clash API equivalent for per-socket connection tracking and termination in the TUI.
-* **Estimated Lines Removed**:
-  - sing-box rules generator in `routing.rs` (~150 lines)
-  - sing-box outbound generator in `store.rs` (~215 lines)
-  - sing-box TUN execution and Clash API client in `tunnel.rs` (~374 lines)
-  - sing-box capability checks in `privilege.rs` (~62 lines)
-  - sing-box UI diagnostics and status checks (~80 lines)
-  - **Gross Reduction: ~881 lines**.
-  - **Net Addition**: Adding `tun2socks` or TPROXY handling to replicate TUN mode would add **~500–700 lines**, yielding a negligible net reduction of **~200–300 lines**.
+  1. **Supreme Anti-Censorship**: Industry-leading VLESS Reality (`mldsa65`), XTLS Vision, XHTTP, XDrive, `fragment`, `dialerProxy`, and Post-Quantum ML-KEM-768 VLESS encryption.
+  2. **Zero-Dependency Installation**: Self-contained Xray installer (`vortex xray install`) with SHA-256 DGST verification.
+* **Correction Note (Xray 26+)**:
+  * Xray 26+ **does** natively support `"protocol": "tun"` inbounds, so standalone fallback Xray TUN works without `tun2socks`.
+  * Xray **does not** support Hysteria2 or TUIC outbounds, and lacks Clash API per-socket flow inspection.
 
 ---
 
-## 6. Concrete Recommendation
+## 6. Implemented Architecture: Throne-Style Dual-Core Bridge
 
-### Recommendation: **Option A (Standardize on `sing-box`)**
+Instead of removing Xray (Option A) or sacrificing Hysteria2/TUIC/Clash API (Option B), Vortex implements a **Throne-style dual-core bridge** (`SingBoxBackend` + `ThroneBridgeBackend` + `XrayBackend`) and eliminates all code duplication:
 
-If the goal is to **reduce code bloat, simplify maintenance, and preserve full system VPN functionality**:
-
-1. **Retain `sing-box` as the Foundation**:
-   `sing-box` is the only engine capable of providing both transparent system-wide TUN routing (`vortex0`) and fine-grained per-socket flow telemetry via the Clash API controller. Standardizing on Xray would require introducing an external `tun2socks` subsystem, defeating the bloat-reduction goal.
-
-2. **Port the Release Downloader**:
-   Adapt the robust release downloader from `crates/vortex-core/src/xray/install.rs` into a generic binary installer for `sing-box` (`~200 lines`), allowing self-contained binary management on any Linux distribution without system package manager friction.
-
-3. **Prune Xray Subsystems**:
-   Deprecate `crates/vortex-core/src/xray/`, `crates/vortex/src/cli/xray.rs`, `tests/xray_tests.rs`, and Xray outbound/routing generators, immediately removing **~2,900 lines of redundant code**.
-
-4. **Refactor sing-box into the `Backend` Trait**:
-   Move sing-box execution from the hardcoded procedural code in `tunnel.rs` into a clean `SingBoxBackend` implementing `crates/vortex-core/src/backend.rs::Backend`.
+1. **`sing-box` Master Router (`crates/vortex-core/src/backends/singbox.rs`)**:
+   - Owns the system TUN interface (`vx0`), unified DNS & `RulesConfig` routing, Hysteria2/TUIC native protocols, and the Clash API (`127.0.0.1:9090`) for live per-socket flow inspection and termination.
+2. **Xray Local SOCKS5 Bridge (`ThroneBridgeBackend` + `XrayBackend::start_bridge`)**:
+   - For Xray protocols (`VLESS`, `XHTTP`, `XDrive`, PQ encryption, `fragment`, `dialerProxy`, and lossless Xray `CustomConfig` / `CustomOutbound`), `sing-box` forwards proxy traffic over a local `127.0.0.1:<port>` SOCKS5 bridge to Xray while enforcing loop prevention via `route_exclude_address` + physical egress `sockopt.interface`.
+   - If `sing-box` is absent (`!have("sing-box")` or `VORTEX_XRAY_STANDALONE=1`), `XrayBackend` cleanly falls back to native Xray TUN (`protocol: "tun"`).
+3. **Deduplication Completed**:
+   - `store.rs` is now a clean facade delegating storage (`storage.rs`) and parsing/sing-box outbounds (`parser.rs`), removing >1,100 lines of duplicated logic.
+   - `tunnel.rs` orchestrates connections cleanly through `backend::{resolve_backend, resolve_backend_for_session}`, removing duplicated `up_singbox` / `up_wg` / `up_ovpn` / `query_xray_traffic` implementations.
+   - `RulesConfig` (`rules.toml`) is the single source of truth for routing across `SingBoxBackend`, `XrayBackend`, `vortex route`, and `vortexd`.

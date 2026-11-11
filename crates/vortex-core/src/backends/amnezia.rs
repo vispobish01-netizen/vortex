@@ -1,9 +1,9 @@
 use crate::backend::Backend;
+use crate::backends::wireguard::start_wg_family;
 use crate::model::Profile;
-use crate::tunnel::{bytes, now, Session};
+use crate::tunnel::{bytes, have, iface_exists, Session};
 use anyhow::{bail, Result};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -22,12 +22,6 @@ impl AmneziaBackend {
     fn tool(&self) -> &'static str {
         "awg-quick"
     }
-
-    fn have_tool(&self) -> bool {
-        ["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"]
-            .iter()
-            .any(|d| Path::new(d).join(self.tool()).is_file())
-    }
 }
 
 impl Default for AmneziaBackend {
@@ -42,7 +36,7 @@ impl Backend for AmneziaBackend {
     }
 
     fn is_available(&self) -> bool {
-        self.have_tool()
+        have(self.tool())
     }
 
     fn version(&self) -> Option<String> {
@@ -62,7 +56,6 @@ impl Backend for AmneziaBackend {
         if !config_content.contains("[Peer]") {
             bail!("AmneziaWG config missing [Peer] block");
         }
-        // Verify presence of Amnezia obfuscation parameters
         let has_obfs = config_content.contains("Jc =")
             || config_content.contains("Jmin =")
             || config_content.contains("S1 =")
@@ -74,52 +67,21 @@ impl Backend for AmneziaBackend {
     }
 
     fn start(&self, profile: &Profile, runtime_dir: &Path) -> Result<Session> {
-        if !self.is_available() {
-            bail!("awg-quick is not installed (install amneziawg-tools from AUR)");
-        }
         self.validate_config(&profile.data)?;
-
-        let iface = &self.iface;
-        let conf_path = runtime_dir.join(format!("{iface}.conf"));
-
-        if Path::new(&format!("/sys/class/net/{iface}")).exists() {
-            let _ = Command::new(self.tool())
-                .args(["down", &conf_path.to_string_lossy()])
-                .output();
-            let _ = Command::new("ip")
-                .args(["link", "delete", "dev", iface])
-                .output();
-        }
-
-        fs::write(&conf_path, &profile.data)?;
-        let _ = fs::set_permissions(&conf_path, fs::Permissions::from_mode(0o600));
-
-        let out = Command::new(self.tool())
-            .args(["up", &conf_path.to_string_lossy()])
-            .output()?;
-
-        if !out.status.success() {
-            let _ = fs::remove_file(&conf_path);
-            let err = String::from_utf8_lossy(&out.stderr);
-            bail!("awg-quick up failed: {}", err.trim());
-        }
-
-        Ok(Session {
-            id: profile.id.clone(),
-            name: profile.name.clone(),
-            kind: profile.kind,
-            server: profile.server.clone(),
-            iface: iface.clone(),
-            pid: None,
-            since: now(),
-            conf: conf_path.to_string_lossy().to_string(),
-        })
+        start_wg_family(
+            self.tool(),
+            &self.iface,
+            "amneziawg-tools (AUR)",
+            "amnezia",
+            profile,
+            runtime_dir,
+        )
     }
 
     fn stop(&self, session: &Session) -> Result<()> {
         let conf = &session.conf;
         let _ = Command::new(self.tool()).args(["down", conf]).output();
-        if Path::new(&format!("/sys/class/net/{}", session.iface)).exists() {
+        if iface_exists(&session.iface) {
             let _ = Command::new("ip")
                 .args(["link", "delete", "dev", &session.iface])
                 .output();

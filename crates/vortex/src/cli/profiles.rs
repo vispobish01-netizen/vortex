@@ -53,7 +53,14 @@ pub fn find(q: &str) -> Result<store::Profile> {
 }
 
 pub fn handle_list() -> Result<()> {
-    let active = tunnel::load_session().map(|s| s.id);
+    let active = if let Some(client) = get_ipc() {
+        match client.request_sync(&IpcRequest::GetStatus) {
+            Ok(IpcResponse::Status(st)) => st.active_profile.map(|p| p.id),
+            _ => tunnel::load_session().map(|s| s.id),
+        }
+    } else {
+        tunnel::load_session().map(|s| s.id)
+    };
     let all = load_profiles();
     if all.is_empty() {
         println!("no profiles found — use `vortex add <link|file>`");
@@ -130,7 +137,12 @@ pub fn handle_conf(args: &[String]) -> Result<()> {
         p.kind.tag()
     );
     println!("{}", p.data);
-    if p.kind.is_singbox() {
+    if p.effective_engine() == vortex_core::model::CoreEngine::Xray {
+        if let Ok(ob) = vortex_core::xray::config::generate_xray_outbound(&p) {
+            println!("\n\x1b[1;36m# Xray Outbound JSON (Bridged behind Sing-Box):\x1b[0m");
+            println!("{}", serde_json::to_string_pretty(&ob)?);
+        }
+    } else if p.kind.is_singbox() {
         if let Ok((_, ob, _, _)) = store::outbound(&p.data) {
             println!("\n\x1b[1;36m# Sing-box Outbound JSON:\x1b[0m");
             println!("{}", serde_json::to_string_pretty(&ob)?);
@@ -143,7 +155,14 @@ pub fn handle_sub(args: &[String]) -> Result<()> {
     let subcmd = args.get(1).map(String::as_str).unwrap_or("list");
     match subcmd {
         "list" | "ls" => {
-            let subs = store::load_subs();
+            let subs = if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::GetSubs) {
+                    Ok(IpcResponse::Subs(s)) => s,
+                    _ => store::load_subs(),
+                }
+            } else {
+                store::load_subs()
+            };
             if subs.is_empty() {
                 println!("no subscriptions configured — use `vortex sub add <url>`");
                 return Ok(());
@@ -185,6 +204,22 @@ pub fn handle_sub(args: &[String]) -> Result<()> {
                 .get(2)
                 .ok_or_else(|| anyhow::anyhow!("usage: vortex sub add <url> [name]"))?;
             let name = args.get(3).map(String::as_str);
+            if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::AddSub {
+                    url: url.clone(),
+                    name: name.map(str::to_string),
+                })? {
+                    IpcResponse::SubAdded { sub, count } => {
+                        println!(
+                            "added subscription '{}' ({}) with {} node(s)",
+                            sub.name, sub.id, count
+                        );
+                        return Ok(());
+                    }
+                    IpcResponse::Error(e) => bail!("Add subscription error: {e}"),
+                    _ => {}
+                }
+            }
             let (sub, count) = store::add_sub(url, name)?;
             println!(
                 "added subscription '{}' ({}) with {} node(s)",
@@ -194,6 +229,22 @@ pub fn handle_sub(args: &[String]) -> Result<()> {
         }
         "update" | "up" | "sync" => {
             let target = args.get(2).map(String::as_str).unwrap_or("all");
+            if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::UpdateSubscriptions {
+                    target: if target == "all" {
+                        None
+                    } else {
+                        Some(target.to_string())
+                    },
+                })? {
+                    IpcResponse::ProfileAdded { count } => {
+                        println!("✔ updated ({count} nodes synchronized)");
+                        return Ok(());
+                    }
+                    IpcResponse::Error(e) => bail!("Update subscription error: {e}"),
+                    _ => {}
+                }
+            }
             if target == "all" {
                 let results = store::update_all_subs()?;
                 for (name, r) in results {
@@ -212,6 +263,19 @@ pub fn handle_sub(args: &[String]) -> Result<()> {
             let target = args
                 .get(2)
                 .ok_or_else(|| anyhow::anyhow!("usage: vortex sub rm <id>"))?;
+            if let Some(client) = get_ipc() {
+                match client.request_sync(&IpcRequest::RemoveSub {
+                    id: target.clone(),
+                    cleanup: true,
+                })? {
+                    IpcResponse::ProfileAdded { count } => {
+                        println!("removed subscription and cleaned up {count} profile(s)");
+                        return Ok(());
+                    }
+                    IpcResponse::Error(e) => bail!("Remove subscription error: {e}"),
+                    _ => {}
+                }
+            }
             let removed = store::remove_sub(target, true)?;
             println!("removed subscription and cleaned up {removed} profile(s)");
             Ok(())

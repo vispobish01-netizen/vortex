@@ -286,7 +286,10 @@ impl MultiLayerProber {
         // 3. Real Delay probe (if proxy bridge active or through isolated Xray instance)
         let real_delay_ms = if let Some(ref proxy) = self.proxy_addr {
             probe_real_delay(Some(proxy), DEFAULT_PROBE_URL, self.timeout).await
-        } else if p.kind.is_xray_capable() && crate::xray::resolve_xray_binary().is_ok() {
+        } else if (p.effective_engine() == crate::model::CoreEngine::Xray
+            || p.kind.is_xray_capable())
+            && crate::xray::resolve_xray_binary().is_ok()
+        {
             let p_clone = p.clone();
             let to = self.timeout;
             tokio::task::spawn_blocking(move || {

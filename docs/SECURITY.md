@@ -32,33 +32,20 @@ Vortex is designed to operate safely in adversarial environments characterized b
 - Private keys and passwords are wiped immediately after handshake initialization.
 
 ### 2.3 Privilege Separation & Capability Bounding
-- The unprivileged client (`vortex`) has **zero** network administration privileges. It interacts with `vortexd` strictly via a Unix domain socket at `/run/vortex/vortex.sock`.
-- The Unix domain socket permissions are enforced at `0660` owned by group `vortex` (or `0600` for user fallback).
-- Systemd service hardening for `vortexd.service`:
-  ```ini
-  [Service]
-  CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-  AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-  NoNewPrivileges=yes
-  ProtectSystem=strict
-  ProtectHome=read-only
-  ProtectKernelTunables=yes
-  ProtectControlGroups=yes
-  RestrictRealtime=yes
-  RestrictSUIDSGID=yes
-  PrivateTmp=yes
-  ```
+- The unprivileged client (`vortex`) interacts with `vortexd` strictly via a Unix domain socket (`$XDG_RUNTIME_DIR/vortex.sock` for user systemd service, or `/run/vortex/vortex.sock` when run system-wide).
+- Ephemeral runtime configs (`singbox.json`, `xray.json`, `ovpn.conf`, `ovpn.auth`) are written with strict `0600` permissions inside `active_run_dir()` (`$XDG_RUNTIME_DIR/vortex` or `/run/vortex`).
+- File capabilities (`vortex setup`) grant `cap_net_admin,cap_net_bind_service,cap_net_raw+ep` to managed `sing-box` and `xray` binaries so TUN creation and `SO_BINDTODEVICE` egress binding avoid running interactive UI sessions under `sudo`.
 
 ### 2.4 Strict Leak Protection (nftables Kill-Switch)
 - Atomic `table inet vortex` firewall table.
 - Default policy on `output`: `drop`.
 - Allowed paths:
-  1. Loopback interface (`iifname "lo" accept`).
-  2. Tunnel interface (`oifname "vortex0" accept`).
-  3. DHCP traffic (`udp sport 68 dport 67 accept`).
+  1. Loopback interface (`oifname "lo" accept`).
+  2. Active tunnel interface (`oifname "vx0" accept`, `vxwg0`, `vxawg0`, or `tun*`).
+  3. DHCP traffic (`udp sport 68 udp dport 67 accept`).
   4. Explicit IP and port of the active VPN remote server endpoint.
   5. Optional RFC1918 LAN allow (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`) when LAN bypass is enabled.
-- Automatic disarming and idempotent rollback on graceful shutdown or crash recovery.
+- Preference (`shield_enabled`) stored under `user_config_dir()` and state (`shield.json`) under `active_run_dir()`, with automatic disarming and idempotent rollback on crash recovery.
 
 ### 2.5 Logging and Telemetry Rules
 - Secrets, private keys, UUIDs, passwords, and raw share links are **never logged**.

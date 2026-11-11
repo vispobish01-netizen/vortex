@@ -86,25 +86,54 @@ pub(crate) fn header(f: &mut Frame, a: Rect, app: &App) {
 
     let armed = app.shield_armed || shield::is_armed();
     let (core_tag, core_val) = if let Some(s) = &app.session {
-        if s.kind == Kind::Xray || s.conf.contains("xray") {
-            let ver = vortex_core::xray::active_xray_version().unwrap_or_default();
-            (
-                "  XRAY: ",
-                if ver.is_empty() {
-                    "xray-core".to_string()
-                } else {
-                    format!("xray {ver}")
-                },
-            )
-        } else if s.kind == Kind::Wg {
-            ("  SYS: ", "wireguard".to_string())
-        } else if s.kind == Kind::Awg {
-            ("  SYS: ", "amneziawg".to_string())
-        } else if s.kind == Kind::Ovpn {
-            ("  SYS: ", "openvpn".to_string())
-        } else {
-            ("  SYS: ", "sing-box/bpf".to_string())
+        match s.backend.as_deref() {
+            Some("sing-box+xray") => {
+                let ver = vortex_core::xray::active_xray_version().unwrap_or_default();
+                (
+                    "  BRIDGE: ",
+                    if ver.is_empty() {
+                        "sing-box + xray".to_string()
+                    } else {
+                        format!("sing-box + xray {ver}")
+                    },
+                )
+            }
+            Some("xray") | Some("xray-bridge") => {
+                let ver = vortex_core::xray::active_xray_version().unwrap_or_default();
+                (
+                    "  XRAY: ",
+                    if ver.is_empty() {
+                        "xray-core".to_string()
+                    } else {
+                        format!("xray {ver}")
+                    },
+                )
+            }
+            Some("wireguard") => ("  SYS: ", "wireguard".to_string()),
+            Some("amnezia") => ("  SYS: ", "amneziawg".to_string()),
+            Some("openvpn") => ("  SYS: ", "openvpn".to_string()),
+            Some("hysteria2") => ("  SYS: ", "hysteria2".to_string()),
+            Some("sing-box") => ("  SYS: ", "sing-box/bpf".to_string()),
+            _ if s.kind == Kind::Xray || s.conf.contains("xray") => {
+                let ver = vortex_core::xray::active_xray_version().unwrap_or_default();
+                (
+                    "  XRAY: ",
+                    if ver.is_empty() {
+                        "xray-core".to_string()
+                    } else {
+                        format!("xray {ver}")
+                    },
+                )
+            }
+            _ if s.kind == Kind::Wg => ("  SYS: ", "wireguard".to_string()),
+            _ if s.kind == Kind::Awg => ("  SYS: ", "amneziawg".to_string()),
+            _ if s.kind == Kind::Ovpn => ("  SYS: ", "openvpn".to_string()),
+            _ => ("  SYS: ", "sing-box/bpf".to_string()),
         }
+    } else if vortex_core::privilege::resolve_singbox_binary().is_some()
+        && vortex_core::xray::active_xray_version().is_some()
+    {
+        ("  BRIDGE: ", "sing-box + xray".to_string())
     } else if let Some(ver) = vortex_core::xray::active_xray_version() {
         ("  XRAY: ", format!("xray {ver}"))
     } else {
@@ -180,7 +209,6 @@ pub(crate) fn header(f: &mut Frame, a: Rect, app: &App) {
     );
 }
 
-
 pub(crate) fn circuit_diagram(
     local_iface: &str,
     node: &str,
@@ -254,7 +282,6 @@ pub(crate) fn circuit_diagram_direct(width: usize) -> Line<'static> {
         ])
     }
 }
-
 
 pub(crate) fn spark(f: &mut Frame, r: Rect, data: &[u64], c: Color) {
     let w = r.width as usize;
@@ -581,7 +608,11 @@ pub(crate) fn info(f: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::styled("CUMULATIVE: ", Style::new().fg(DIM).bold()),
                 Span::styled(
-                    format!("RX (DOWN) {} · TX (UP) {}", fmt_bytes(tot.0), fmt_bytes(tot.1)),
+                    format!(
+                        "RX (DOWN) {} · TX (UP) {}",
+                        fmt_bytes(tot.0),
+                        fmt_bytes(tot.1)
+                    ),
                     Style::new().fg(FG_DIM),
                 ),
                 Span::styled("  │  MTU: 9000  │  BBR: ENGAGED", Style::new().fg(GREEN)),
@@ -647,6 +678,24 @@ pub(crate) fn info(f: &mut Frame, area: Rect, app: &App) {
             .collect();
 
         if inner.height >= 9 && inner.width >= 60 {
+            let core_desc = match sel.map(|p| p.effective_engine()) {
+                Some(vortex_core::model::CoreEngine::Xray) => "sing-box+xray     ",
+                Some(vortex_core::model::CoreEngine::WireGuard) => "wireguard/kern    ",
+                Some(vortex_core::model::CoreEngine::AmneziaWg) => "amneziawg/kern    ",
+                Some(vortex_core::model::CoreEngine::OpenVpn) => "openvpn           ",
+                _ => "sing-box/bpf      ",
+            };
+            let routing_desc = if vortex_core::storage::get_mode_preference().is_proxy() {
+                "PROXY (:1080)      "
+            } else {
+                "STRICT-ROUTE (vx0) "
+            };
+            let armed = app.shield_armed || shield::is_armed();
+            let shield_desc = if armed {
+                "KILL-SWITCH ARMED  "
+            } else {
+                "STANDBY (OFF)      "
+            };
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 " ┌─[ TARGET VECTOR INTELLIGENCE ]──────────────────────────┐",
@@ -654,16 +703,19 @@ pub(crate) fn info(f: &mut Frame, area: Rect, app: &App) {
             )));
             lines.push(Line::from(vec![
                 Span::styled(" │ CORE: ", Style::new().fg(BORDER)),
-                Span::styled("sing-box/bpf       ", Style::new().fg(CYAN)),
+                Span::styled(core_desc, Style::new().fg(CYAN)),
                 Span::styled(" ROUTING: ", Style::new().fg(BORDER)),
-                Span::styled("STRICT-ROUTE (vx0) ", Style::new().fg(FG)),
+                Span::styled(routing_desc, Style::new().fg(FG)),
                 Span::styled("│", Style::new().fg(BORDER)),
             ]));
             lines.push(Line::from(vec![
                 Span::styled(" │ DNS : ", Style::new().fg(BORDER)),
                 Span::styled("1.1.1.1 (DoH)      ", Style::new().fg(GREEN)),
                 Span::styled(" SHIELD : ", Style::new().fg(BORDER)),
-                Span::styled("KILL-SWITCH ARMED  ", Style::new().fg(PURPLE)),
+                Span::styled(
+                    shield_desc,
+                    Style::new().fg(if armed { PURPLE } else { FG_DIM }),
+                ),
                 Span::styled("│", Style::new().fg(BORDER)),
             ]));
             lines.push(Line::from(Span::styled(
@@ -674,4 +726,3 @@ pub(crate) fn info(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(Paragraph::new(lines), inner);
     }
 }
-

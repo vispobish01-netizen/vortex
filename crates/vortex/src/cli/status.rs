@@ -389,23 +389,9 @@ pub fn handle_status(args: &[String]) -> Result<()> {
                     match sess {
                         Some(s) => {
                             let up = tunnel::now().saturating_sub(s.since);
-                            (
-                                true,
-                                s.name,
-                                s.kind.tag().to_string(),
-                                s.server,
-                                up,
-                                armed,
-                            )
+                            (true, s.name, s.kind.tag().to_string(), s.server, up, armed)
                         }
-                        None => (
-                            false,
-                            String::new(),
-                            String::new(),
-                            String::new(),
-                            0,
-                            armed,
-                        ),
+                        None => (false, String::new(), String::new(), String::new(), 0, armed),
                     }
                 };
 
@@ -427,7 +413,8 @@ pub fn handle_status(args: &[String]) -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string(&err_json).unwrap_or_else(|_| {
-                    "{\"class\":[\"error\"],\"text\":\"vortex ?\",\"tooltip\":\"error\"}".to_string()
+                    "{\"class\":[\"error\"],\"text\":\"vortex ?\",\"tooltip\":\"error\"}"
+                        .to_string()
                 })
             );
         }
@@ -572,10 +559,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("must parse back");
 
         // 1. class is an array of strings
-        let class = parsed["class"].as_array().expect("class must be a JSON array");
+        let class = parsed["class"]
+            .as_array()
+            .expect("class must be a JSON array");
         assert_eq!(
             class,
-            serde_json::json!(["connected", "shield-armed"]).as_array().unwrap()
+            serde_json::json!(["connected", "shield-armed"])
+                .as_array()
+                .unwrap()
         );
 
         // 2. text and tooltip contain no raw & or < from node names
@@ -596,23 +587,18 @@ mod tests {
         }
 
         // Test disconnected
-        let disc_val = format_status_json(
-            false,
-            "",
-            "",
-            "",
-            0,
-            false,
-            OperationalMode::Proxy,
-        );
+        let disc_val = format_status_json(false, "", "", "", 0, false, OperationalMode::Proxy);
         let disc_parsed: serde_json::Value = serde_json::from_str(&disc_val.to_string()).unwrap();
         assert_eq!(
             disc_parsed["class"].as_array().unwrap(),
-            serde_json::json!(["disconnected", "shield-off"]).as_array().unwrap()
+            serde_json::json!(["disconnected", "shield-off"])
+                .as_array()
+                .unwrap()
         );
 
         // Test error format
-        let err_val = format_status_error_json("internal error: connection to <daemon> & socket failed");
+        let err_val =
+            format_status_error_json("internal error: connection to <daemon> & socket failed");
         let err_parsed: serde_json::Value = serde_json::from_str(&err_val.to_string()).unwrap();
         assert_eq!(
             err_parsed["class"].as_array().unwrap(),

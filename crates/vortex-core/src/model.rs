@@ -92,6 +92,50 @@ impl Kind {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreEngine {
+    #[default]
+    Auto,
+    SingBox,
+    Xray,
+    WireGuard,
+    AmneziaWg,
+    OpenVpn,
+}
+
+impl CoreEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CoreEngine::Auto => "auto",
+            CoreEngine::SingBox => "sing-box",
+            CoreEngine::Xray => "xray",
+            CoreEngine::WireGuard => "wireguard",
+            CoreEngine::AmneziaWg => "amneziawg",
+            CoreEngine::OpenVpn => "openvpn",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfilePayloadKind {
+    #[default]
+    Structured,
+    CustomOutbound,
+    CustomConfig,
+}
+
+impl ProfilePayloadKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProfilePayloadKind::Structured => "LINK",
+            ProfilePayloadKind::CustomOutbound => "OUTBOUND",
+            ProfilePayloadKind::CustomConfig => "CONFIG",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     Tcp,
@@ -102,6 +146,7 @@ pub enum Transport {
     H2,
     HttpUpgrade,
     Xhttp,
+    Xdrive,
     #[default]
     Unknown,
 }
@@ -116,6 +161,7 @@ impl Transport {
                 | Transport::H2
                 | Transport::HttpUpgrade
                 | Transport::Xhttp
+                | Transport::Xdrive
         )
     }
 
@@ -133,6 +179,7 @@ impl Transport {
             Transport::H2 => "TCP+H2",
             Transport::HttpUpgrade => "TCP+Upgrade",
             Transport::Xhttp => "TCP+XHTTP",
+            Transport::Xdrive => "TCP+XDrive",
             Transport::Unknown => "--",
         }
     }
@@ -250,6 +297,10 @@ pub struct Profile {
     pub post_quantum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_type: Option<String>,
+    #[serde(default)]
+    pub engine: CoreEngine,
+    #[serde(default)]
+    pub payload_kind: ProfilePayloadKind,
 }
 
 impl Profile {
@@ -292,6 +343,88 @@ impl Profile {
             pinned_peer_cert: None,
             post_quantum: None,
             backend_type: None,
+            engine: CoreEngine::Auto,
+            payload_kind: ProfilePayloadKind::Structured,
+        }
+    }
+
+    /// Returns true if this profile relies on Xray-core specific transports, encryption, or JSON schema.
+    pub fn needs_xray_core(&self) -> bool {
+        if self.kind == Kind::Wg || self.kind == Kind::Awg || self.kind == Kind::Ovpn {
+            return false;
+        }
+        if self.engine == CoreEngine::Xray
+            || self.backend_type.as_deref() == Some("xray")
+            || self.kind == Kind::Xray
+        {
+            return true;
+        }
+        if self.engine == CoreEngine::SingBox || self.backend_type.as_deref() == Some("sing-box") {
+            return false;
+        }
+        if matches!(self.transport, Transport::Xhttp | Transport::Xdrive)
+            || self.post_quantum.is_some()
+            || self.reality_spider_x.is_some()
+        {
+            return true;
+        }
+        let d = self.data.trim();
+        if d.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(d) {
+                let looks_xray = v.get("protocol").is_some()
+                    || v.get("streamSettings").is_some()
+                    || v.get("routing").is_some()
+                    || v["outbounds"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter().any(|o| {
+                                o.get("protocol").is_some() || o.get("streamSettings").is_some()
+                            })
+                        })
+                        .unwrap_or(false);
+                if looks_xray {
+                    return true;
+                }
+            }
+        }
+        if d.starts_with("vless://") {
+            if let Ok(u) = url::Url::parse(d) {
+                for (k, v) in u.query_pairs() {
+                    if k == "encryption" && !v.is_empty() && !v.eq_ignore_ascii_case("none") {
+                        return true;
+                    }
+                    if k == "extra" && !v.is_empty() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Resolves the effective core engine responsible for this profile.
+    pub fn effective_engine(&self) -> CoreEngine {
+        match self.kind {
+            Kind::Wg => return CoreEngine::WireGuard,
+            Kind::Awg => return CoreEngine::AmneziaWg,
+            Kind::Ovpn => return CoreEngine::OpenVpn,
+            _ => {}
+        }
+        if self.engine != CoreEngine::Auto {
+            return self.engine;
+        }
+        if let Some(bt) = self.backend_type.as_deref() {
+            if bt.eq_ignore_ascii_case("xray") {
+                return CoreEngine::Xray;
+            }
+            if bt.eq_ignore_ascii_case("sing-box") || bt.eq_ignore_ascii_case("singbox") {
+                return CoreEngine::SingBox;
+            }
+        }
+        if self.needs_xray_core() {
+            CoreEngine::Xray
+        } else {
+            CoreEngine::SingBox
         }
     }
 
@@ -305,6 +438,7 @@ impl Profile {
             Transport::H2 => "TCP+H2".to_string(),
             Transport::HttpUpgrade => "TCP+Upgrade".to_string(),
             Transport::Xhttp => "TCP+XHTTP".to_string(),
+            Transport::Xdrive => "TCP+XDrive".to_string(),
             Transport::Tcp => {
                 if self.security == Security::Reality {
                     "TCP+Reality".to_string()

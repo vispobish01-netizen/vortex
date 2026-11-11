@@ -309,7 +309,12 @@ pub(crate) fn qr_popup(
     f.render_widget(Paragraph::new(lines), det_inner);
 }
 
-pub(crate) fn subs_popup(f: &mut Frame, area: Rect, list: &mut ListState, subs: &[store::Subscription]) {
+pub(crate) fn subs_popup(
+    f: &mut Frame,
+    area: Rect,
+    list: &mut ListState,
+    subs: &[store::Subscription],
+) {
     let w = (area.width.saturating_sub(4)).min(88);
     let h = (area.height.saturating_sub(4)).min(20);
     let r = Rect {
@@ -1079,4 +1084,3 @@ pub(crate) fn help(f: &mut Frame, area: Rect) {
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
-

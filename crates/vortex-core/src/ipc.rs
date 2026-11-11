@@ -1,5 +1,8 @@
 use crate::error::VortexError;
-use crate::model::{ActiveFlow, LeakReport, ProbeResult, Profile, RoutingConfig, SpeedResult};
+use crate::model::{
+    ActiveFlow, LeakReport, ProbeResult, Profile, ReconReport, RoutingConfig, SpeedResult,
+    Subscription,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -84,6 +87,11 @@ pub enum IpcRequest {
     Connect {
         profile_id: String,
     },
+    ConnectWithCredentials {
+        profile_id: String,
+        username: String,
+        password: String,
+    },
     Disconnect,
     ToggleShield {
         enable: Option<bool>,
@@ -98,6 +106,23 @@ pub enum IpcRequest {
         id: String,
         new_name: String,
     },
+    SetAuth {
+        profile_id: String,
+        username: String,
+        password: String,
+    },
+    ClearAuth {
+        profile_id: String,
+    },
+    GetSubs,
+    AddSub {
+        url: String,
+        name: Option<String>,
+    },
+    RemoveSub {
+        id: String,
+        cleanup: bool,
+    },
     UpdateSubscriptions {
         target: Option<String>,
     },
@@ -106,6 +131,9 @@ pub enum IpcRequest {
     },
     RunSpeedTest,
     RunLeakTest,
+    RunRecon {
+        profile_id: String,
+    },
     GetFlows,
     KillFlow {
         id: String,
@@ -161,11 +189,17 @@ pub enum IpcResponse {
     ProfileAdded {
         count: usize,
     },
+    Subs(Vec<Subscription>),
+    SubAdded {
+        sub: Subscription,
+        count: usize,
+    },
     Flows(Vec<ActiveFlow>),
     Logs(Vec<String>),
     Speed(SpeedResult),
     Probe(Vec<ProbeResult>),
     Leak(LeakReport),
+    Recon(ReconReport),
     Routing(RoutingConfig),
     RulesConfig(RulesConfig),
     ExplainRoute(ExplainResult),
@@ -424,5 +458,41 @@ mod tests {
         let mut slice = &buffer[..];
         let decoded: IpcRequest = read_frame_sync(&mut slice).unwrap();
         assert_eq!(decoded, IpcRequest::Ping);
+    }
+
+    #[test]
+    fn test_new_ipc_variants_roundtrip() {
+        let requests = vec![
+            IpcRequest::GetSubs,
+            IpcRequest::AddSub {
+                url: "https://example.com/sub".into(),
+                name: Some("SubA".into()),
+            },
+            IpcRequest::RemoveSub {
+                id: "sub1".into(),
+                cleanup: true,
+            },
+            IpcRequest::RunRecon {
+                profile_id: "node-1".into(),
+            },
+            IpcRequest::SetAuth {
+                profile_id: "ovpn-1".into(),
+                username: "alice".into(),
+                password: "secret".into(),
+            },
+            IpcRequest::ConnectWithCredentials {
+                profile_id: "ovpn-1".into(),
+                username: "alice".into(),
+                password: "secret".into(),
+            },
+        ];
+
+        for req in requests {
+            let mut buf = Vec::new();
+            write_frame_sync(&mut buf, &req).unwrap();
+            let mut slice = &buf[..];
+            let decoded: IpcRequest = read_frame_sync(&mut slice).unwrap();
+            assert_eq!(decoded, req);
+        }
     }
 }

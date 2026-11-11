@@ -190,7 +190,15 @@ pub fn handle_speed() -> Result<()> {
         Some(s) => println!("\x1b[1;36m⚡ VORTEX // RUNNING LIVE THROUGHPUT BENCHMARK (TUNNEL: {})\x1b[0m...", s.name),
         None => println!("\x1b[1;33m⚡ VORTEX // RUNNING DIRECT THROUGHPUT BENCHMARK (NO TUNNEL ENGAGED)\x1b[0m..."),
     }
-    let res = benchmark::run_speed_test(4)?;
+    let res = if let Some(client) = get_ipc() {
+        match client.request_sync(&IpcRequest::RunSpeedTest)? {
+            IpcResponse::Speed(r) => r,
+            IpcResponse::Error(e) => bail!("Speed test failed: {e}"),
+            _ => benchmark::run_speed_test(4)?,
+        }
+    } else {
+        benchmark::run_speed_test(4)?
+    };
     println!("\x1b[1;32m✔ Benchmark Complete\x1b[0m");
     println!(
         "  Throughput  : \x1b[1;32m{:.2} Mbps\x1b[0m ({:.2} MB/s)",
@@ -213,7 +221,14 @@ pub fn handle_speed() -> Result<()> {
 }
 
 pub fn handle_flows() -> Result<()> {
-    let flows = tunnel::active_flows();
+    let flows = if let Some(client) = get_ipc() {
+        match client.request_sync(&IpcRequest::GetFlows) {
+            Ok(IpcResponse::Flows(f)) => f,
+            _ => tunnel::active_flows(),
+        }
+    } else {
+        tunnel::active_flows()
+    };
     println!(
         "\x1b[1;36m◈ 0xNET // ACTIVE FLOWS & SOCKET MATRIX ({} ESTABLISHED)\x1b[0m",
         flows.len()
@@ -341,7 +356,17 @@ pub fn handle_recon(args: &[String]) -> Result<()> {
     let p = find(q)?;
     println!("\x1b[1;36m⚡ VORTEX // EXECUTING DEEP NODE RECONNAISSANCE...\x1b[0m");
     println!("  Target: {} ({})\n", p.name, p.server);
-    let rep = recon::probe_recon(&p)?;
+    let rep = if let Some(client) = get_ipc() {
+        match client.request_sync(&IpcRequest::RunRecon {
+            profile_id: p.id.clone(),
+        })? {
+            IpcResponse::Recon(r) => r,
+            IpcResponse::Error(e) => bail!("Recon failed: {e}"),
+            _ => recon::probe_recon(&p)?,
+        }
+    } else {
+        recon::probe_recon(&p)?
+    };
     println!("\x1b[1;32m[+] ENDPOINT INTELLIGENCE\x1b[0m");
     println!("    Host / Target : {}:{}", rep.host, rep.port);
     println!("    Resolved IPv4 : {}", rep.resolved_ips.join(", "));
@@ -396,16 +421,33 @@ pub fn handle_recon(args: &[String]) -> Result<()> {
 
 pub fn handle_leaks() -> Result<()> {
     println!("\x1b[1;36m🛡 VORTEX // EXECUTING LEAK INTEGRITY SUITE...\x1b[0m\n");
-    let sess = tunnel::load_session();
-    let is_sec = sess.is_some();
-    let srv = sess.as_ref().map(|s| s.server.as_str());
-    let exit_ip = sess.as_ref().map(|_| tunnel::public_ip());
-
-    let rep = tokio::runtime::Runtime::new()?.block_on(vortex_core::leak::run_leak_suite(
-        is_sec,
-        srv,
-        exit_ip.as_deref(),
-    ));
+    let rep = if let Some(client) = get_ipc() {
+        match client.request_sync(&IpcRequest::RunLeakTest)? {
+            IpcResponse::Leak(r) => r,
+            IpcResponse::Error(e) => bail!("Leak check failed: {e}"),
+            _ => {
+                let sess = tunnel::load_session();
+                let is_sec = sess.is_some();
+                let srv = sess.as_ref().map(|s| s.server.as_str());
+                let exit_ip = sess.as_ref().map(|_| tunnel::public_ip());
+                tokio::runtime::Runtime::new()?.block_on(vortex_core::leak::run_leak_suite(
+                    is_sec,
+                    srv,
+                    exit_ip.as_deref(),
+                ))
+            }
+        }
+    } else {
+        let sess = tunnel::load_session();
+        let is_sec = sess.is_some();
+        let srv = sess.as_ref().map(|s| s.server.as_str());
+        let exit_ip = sess.as_ref().map(|_| tunnel::public_ip());
+        tokio::runtime::Runtime::new()?.block_on(vortex_core::leak::run_leak_suite(
+            is_sec,
+            srv,
+            exit_ip.as_deref(),
+        ))
+    };
 
     println!(
         "  \x1b[1mStatus:\x1b[0m       {}",
@@ -475,7 +517,7 @@ pub fn handle_check() -> Result<()> {
             .unwrap_or_else(|| "\x1b[1;31mNOT FOUND\x1b[0m".into())
     );
     println!(
-        "  Managed Binary       : {}",
+        "  Managed Sing-Box     : {}",
         if rep.is_managed_binary {
             "\x1b[1;32mYES (~/.local/share/vortex/bin/sing-box)\x1b[0m"
         } else {
@@ -483,11 +525,36 @@ pub fn handle_check() -> Result<()> {
         }
     );
     println!(
-        "  File Capabilities    : {}",
+        "  Sing-Box Caps        : {}",
         if rep.singbox_has_caps {
             "\x1b[1;32mVALID (cap_net_admin enabled)\x1b[0m"
         } else {
             "\x1b[1;33mNONE (missing cap_net_admin)\x1b[0m"
+        }
+    );
+    println!(
+        "  Xray-Core Binary     : {}",
+        rep.xray_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "\x1b[1;33mNOT FOUND (`vortex xray install`)\x1b[0m".into())
+    );
+    println!(
+        "  Xray-Core Caps       : {}",
+        if rep.xray_has_caps {
+            "\x1b[1;32mVALID (cap_net_admin,cap_net_raw enabled)\x1b[0m"
+        } else if rep.xray_found {
+            "\x1b[2mNONE (runs bridged via Sing-Box; standalone TUN needs caps)\x1b[0m"
+        } else {
+            "\x1b[2mN/A\x1b[0m"
+        }
+    );
+    println!(
+        "  Dual-Core Bridge     : {}",
+        if rep.singbox_found && rep.xray_found {
+            "\x1b[1;32mREADY (Sing-Box Master Router + Xray Bridge)\x1b[0m"
+        } else {
+            "\x1b[1;33mPARTIAL (single-core mode active)\x1b[0m"
         }
     );
     println!(

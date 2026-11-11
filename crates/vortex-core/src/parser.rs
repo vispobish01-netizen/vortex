@@ -293,10 +293,185 @@ pub fn parse_openvpn_conf(text: &str, default_name: Option<&str>) -> Result<Prof
     Ok(p)
 }
 
-/// Parses sing-box JSON configuration: extracts outbounds and server endpoints.
+fn is_singbox_infra_type(ty: &str) -> bool {
+    matches!(ty, "direct" | "block" | "dns" | "selector" | "urltest")
+}
+
+fn is_xray_infra_protocol(proto: &str) -> bool {
+    matches!(
+        proto,
+        "freedom" | "direct" | "blackhole" | "block" | "dns" | "loopback"
+    )
+}
+
+fn extract_xray_outbound_endpoint(ob: &Value) -> (String, u16) {
+    let settings = &ob["settings"];
+    if let Some(vnext) = settings["vnext"].as_array().and_then(|a| a.first()) {
+        let host = vnext["address"].as_str().unwrap_or("0.0.0.0").to_string();
+        let port = vnext["port"].as_u64().unwrap_or(443) as u16;
+        return (host, port);
+    }
+    if let Some(servers) = settings["servers"].as_array().and_then(|a| a.first()) {
+        let host = servers["address"].as_str().unwrap_or("0.0.0.0").to_string();
+        let port = servers["port"].as_u64().unwrap_or(443) as u16;
+        return (host, port);
+    }
+    if let Some(host) = settings["address"].as_str() {
+        let port = settings["port"].as_u64().unwrap_or(443) as u16;
+        return (host.to_string(), port);
+    }
+    ("0.0.0.0".to_string(), 443)
+}
+
+fn find_primary_xray_outbound(val: &Value) -> Option<&Value> {
+    if let Some(arr) = val["outbounds"].as_array() {
+        arr.iter()
+            .find(|ob| {
+                let proto = ob["protocol"].as_str().unwrap_or("").to_ascii_lowercase();
+                !proto.is_empty()
+                    && !is_xray_infra_protocol(&proto)
+                    && ob["settings"]["fragment"].is_null()
+                    && ob["settings"]["noises"].is_null()
+            })
+            .or_else(|| {
+                arr.iter().find(|ob| {
+                    let proto = ob["protocol"].as_str().unwrap_or("").to_ascii_lowercase();
+                    !proto.is_empty() && !is_xray_infra_protocol(&proto)
+                })
+            })
+            .or_else(|| arr.first())
+    } else if val.is_object() && val.get("protocol").is_some() {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn resolve_singbox_egress<'a>(
+    outbounds: &'a [Value],
+    tag: Option<&str>,
+    depth: u8,
+) -> Option<&'a Value> {
+    if depth == 0 || outbounds.is_empty() {
+        return None;
+    }
+    let target = if let Some(t) = tag.filter(|s| !s.is_empty()) {
+        outbounds.iter().find(|o| o["tag"].as_str() == Some(t))?
+    } else {
+        outbounds.first()?
+    };
+    let ty = target["type"].as_str().unwrap_or("");
+    if ty == "selector" || ty == "urltest" {
+        let next = target["default"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                target["outbounds"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+            });
+        return resolve_singbox_egress(outbounds, next, depth - 1);
+    }
+    if ty.is_empty() || is_singbox_infra_type(ty) {
+        return outbounds.iter().find(|o| {
+            let t = o["type"].as_str().unwrap_or("");
+            !t.is_empty() && !is_singbox_infra_type(t)
+        });
+    }
+    Some(target)
+}
+
+fn find_primary_singbox_outbound(val: &Value) -> Option<&Value> {
+    if let Some(arr) = val["outbounds"].as_array() {
+        let final_tag = val["route"]["final"].as_str();
+        resolve_singbox_egress(arr, final_tag, 6)
+    } else if val.is_object() && val.get("type").is_some() {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn map_singbox_kind(ob_type: &str) -> Option<Kind> {
+    match ob_type.to_ascii_lowercase().as_str() {
+        "vless" => Some(Kind::Vless),
+        "vmess" => Some(Kind::Vmess),
+        "trojan" => Some(Kind::Trojan),
+        "shadowsocks" | "ss" => Some(Kind::Ss),
+        "hysteria2" | "hy2" => Some(Kind::Hy2),
+        "tuic" => Some(Kind::Tuic),
+        "wireguard" => Some(Kind::Wg),
+        _ => None,
+    }
+}
+
+fn map_xray_kind(proto: &str) -> Option<Kind> {
+    match proto.to_ascii_lowercase().as_str() {
+        "vless" => Some(Kind::Vless),
+        "vmess" => Some(Kind::Vmess),
+        "trojan" => Some(Kind::Trojan),
+        "shadowsocks" => Some(Kind::Ss),
+        "hysteria2" => Some(Kind::Hy2),
+        _ => None,
+    }
+}
+
+/// Parses sing-box JSON configuration: preserves full configs losslessly and extracts custom outbounds.
 pub fn parse_singbox_json(json_text: &str) -> Result<Vec<Profile>, VortexError> {
     let val: Value = serde_json::from_str(json_text)
         .map_err(|e| VortexError::Parse(format!("Invalid sing-box JSON: {e}")))?;
+
+    let is_full_config = val.get("inbounds").is_some()
+        || val.get("route").is_some()
+        || val.get("dns").is_some()
+        || val.get("experimental").is_some()
+        || val.get("endpoints").is_some()
+        || val["outbounds"]
+            .as_array()
+            .map(|arr| {
+                arr.len() > 1
+                    && arr.iter().any(|o| {
+                        let ty = o["type"].as_str().unwrap_or("");
+                        is_singbox_infra_type(ty)
+                            || o.get("detour")
+                                .and_then(|d| d.as_str())
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                    })
+            })
+            .unwrap_or(false);
+
+    if is_full_config {
+        let primary = find_primary_singbox_outbound(&val);
+        let kind = primary
+            .and_then(|o| o["type"].as_str())
+            .and_then(map_singbox_kind)
+            .unwrap_or(Kind::Vless);
+        let name = val["remarks"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                primary
+                    .and_then(|o| o["tag"].as_str())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or("sing-box Config");
+        let endpoint = primary
+            .and_then(|o| {
+                let srv = o["server"].as_str().filter(|s| !s.is_empty())?;
+                let port = o["server_port"].as_u64().unwrap_or(443);
+                Some(format!("{srv}:{port}"))
+            })
+            .unwrap_or_else(|| "127.0.0.1:1080".into());
+
+        let mut p = Profile::new("", name, kind, endpoint, json_text.trim());
+        p.engine = crate::model::CoreEngine::SingBox;
+        p.backend_type = Some("sing-box".into());
+        p.payload_kind = crate::model::ProfilePayloadKind::CustomConfig;
+        derive_metadata_for_profile(&mut p);
+        return Ok(vec![p]);
+    }
 
     let mut profiles = vec![];
     let outbounds = if let Some(arr) = val["outbounds"].as_array() {
@@ -311,17 +486,10 @@ pub fn parse_singbox_json(json_text: &str) -> Result<Vec<Profile>, VortexError> 
 
     for ob in outbounds {
         let ob_type = ob["type"].as_str().unwrap_or("");
-        let kind = match ob_type {
-            "vless" => Kind::Vless,
-            "vmess" => Kind::Vmess,
-            "trojan" => Kind::Trojan,
-            "shadowsocks" => Kind::Ss,
-            "hysteria2" => Kind::Hy2,
-            "tuic" => Kind::Tuic,
-            "wireguard" => Kind::Wg,
-            _ => continue,
-        };
-
+        if is_singbox_infra_type(ob_type) {
+            continue;
+        }
+        let kind = map_singbox_kind(ob_type).unwrap_or(Kind::Vless);
         let tag = ob["tag"].as_str().unwrap_or("sing-box");
         let server = ob["server"].as_str().unwrap_or("");
         let port = ob["server_port"].as_u64().unwrap_or(443);
@@ -333,6 +501,9 @@ pub fn parse_singbox_json(json_text: &str) -> Result<Vec<Profile>, VortexError> 
 
         let data = serde_json::to_string_pretty(&ob).unwrap_or_default();
         let mut p = Profile::new("", tag, kind, endpoint, data);
+        p.engine = crate::model::CoreEngine::SingBox;
+        p.backend_type = Some("sing-box".into());
+        p.payload_kind = crate::model::ProfilePayloadKind::CustomOutbound;
         derive_metadata_for_profile(&mut p);
         profiles.push(p);
     }
@@ -347,9 +518,58 @@ pub fn parse_singbox_json(json_text: &str) -> Result<Vec<Profile>, VortexError> 
 }
 
 /// Parses an Xray JSON configuration or outbound definition into Profiles.
+/// Full configs (with routing/inbounds/dns/policy/chains) are preserved losslessly.
 pub fn parse_xray_json(json_text: &str) -> Result<Vec<Profile>, VortexError> {
     let val: Value = serde_json::from_str(json_text)
         .map_err(|e| VortexError::Parse(format!("Invalid Xray JSON: {e}")))?;
+
+    let is_full_config = val.get("inbounds").is_some()
+        || val.get("routing").is_some()
+        || val.get("dns").is_some()
+        || val.get("policy").is_some()
+        || val.get("observatory").is_some()
+        || val.get("burstObservatory").is_some()
+        || val.get("fakedns").is_some()
+        || val["outbounds"]
+            .as_array()
+            .map(|arr| {
+                arr.len() > 1
+                    && arr.iter().any(|o| {
+                        let proto = o["protocol"].as_str().unwrap_or("").to_ascii_lowercase();
+                        is_xray_infra_protocol(&proto)
+                            || !o["settings"]["fragment"].is_null()
+                            || !o["settings"]["noises"].is_null()
+                            || o["streamSettings"]["sockopt"]["dialerProxy"]
+                                .as_str()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                    })
+            })
+            .unwrap_or(false);
+
+    if is_full_config {
+        let primary = find_primary_xray_outbound(&val);
+        let (host, port) = primary
+            .map(extract_xray_outbound_endpoint)
+            .unwrap_or_else(|| ("127.0.0.1".into(), 1080));
+        let endpoint = format!("{host}:{port}");
+        let name = val["remarks"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                primary
+                    .and_then(|o| o["tag"].as_str())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or("Xray Config");
+
+        let mut p = Profile::new("", name, Kind::Xray, endpoint, json_text.trim());
+        p.engine = crate::model::CoreEngine::Xray;
+        p.backend_type = Some("xray".into());
+        p.payload_kind = crate::model::ProfilePayloadKind::CustomConfig;
+        derive_metadata_for_profile(&mut p);
+        return Ok(vec![p]);
+    }
 
     let mut profiles = vec![];
 
@@ -357,18 +577,6 @@ pub fn parse_xray_json(json_text: &str) -> Result<Vec<Profile>, VortexError> {
         arr.clone()
     } else if val.is_object() && val.get("protocol").is_some() {
         vec![val.clone()]
-    } else if val.is_object() && val.get("inbounds").is_some() {
-        // Full Xray configuration file
-        let mut p = Profile::new(
-            "",
-            "Xray Tunnel Config",
-            Kind::Xray,
-            "127.0.0.1:1080",
-            json_text.trim(),
-        );
-        p.backend_type = Some("xray".into());
-        derive_metadata_for_profile(&mut p);
-        return Ok(vec![p]);
     } else {
         return Err(VortexError::Parse(
             "Xray JSON missing 'outbounds' or 'protocol' definition".into(),
@@ -377,41 +585,19 @@ pub fn parse_xray_json(json_text: &str) -> Result<Vec<Profile>, VortexError> {
 
     for ob in outbounds {
         let proto = ob["protocol"].as_str().unwrap_or("").to_ascii_lowercase();
-        let kind = match proto.as_str() {
-            "vless" => Kind::Vless,
-            "vmess" => Kind::Vmess,
-            "trojan" => Kind::Trojan,
-            "shadowsocks" => Kind::Ss,
-            "hysteria2" => Kind::Hy2,
-            _ => continue,
-        };
-
-        let tag = ob["tag"].as_str().unwrap_or("xray-proxy");
-
-        // Try extracting address and port
-        let mut host = "0.0.0.0";
-        let mut port = 443u16;
-
-        if let Some(vnext) = ob["settings"]["vnext"].as_array().and_then(|a| a.first()) {
-            if let Some(h) = vnext["address"].as_str() {
-                host = h;
-            }
-            if let Some(p) = vnext["port"].as_u64() {
-                port = p as u16;
-            }
-        } else if let Some(servers) = ob["settings"]["servers"].as_array().and_then(|a| a.first()) {
-            if let Some(h) = servers["address"].as_str() {
-                host = h;
-            }
-            if let Some(p) = servers["port"].as_u64() {
-                port = p as u16;
-            }
+        if is_xray_infra_protocol(&proto) {
+            continue;
         }
+        let kind = map_xray_kind(&proto).unwrap_or(Kind::Xray);
+        let tag = ob["tag"].as_str().unwrap_or("xray-proxy");
+        let (host, port) = extract_xray_outbound_endpoint(&ob);
 
         let endpoint = format!("{host}:{port}");
         let data = serde_json::to_string_pretty(&ob).unwrap_or_default();
         let mut p = Profile::new("", tag, kind, endpoint, data);
+        p.engine = crate::model::CoreEngine::Xray;
         p.backend_type = Some("xray".into());
+        p.payload_kind = crate::model::ProfilePayloadKind::CustomOutbound;
         derive_metadata_for_profile(&mut p);
         profiles.push(p);
     }
@@ -423,6 +609,420 @@ pub fn parse_xray_json(json_text: &str) -> Result<Vec<Profile>, VortexError> {
     }
 
     Ok(profiles)
+}
+
+// ───────────────────── Unified sing-box Outbound Builder ─────────────────────
+
+fn query_map(u: &Url) -> std::collections::HashMap<String, String> {
+    u.query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn truthy_param(q: &std::collections::HashMap<String, String>, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|k| q.get(*k).map(|v| v == "1" || v == "true").unwrap_or(false))
+}
+
+fn singbox_tls_block(
+    q: &std::collections::HashMap<String, String>,
+    default_on: bool,
+) -> Option<Value> {
+    let sec = q
+        .get("security")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(if default_on { "tls" } else { "none" });
+    if sec != "tls" && sec != "reality" {
+        return None;
+    }
+    let mut t = serde_json::json!({"enabled": true});
+    if let Some(s) = q
+        .get("sni")
+        .or_else(|| q.get("peer"))
+        .filter(|s| !s.is_empty())
+    {
+        t["server_name"] = serde_json::json!(s);
+    }
+    if let Some(a) = q.get("alpn").filter(|s| !s.is_empty()) {
+        t["alpn"] = serde_json::json!(a.split(',').collect::<Vec<_>>());
+    }
+    if truthy_param(q, &["allowInsecure", "insecure", "allow_insecure"]) {
+        t["insecure"] = serde_json::json!(true);
+    }
+    let fp = q
+        .get("fp")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .or_else(|| (sec == "reality").then(|| "chrome".to_string()));
+    if let Some(fp) = fp {
+        t["utls"] = serde_json::json!({"enabled": true, "fingerprint": fp});
+    }
+    if sec == "reality" {
+        t["reality"] = serde_json::json!({
+            "enabled": true,
+            "public_key": q.get("pbk").cloned().unwrap_or_default(),
+            "short_id": q.get("sid").cloned().unwrap_or_default(),
+        });
+    }
+    Some(t)
+}
+
+fn singbox_transport_block(
+    q: &std::collections::HashMap<String, String>,
+) -> Result<Option<Value>, VortexError> {
+    let ty = q.get("type").map(String::as_str).unwrap_or("tcp");
+    let path = q.get("path").cloned().unwrap_or_default();
+    let host = q.get("host").filter(|s| !s.is_empty()).cloned();
+    let norm = |p: &str| {
+        if p.is_empty() {
+            "/".to_string()
+        } else {
+            p.to_string()
+        }
+    };
+    Ok(match ty {
+        "" | "tcp" | "raw" | "none" => None,
+        "ws" | "websocket" => {
+            let (p, ed) = match path.split_once("?ed=") {
+                Some((a, e)) => (a.to_string(), e.parse::<u32>().ok()),
+                None => (path.clone(), None),
+            };
+            let p = norm(&p);
+            let mut t = serde_json::json!({"type": "ws", "path": p});
+            if let Some(h) = host {
+                t["headers"] = serde_json::json!({"Host": h});
+            }
+            if let Some(n) = ed {
+                t["max_early_data"] = serde_json::json!(n);
+                t["early_data_header_name"] = serde_json::json!("Sec-WebSocket-Protocol");
+            }
+            Some(t)
+        }
+        "grpc" => {
+            let sn = q.get("serviceName").cloned().unwrap_or_default();
+            Some(serde_json::json!({"type": "grpc", "service_name": sn}))
+        }
+        "http" | "h2" => {
+            let p = norm(&path);
+            let mut t = serde_json::json!({"type": "http", "path": p});
+            if let Some(h) = host {
+                t["host"] = serde_json::json!(h.split(',').collect::<Vec<_>>());
+            }
+            Some(t)
+        }
+        "httpupgrade" => {
+            let p = norm(&path);
+            let mut t = serde_json::json!({"type": "httpupgrade", "path": p});
+            if let Some(h) = host {
+                t["host"] = serde_json::json!(h);
+            }
+            Some(t)
+        }
+        "xhttp" | "splithttp" => {
+            let p = norm(&path);
+            let mut t = serde_json::json!({"type": "xhttp", "path": p});
+            if let Some(h) = host {
+                t["host"] = serde_json::json!(h);
+            }
+            Some(t)
+        }
+        other => {
+            return Err(VortexError::Parse(format!(
+                "transport '{other}' is not supported by sing-box outbound builder"
+            )))
+        }
+    })
+}
+
+fn uri_host_port(u: &Url) -> Result<(String, u16), VortexError> {
+    let h = u
+        .host_str()
+        .ok_or_else(|| VortexError::Parse("link has no host".into()))?
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_string();
+    let p = u
+        .port()
+        .ok_or_else(|| VortexError::Parse("link has no port".into()))?;
+    Ok((h, p))
+}
+
+fn uri_fragment(u: &Url, h: &str, p: u16) -> String {
+    u.fragment()
+        .map(pct_decode)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{h}:{p}"))
+}
+
+fn singbox_uri_proxy(l: &str, kind: Kind) -> Result<(Value, String, String), VortexError> {
+    let u = Url::parse(l).map_err(|e| VortexError::Parse(format!("invalid link: {e}")))?;
+    let (h, p) = uri_host_port(&u)?;
+    let q = query_map(&u);
+    let user = pct_decode(u.username());
+    let mut o = if kind == Kind::Vless {
+        serde_json::json!({
+            "type": "vless", "tag": "proxy", "server": h, "server_port": p,
+            "uuid": user, "packet_encoding": "xudp"
+        })
+    } else {
+        serde_json::json!({
+            "type": "trojan", "tag": "proxy", "server": h, "server_port": p,
+            "password": user
+        })
+    };
+    if kind == Kind::Vless {
+        if let Some(f) = q.get("flow").filter(|s| !s.is_empty()) {
+            o["flow"] = serde_json::json!(f);
+        }
+    }
+    if let Some(t) = singbox_tls_block(&q, kind == Kind::Trojan) {
+        o["tls"] = t;
+    }
+    if let Some(t) = singbox_transport_block(&q)? {
+        o["transport"] = t;
+    }
+    Ok((o, uri_fragment(&u, &h, p), format!("{h}:{p}")))
+}
+
+fn singbox_vmess(l: &str) -> Result<(Value, String, String), VortexError> {
+    let body = l
+        .strip_prefix("vmess://")
+        .ok_or_else(|| VortexError::Parse("expected vmess://".into()))?;
+    let body = body.split('#').next().unwrap_or(body);
+    if let Ok(raw) = decode_base64_flexible(body) {
+        if let Ok(v) = serde_json::from_slice::<Value>(&raw) {
+            let s = |k: &str| -> String {
+                match &v[k] {
+                    Value::String(x) => x.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => String::new(),
+                }
+            };
+            let h = s("add");
+            let port: u16 = s("port")
+                .parse()
+                .map_err(|_| VortexError::Parse("vmess: bad port".into()))?;
+            let scy = if s("scy").is_empty() {
+                "auto".to_string()
+            } else {
+                s("scy")
+            };
+            let mut o = serde_json::json!({
+                "type": "vmess", "tag": "proxy", "server": h, "server_port": port,
+                "uuid": s("id"), "security": scy, "alter_id": s("aid").parse::<u32>().unwrap_or(0),
+            });
+            let mut q = std::collections::HashMap::new();
+            let net = s("net");
+            q.insert("type".into(), net.clone());
+            q.insert("path".into(), s("path"));
+            q.insert("host".into(), s("host"));
+            if net == "grpc" {
+                q.insert("serviceName".into(), s("path"));
+            }
+            q.insert(
+                "security".into(),
+                if s("tls") == "tls" {
+                    "tls".into()
+                } else {
+                    "none".into()
+                },
+            );
+            q.insert("sni".into(), s("sni"));
+            q.insert("alpn".into(), s("alpn"));
+            q.insert("fp".into(), s("fp"));
+            if let Some(t) = singbox_tls_block(&q, false) {
+                o["tls"] = t;
+            }
+            if let Some(t) = singbox_transport_block(&q)? {
+                o["transport"] = t;
+            }
+            let name = if s("ps").is_empty() {
+                format!("{h}:{port}")
+            } else {
+                s("ps")
+            };
+            return Ok((o, name, format!("{h}:{port}")));
+        }
+    }
+    let (mut o, n, sv) = singbox_uri_proxy(l, Kind::Vless)?;
+    o["type"] = serde_json::json!("vmess");
+    o["security"] = serde_json::json!("auto");
+    o["alter_id"] = serde_json::json!(0);
+    if let Some(m) = o.as_object_mut() {
+        m.remove("flow");
+        m.remove("packet_encoding");
+    }
+    Ok((o, n, sv))
+}
+
+fn singbox_shadowsocks(l: &str) -> Result<(Value, String, String), VortexError> {
+    let mut rest = l
+        .strip_prefix("ss://")
+        .ok_or_else(|| VortexError::Parse("expected ss://".into()))?;
+    let mut name = String::new();
+    if let Some((a, f)) = rest.split_once('#') {
+        name = pct_decode(f);
+        rest = a;
+    }
+    let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let rest = rest.trim_end_matches('/');
+    let (userinfo, hostport) = if let Some((ui, hp)) = rest.rsplit_once('@') {
+        let ui = if ui.contains(':') {
+            pct_decode(ui)
+        } else {
+            let decoded = decode_base64_flexible(&pct_decode(ui))?;
+            String::from_utf8(decoded)
+                .map_err(|e| VortexError::Parse(format!("bad ss userinfo: {e}")))?
+        };
+        (ui, hp.to_string())
+    } else {
+        let d = decode_base64_flexible(rest)?;
+        let s =
+            String::from_utf8(d).map_err(|e| VortexError::Parse(format!("bad ss base64: {e}")))?;
+        let (ui, hp) = s
+            .rsplit_once('@')
+            .ok_or_else(|| VortexError::Parse("bad ss link".into()))?;
+        (ui.to_string(), hp.to_string())
+    };
+    let (method, pass) = userinfo
+        .split_once(':')
+        .ok_or_else(|| VortexError::Parse("bad ss credentials".into()))?;
+    let (h, p) = hostport
+        .rsplit_once(':')
+        .ok_or_else(|| VortexError::Parse("bad ss host".into()))?;
+    let h = h.trim_matches(|c| c == '[' || c == ']');
+    let port: u16 = p
+        .trim_end_matches('/')
+        .parse()
+        .map_err(|_| VortexError::Parse("bad ss port".into()))?;
+    let mut o = serde_json::json!({
+        "type": "shadowsocks", "tag": "proxy", "server": h, "server_port": port,
+        "method": method, "password": pass
+    });
+    for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+        if k == "plugin" {
+            let v = v.to_string();
+            let (n, opts) = v.split_once(';').unwrap_or((v.as_str(), ""));
+            o["plugin"] = serde_json::json!(n);
+            if !opts.is_empty() {
+                o["plugin_opts"] = serde_json::json!(opts);
+            }
+        }
+    }
+    let sv = format!("{h}:{port}");
+    Ok((o, if name.is_empty() { sv.clone() } else { name }, sv))
+}
+
+fn singbox_hy2(l: &str) -> Result<(Value, String, String), VortexError> {
+    let l2 = l.replacen("hy2://", "hysteria2://", 1);
+    let u = Url::parse(&l2).map_err(|e| VortexError::Parse(format!("invalid hy2 link: {e}")))?;
+    let h = u
+        .host_str()
+        .ok_or_else(|| VortexError::Parse("link has no host".into()))?
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_string();
+    let port = u.port().unwrap_or(443);
+    let pass = match u.password() {
+        Some(pw) => format!("{}:{}", pct_decode(u.username()), pct_decode(pw)),
+        None => pct_decode(u.username()),
+    };
+    let q = query_map(&u);
+    let mut tls = serde_json::json!({"enabled": true, "alpn": ["h3"]});
+    if let Some(s) = q.get("sni").filter(|s| !s.is_empty()) {
+        tls["server_name"] = serde_json::json!(s);
+    }
+    if truthy_param(&q, &["insecure", "allowInsecure"]) {
+        tls["insecure"] = serde_json::json!(true);
+    }
+    let mut o = serde_json::json!({
+        "type": "hysteria2", "tag": "proxy", "server": h, "server_port": port,
+        "password": pass, "tls": tls
+    });
+    if let Some(t) = q.get("obfs").filter(|s| !s.is_empty() && *s != "none") {
+        o["obfs"] = serde_json::json!({
+            "type": t,
+            "password": q.get("obfs-password").cloned().unwrap_or_default()
+        });
+    }
+    if let Some(m) = q.get("mport").filter(|s| !s.is_empty()) {
+        o["server_ports"] = serde_json::json!(m
+            .split(',')
+            .map(|x| x.replace('-', ":"))
+            .collect::<Vec<_>>());
+        if let Some(m) = o.as_object_mut() {
+            m.remove("server_port");
+        }
+    }
+    Ok((o, uri_fragment(&u, &h, port), format!("{h}:{port}")))
+}
+
+fn singbox_tuic(l: &str) -> Result<(Value, String, String), VortexError> {
+    let u = Url::parse(l).map_err(|e| VortexError::Parse(format!("invalid tuic link: {e}")))?;
+    let (h, p) = uri_host_port(&u)?;
+    let q = query_map(&u);
+    let cc = q
+        .get("congestion_control")
+        .cloned()
+        .unwrap_or_else(|| "bbr".into());
+    let um = q
+        .get("udp_relay_mode")
+        .cloned()
+        .unwrap_or_else(|| "native".into());
+    let mut o = serde_json::json!({
+        "type": "tuic", "tag": "proxy", "server": h, "server_port": p,
+        "uuid": pct_decode(u.username()),
+        "password": pct_decode(u.password().unwrap_or("")),
+        "congestion_control": cc,
+        "udp_relay_mode": um,
+    });
+    if let Some(t) = singbox_tls_block(&q, true) {
+        o["tls"] = t;
+    }
+    Ok((o, uri_fragment(&u, &h, p), format!("{h}:{p}")))
+}
+
+/// Builds a sing-box outbound JSON object from a share URI or raw sing-box outbound JSON.
+pub fn singbox_outbound_from_str(link: &str) -> Result<(Kind, Value, String, String), VortexError> {
+    let trimmed = link.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(mut ob) = serde_json::from_str::<Value>(trimmed) {
+            // If a full sing-box config was passed, extract its primary outbound for inspection
+            if ob.get("outbounds").is_some() && ob.get("type").is_none() {
+                if let Some(primary) = find_primary_singbox_outbound(&ob).cloned() {
+                    ob = primary;
+                }
+            }
+            let ty = ob["type"].as_str().unwrap_or("").to_ascii_lowercase();
+            let k = map_singbox_kind(&ty).ok_or_else(|| {
+                VortexError::Parse(format!("unsupported sing-box outbound type '{ty}'"))
+            })?;
+            let name = ob["tag"].as_str().unwrap_or("proxy").to_string();
+            let srv = ob["server"].as_str().unwrap_or("");
+            let port = ob["server_port"].as_u64().unwrap_or(443);
+            let server_str = format!("{srv}:{port}");
+            ob["tag"] = serde_json::json!("proxy");
+            return Ok((k, ob, name, server_str));
+        }
+    }
+    let scheme = trimmed
+        .split("://")
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (k, (o, n, s)) = match scheme.as_str() {
+        "vless" => (Kind::Vless, singbox_uri_proxy(trimmed, Kind::Vless)?),
+        "trojan" => (Kind::Trojan, singbox_uri_proxy(trimmed, Kind::Trojan)?),
+        "vmess" => (Kind::Vmess, singbox_vmess(trimmed)?),
+        "ss" => (Kind::Ss, singbox_shadowsocks(trimmed)?),
+        "hy2" | "hysteria2" => (Kind::Hy2, singbox_hy2(trimmed)?),
+        "tuic" => (Kind::Tuic, singbox_tuic(trimmed)?),
+        _ => {
+            return Err(VortexError::Parse(format!(
+                "unsupported link scheme '{scheme}://'"
+            )))
+        }
+    };
+    Ok((k, o, n, s))
 }
 
 /// Derives Transport, Security, and other metadata from the PARSED config text/data.
@@ -450,7 +1050,8 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 .unwrap_or_default();
             p.transport = match net.as_str() {
                 "xhttp" | "splithttp" => Transport::Xhttp,
-                "tcp" | "" => Transport::Tcp,
+                "xdrive" => Transport::Xdrive,
+                "tcp" | "raw" | "" => Transport::Tcp,
                 "ws" | "websocket" => Transport::Ws,
                 "grpc" => Transport::Grpc,
                 "h2" | "http" => Transport::H2,
@@ -458,9 +1059,6 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 "quic" => Transport::Quic,
                 _ => Transport::Unknown,
             };
-            if p.transport == Transport::Xhttp {
-                p.backend_type = Some("xray".into());
-            }
             let sec = q
                 .get("security")
                 .map(|s| s.to_ascii_lowercase())
@@ -481,7 +1079,19 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
             p.reality_spider_x = q.get("spx").cloned();
             p.ech = q.get("ech").cloned();
             p.pinned_peer_cert = q.get("pinnedPeerCertificateChainSha256").cloned();
-            p.post_quantum = q.get("pq").cloned();
+            let enc_pq = q
+                .get("encryption")
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+                .cloned();
+            p.post_quantum = q.get("pq").cloned().or(enc_pq);
+
+            if matches!(p.transport, Transport::Xhttp | Transport::Xdrive)
+                || p.post_quantum.is_some()
+                || q.get("extra").map(|s| !s.is_empty()).unwrap_or(false)
+            {
+                p.engine = crate::model::CoreEngine::Xray;
+                p.backend_type = Some("xray".into());
+            }
             return;
         }
     }
@@ -501,16 +1111,18 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 }
                 let net = val["net"].as_str().unwrap_or("tcp").to_ascii_lowercase();
                 p.transport = match net.as_str() {
-                    "tcp" | "" | "none" => Transport::Tcp,
+                    "tcp" | "raw" | "" | "none" => Transport::Tcp,
                     "ws" => Transport::Ws,
                     "grpc" => Transport::Grpc,
                     "h2" | "http" => Transport::H2,
                     "httpupgrade" => Transport::HttpUpgrade,
                     "xhttp" | "splithttp" => Transport::Xhttp,
+                    "xdrive" => Transport::Xdrive,
                     "quic" => Transport::Quic,
                     _ => Transport::Unknown,
                 };
-                if p.transport == Transport::Xhttp {
+                if matches!(p.transport, Transport::Xhttp | Transport::Xdrive) {
+                    p.engine = crate::model::CoreEngine::Xray;
                     p.backend_type = Some("xray".into());
                 }
                 let tls = val["tls"].as_str().unwrap_or("none").to_ascii_lowercase();
@@ -540,15 +1152,17 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_default();
             p.transport = match net.as_str() {
-                "tcp" | "" => Transport::Tcp,
+                "tcp" | "raw" | "" => Transport::Tcp,
                 "ws" => Transport::Ws,
                 "grpc" => Transport::Grpc,
                 "h2" | "http" => Transport::H2,
                 "httpupgrade" => Transport::HttpUpgrade,
                 "xhttp" | "splithttp" => Transport::Xhttp,
+                "xdrive" => Transport::Xdrive,
                 _ => Transport::Unknown,
             };
-            if p.transport == Transport::Xhttp {
+            if matches!(p.transport, Transport::Xhttp | Transport::Xdrive) {
+                p.engine = crate::model::CoreEngine::Xray;
                 p.backend_type = Some("xray".into());
             }
             let sec = q
@@ -581,15 +1195,17 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 .map(|s| s.to_ascii_lowercase())
                 .unwrap_or_default();
             p.transport = match net.as_str() {
-                "tcp" | "" => Transport::Tcp,
+                "tcp" | "raw" | "" => Transport::Tcp,
                 "ws" | "websocket" => Transport::Ws,
                 "grpc" => Transport::Grpc,
                 "h2" | "http" => Transport::H2,
                 "httpupgrade" => Transport::HttpUpgrade,
                 "xhttp" | "splithttp" => Transport::Xhttp,
+                "xdrive" => Transport::Xdrive,
                 _ => Transport::Unknown,
             };
-            if p.transport == Transport::Xhttp {
+            if matches!(p.transport, Transport::Xhttp | Transport::Xdrive) {
+                p.engine = crate::model::CoreEngine::Xray;
                 p.backend_type = Some("xray".into());
             }
             let sec = q
@@ -768,11 +1384,39 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
 
     // 9. JSON config or outbound (sing-box or Xray)
     if let Ok(val) = serde_json::from_str::<Value>(data) {
-        let ob = if let Some(arr) = val["outbounds"].as_array().and_then(|a| a.first()) {
-            arr
-        } else if val.is_object() && (val.get("type").is_some() || val.get("protocol").is_some()) {
-            &val
+        let is_xray = val.get("protocol").is_some()
+            || val.get("streamSettings").is_some()
+            || val.get("routing").is_some()
+            || val.get("policy").is_some()
+            || val["outbounds"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .any(|o| o.get("protocol").is_some() || o.get("streamSettings").is_some())
+                })
+                .unwrap_or(false);
+
+        let is_full = val.get("inbounds").is_some()
+            || val.get("routing").is_some()
+            || val.get("route").is_some()
+            || val.get("dns").is_some()
+            || val.get("experimental").is_some()
+            || val.get("policy").is_some();
+
+        if p.payload_kind == crate::model::ProfilePayloadKind::Structured {
+            p.payload_kind = if is_full {
+                crate::model::ProfilePayloadKind::CustomConfig
+            } else {
+                crate::model::ProfilePayloadKind::CustomOutbound
+            };
+        }
+
+        let ob_opt = if is_xray {
+            find_primary_xray_outbound(&val)
         } else {
+            find_primary_singbox_outbound(&val)
+        };
+        let Some(ob) = ob_opt else {
             p.transport = Transport::Unknown;
             p.security = Security::Unknown;
             return;
@@ -780,6 +1424,8 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
 
         // Handle Xray outbound: has "protocol" and optionally "streamSettings"
         if let Some(proto) = ob.get("protocol").and_then(|v| v.as_str()) {
+            p.engine = crate::model::CoreEngine::Xray;
+            p.backend_type = Some("xray".into());
             if let Some(stream) = ob.get("streamSettings") {
                 let net = stream["network"]
                     .as_str()
@@ -789,11 +1435,12 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                     "ws" => Transport::Ws,
                     "grpc" => Transport::Grpc,
                     "xhttp" | "splithttp" => Transport::Xhttp,
+                    "xdrive" => Transport::Xdrive,
                     "http" | "h2" => Transport::H2,
                     "httpupgrade" => Transport::HttpUpgrade,
                     "quic" => Transport::Quic,
                     "kcp" => Transport::Udp,
-                    "tcp" | "" => Transport::Tcp,
+                    "tcp" | "raw" | "" => Transport::Tcp,
                     _ => Transport::Unknown,
                 };
 
@@ -808,7 +1455,10 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                 if sec == "reality" {
                     let r = &stream["realitySettings"];
                     p.sni = r["serverName"].as_str().map(String::from);
-                    p.reality_public_key = r["publicKey"].as_str().map(String::from);
+                    p.reality_public_key = r["publicKey"]
+                        .as_str()
+                        .or_else(|| r["password"].as_str())
+                        .map(String::from);
                     p.reality_short_id = r["shortId"].as_str().map(String::from);
                     p.reality_spider_x = r["spiderX"].as_str().map(String::from);
                     p.fingerprint = r["fingerprint"].as_str().map(String::from);
@@ -841,17 +1491,15 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
             }
 
             if p.port.is_none() {
-                if let Some(vnext) = ob["settings"]["vnext"].as_array().and_then(|a| a.first()) {
-                    p.port = vnext["port"].as_u64().map(|x| x as u16);
-                } else if let Some(servers) =
-                    ob["settings"]["servers"].as_array().and_then(|a| a.first())
-                {
-                    p.port = servers["port"].as_u64().map(|x| x as u16);
-                }
+                let (_, ep_port) = extract_xray_outbound_endpoint(ob);
+                p.port = Some(ep_port);
             }
             return;
         }
 
+        if p.engine == crate::model::CoreEngine::Auto {
+            p.engine = crate::model::CoreEngine::SingBox;
+        }
         let ty = ob["type"].as_str().unwrap_or("");
         p.port = ob["server_port"].as_u64().map(|p| p as u16);
         match ty {
@@ -880,6 +1528,7 @@ pub fn derive_metadata_for_profile(p: &mut Profile) {
                     "grpc" => Transport::Grpc,
                     "http" | "h2" => Transport::H2,
                     "httpupgrade" => Transport::HttpUpgrade,
+                    "xhttp" | "splithttp" => Transport::Xhttp,
                     "quic" => Transport::Quic,
                     "tcp" | "" => Transport::Tcp,
                     _ => Transport::Unknown,
@@ -993,34 +1642,38 @@ pub fn parse_amnezia(uri: &str) -> Result<Vec<Profile>, VortexError> {
     Ok(profiles)
 }
 
-/// Decodes QR code image from file path using rqrr and image.
+/// Decodes QR code image from file path using pure-Rust rqrr (with zbarimg fallback).
 pub fn parse_qr_image(path: &Path) -> Result<Vec<Profile>, VortexError> {
-    let img = image::open(path)
-        .map_err(|e| VortexError::Parse(format!("Failed to open image {:?}: {e}", path)))?
-        .to_luma8();
-
-    let mut prepared = rqrr::PreparedImage::prepare(img);
-    let grids = prepared.detect_grids();
-    if grids.is_empty() {
-        return Err(VortexError::Parse("No QR code detected in image".into()));
-    }
-
-    let mut content = String::new();
-    for grid in grids {
-        let mut bytes = Vec::new();
-        if grid.decode_to(&mut bytes).is_ok() && !bytes.is_empty() {
-            content = String::from_utf8_lossy(&bytes).to_string();
-            break;
+    if let Ok(dyn_img) = image::open(path) {
+        let img = dyn_img.to_luma8();
+        let mut prepared = rqrr::PreparedImage::prepare(img);
+        let grids = prepared.detect_grids();
+        for grid in grids {
+            let mut bytes = Vec::new();
+            if grid.decode_to(&mut bytes).is_ok() && !bytes.is_empty() {
+                let content = String::from_utf8_lossy(&bytes).to_string();
+                return parse_any(&content);
+            }
         }
     }
 
-    if content.is_empty() {
-        return Err(VortexError::Parse(
-            "Failed to decode QR code payload from image".into(),
-        ));
+    if let Ok(out) = std::process::Command::new("zbarimg")
+        .args(["-q", "--raw"])
+        .arg(path)
+        .output()
+    {
+        if out.status.success() {
+            let content = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !content.is_empty() {
+                return parse_any(&content);
+            }
+        }
     }
 
-    parse_any(&content)
+    Err(VortexError::Parse(format!(
+        "No QR code detected in image {:?}",
+        path
+    )))
 }
 
 /// Parses clipboard content (either text passed in or queried from system tools).
@@ -1032,39 +1685,140 @@ pub fn parse_clipboard(text: &str) -> Result<Vec<Profile>, VortexError> {
     parse_any(clean)
 }
 
+fn expand_tilde_path(s: &str) -> std::path::PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        crate::store::user_home().join(rest)
+    } else {
+        std::path::PathBuf::from(s)
+    }
+}
+
+fn parse_json_auto(trimmed: &str) -> Result<Vec<Profile>, VortexError> {
+    if trimmed.starts_with('[') {
+        let arr: Vec<Value> = serde_json::from_str(trimmed)
+            .map_err(|e| VortexError::Parse(format!("Invalid JSON array: {e}")))?;
+        let mut profiles = Vec::new();
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                if let Ok(mut p) = parse_any(s) {
+                    profiles.append(&mut p);
+                }
+            } else if item.is_object() {
+                let text = serde_json::to_string(&item).unwrap_or_default();
+                if let Ok(mut p) = parse_json_auto(&text) {
+                    profiles.append(&mut p);
+                }
+            }
+        }
+        if !profiles.is_empty() {
+            return Ok(profiles);
+        }
+        return Err(VortexError::Parse(
+            "JSON array contained no supported profiles".into(),
+        ));
+    }
+
+    let val: Value = serde_json::from_str(trimmed)
+        .map_err(|e| VortexError::Parse(format!("Invalid JSON configuration: {e}")))?;
+
+    let is_xray = val.get("protocol").is_some()
+        || val.get("routing").is_some()
+        || val.get("policy").is_some()
+        || val.get("streamSettings").is_some()
+        || val["outbounds"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .any(|o| o.get("protocol").is_some() || o.get("streamSettings").is_some())
+            })
+            .unwrap_or(false);
+
+    let is_singbox = val.get("type").is_some()
+        || val.get("route").is_some()
+        || val.get("experimental").is_some()
+        || val["outbounds"]
+            .as_array()
+            .map(|a| a.iter().any(|o| o.get("type").is_some()))
+            .unwrap_or(false);
+
+    if is_xray && !is_singbox {
+        return parse_xray_json(trimmed);
+    }
+    if is_singbox && !is_xray {
+        return parse_singbox_json(trimmed);
+    }
+    if let Ok(profiles) = parse_xray_json(trimmed) {
+        return Ok(profiles);
+    }
+    parse_singbox_json(trimmed)
+}
+
 /// General entry point that automatically detects and parses any input format.
 pub fn parse_any(input: &str) -> Result<Vec<Profile>, VortexError> {
-    let trimmed = input.trim();
+    let trimmed = input.trim().trim_matches(|c| c == '"' || c == '\'');
     if trimmed.is_empty() {
         return Err(VortexError::Parse("Input is empty".into()));
     }
 
-    // 1. File path check
-    let p = Path::new(trimmed);
-    if p.exists() && p.is_file() {
-        if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
-            match ext.to_ascii_lowercase().as_str() {
-                "png" | "jpg" | "jpeg" | "webp" => return parse_qr_image(p),
-                "conf" => {
-                    let content = fs::read_to_string(p)?;
-                    let stem = p.file_stem().and_then(|x| x.to_str());
-                    return Ok(vec![parse_wireguard_conf(&content, stem)?]);
+    // 1. File path check (supports ~/ expansion)
+    let expanded = expand_tilde_path(trimmed);
+    if expanded.exists() && expanded.is_file() {
+        let ext = expanded
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let stem = expanded
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .map(String::from);
+
+        if matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tiff"
+        ) {
+            return parse_qr_image(&expanded);
+        }
+
+        let content = fs::read_to_string(&expanded)?;
+        match ext.as_str() {
+            "conf" => {
+                if content.contains("[Interface]") {
+                    return Ok(vec![parse_wireguard_conf(&content, stem.as_deref())?]);
                 }
-                "ovpn" => {
-                    let content = fs::read_to_string(p)?;
-                    let stem = p.file_stem().and_then(|x| x.to_str());
-                    return Ok(vec![parse_openvpn_conf(&content, stem)?]);
-                }
-                "json" => {
-                    let content = fs::read_to_string(p)?;
-                    if let Ok(profiles) = parse_xray_json(&content) {
-                        return Ok(profiles);
+            }
+            "ovpn" => {
+                let dir = expanded.parent().unwrap_or_else(|| Path::new("."));
+                let inlined = inline_ovpn_assets(&content, dir);
+                return Ok(vec![parse_openvpn_conf(&inlined, stem.as_deref())?]);
+            }
+            "json" => {
+                let mut profiles = parse_json_auto(content.trim())?;
+                if profiles.len() == 1 {
+                    if let Some(st) = stem {
+                        if profiles[0].name == "Xray Config"
+                            || profiles[0].name == "sing-box Config"
+                        {
+                            profiles[0].name = st;
+                        }
                     }
-                    return parse_singbox_json(&content);
                 }
-                _ => {}
+                return Ok(profiles);
+            }
+            _ => {}
+        }
+        let mut profiles = parse_any(&content)?;
+        if profiles.len() == 1 {
+            if let Some(st) = stem {
+                if profiles[0].name.starts_with("Config ·")
+                    || profiles[0].name == "Xray Config"
+                    || profiles[0].name == "sing-box Config"
+                {
+                    profiles[0].name = st;
+                }
             }
         }
+        return Ok(profiles);
     }
 
     // 2. URI Scheme checks
@@ -1100,31 +1854,18 @@ pub fn parse_any(input: &str) -> Result<Vec<Profile>, VortexError> {
     {
         return Ok(vec![parse_openvpn_conf(trimmed, None)?]);
     }
-    if trimmed.starts_with('{') {
-        if trimmed.contains("\"protocol\"")
-            || trimmed.contains("\"streamSettings\"")
-            || trimmed.contains("\"vnext\"")
-        {
-            if let Ok(profiles) = parse_xray_json(trimmed) {
-                return Ok(profiles);
-            }
-        }
-        if trimmed.contains("\"outbounds\"") {
-            if let Ok(profiles) = parse_xray_json(trimmed) {
-                return Ok(profiles);
-            }
-            return parse_singbox_json(trimmed);
-        }
-        if trimmed.contains("\"inbounds\"") {
-            if let Ok(profiles) = parse_xray_json(trimmed) {
-                return Ok(profiles);
-            }
-        }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return parse_json_auto(trimmed);
     }
 
     // 4. Base64 multi-link list (e.g. subscription body)
     if let Ok(decoded) = decode_base64_flexible(trimmed) {
         if let Ok(text) = String::from_utf8(decoded) {
+            if text.trim().starts_with('{') || text.trim().starts_with('[') {
+                if let Ok(list) = parse_json_auto(text.trim()) {
+                    return Ok(list);
+                }
+            }
             let mut list = vec![];
             for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
                 if let Ok(mut sub_profiles) = parse_any(line) {
@@ -1137,11 +1878,20 @@ pub fn parse_any(input: &str) -> Result<Vec<Profile>, VortexError> {
         }
     }
 
-    // 5. Plain line-delimited links (only if input contains multiple lines)
-    if trimmed.contains('\n') {
+    // 5. Plain line-delimited or whitespace-separated links
+    if trimmed.contains('\n') || trimmed.split_whitespace().count() > 1 {
         let mut list = vec![];
-        for line in trimmed.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if let Ok(mut sub_profiles) = parse_any(line) {
+        let iter: Vec<&str> = if trimmed.contains('\n') {
+            trimmed
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect()
+        } else {
+            trimmed.split_whitespace().collect()
+        };
+        for item in iter {
+            if let Ok(mut sub_profiles) = parse_any(item) {
                 list.append(&mut sub_profiles);
             }
         }
@@ -1160,9 +1910,38 @@ pub fn parse_any(input: &str) -> Result<Vec<Profile>, VortexError> {
     )))
 }
 
+fn inline_ovpn_assets(text: &str, dir: &Path) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let key = it.next().unwrap_or("");
+        let tag = match key {
+            "ca" | "cert" | "key" | "tls-crypt" | "tls-auth" | "crl-verify" => key,
+            _ => "",
+        };
+        if !tag.is_empty() {
+            if let Some(f) = it.next() {
+                if let Ok(c) = fs::read_to_string(dir.join(f)) {
+                    out += &format!("<{tag}>\n{}\n</{tag}>\n", c.trim());
+                    if tag == "tls-auth" {
+                        if let Some(d) = it.next() {
+                            out += &format!("key-direction {d}\n");
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+        out += line;
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{CoreEngine, ProfilePayloadKind};
 
     #[test]
     fn test_parse_vless_reality() {
@@ -1336,6 +2115,72 @@ mod tests {
         assert_eq!(profs[0].transport, Transport::Tcp);
         assert_eq!(profs[0].display_transport(), "TCP");
         assert_eq!(profs[0].port, Some(443));
+    }
+
+    #[test]
+    fn test_throne_full_xray_config_preserved_lossless() {
+        let cfg = r#"{
+            "inbounds": [{"port": 10808, "listen": "127.0.0.1", "protocol": "socks"}],
+            "outbounds": [
+                {
+                    "tag": "proxy",
+                    "protocol": "vless",
+                    "settings": {"vnext": [{"address": "cdn.example.com", "port": 443, "users": [{"id": "b6a03649-61f4-41aa-a51b-402c3cc6c547", "encryption": "none"}]}]},
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "reality",
+                        "realitySettings": {"serverName": "yahoo.com", "fingerprint": "chrome", "publicKey": "1111222233334444555566667777888899990000111"},
+                        "sockopt": {"dialerProxy": "frag"}
+                    }
+                },
+                {
+                    "tag": "frag",
+                    "protocol": "freedom",
+                    "settings": {"fragment": {"packets": "tlshello", "length": "100-200", "interval": "10-20"}}
+                }
+            ],
+            "routing": {
+                "domainStrategy": "AsIs",
+                "rules": [{"type": "field", "domain": ["geosite:ir"], "outboundTag": "direct"}]
+            }
+        }"#;
+
+        let profs = parse_any(cfg).unwrap();
+        assert_eq!(profs.len(), 1);
+        assert_eq!(profs[0].payload_kind, ProfilePayloadKind::CustomConfig);
+        assert_eq!(profs[0].effective_engine(), CoreEngine::Xray);
+        assert!(profs[0].data.contains("dialerProxy"));
+        assert!(profs[0].data.contains("fragment"));
+        assert_eq!(profs[0].server, "cdn.example.com:443");
+    }
+
+    #[test]
+    fn test_throne_full_singbox_config_preserved_lossless() {
+        let cfg = r#"{
+            "inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": 2080}],
+            "outbounds": [
+                {"type": "selector", "tag": "proxy", "outbounds": ["node-a"]},
+                {"type": "tuic", "tag": "node-a", "server": "tuic.example.com", "server_port": 443}
+            ],
+            "route": {"final": "proxy"}
+        }"#;
+
+        let profs = parse_any(cfg).unwrap();
+        assert_eq!(profs.len(), 1);
+        assert_eq!(profs[0].payload_kind, ProfilePayloadKind::CustomConfig);
+        assert_eq!(profs[0].effective_engine(), CoreEngine::SingBox);
+        assert!(profs[0].data.contains("selector"));
+        assert_eq!(profs[0].server, "tuic.example.com:443");
+    }
+
+    #[test]
+    fn test_vless_xdrive_and_pq_encryption_parsing() {
+        let uri = "vless://b6a03649-61f4-41aa-a51b-402c3cc6c547@1.2.3.4:443?type=xdrive&encryption=mlkem768x25519plus.native.0rtt.LVtlu3hiYcMGgbA-SU19PvPMMzNHWW_knxo1c0AkxU8#PQ-XDrive";
+        let profs = parse_any(uri).unwrap();
+        assert_eq!(profs.len(), 1);
+        assert_eq!(profs[0].transport, Transport::Xdrive);
+        assert!(profs[0].post_quantum.is_some());
+        assert_eq!(profs[0].effective_engine(), CoreEngine::Xray);
     }
 
     #[test]
