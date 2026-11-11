@@ -83,7 +83,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Run cargo audit
+        # RUSTSEC-2026-0387 (crypto-bigint 0.5.5) is transitive via age -> p256;
+        # vortex-core only uses age::scrypt passphrase encryption.
+        run: cargo audit --ignore RUSTSEC-2026-0387

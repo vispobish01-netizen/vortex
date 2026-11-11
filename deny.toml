@@ -4,7 +4,9 @@
 version = 2
 unmaintained = "workspace"
 yanked = "warn"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0387", reason = "Transitive via age -> p256; vortex-core only uses age::scrypt passphrase encryption" },
+]
 
 [licenses]
 version = 2
@@ -15,9 +17,8 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "OpenSSL",
+    "NCSA",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Zlib",
     "CC0-1.0",
 ]
