@@ -1,7 +1,10 @@
 [package]
 name = "vortexd"
-version = "0.3.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Background daemon service for Vortex VPN/proxy manager"
 
 [[bin]]

@@ -1,6 +1,6 @@
 [Unit]
 Description=Vortex Tunnel & Proxy Daemon
-Documentation=https://github.com/vispobish/vortex
+Documentation=https://github.com/vispobish01-netizen/vortex
 After=network.target network-online.target
 Wants=network-online.target
 

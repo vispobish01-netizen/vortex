@@ -1,7 +1,10 @@
 [package]
 name = "vortex-core"
-version = "0.3.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Core library for Vortex — VPN/proxy models, IPC protocol, probing, routing, and tunnel management"
 
 [dependencies]

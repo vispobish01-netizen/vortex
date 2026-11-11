@@ -20,44 +20,30 @@ Vortex is a terminal VPN/proxy manager designed for Linux environments. The code
 | Section | Feature Area | Description & Status | Target File(s) |
 |---|---|---|---|
 | **§ 1** | Workspace Architecture | Workspace crates (`vortex-core`, `vortexd`, `vortex`), systemd service, Unix socket at `/run/vortex/vortex.sock` (0660 group vortex), versioned JSON-RPC protocol | `crates/vortex-core/src/ipc.rs`, `crates/vortexd/src/main.rs`, `packaging/vortexd.service` |
-| **§ 2** | Protocol Backends (`trait Backend`) | Common trait (`start`, `stop`, `status`, `stats`/`query_traffic`, `validate_config`). Isolated backends: Xray-core (VLESS, VMess, Trojan, SS), WireGuard (netlink/wg-quick), OpenVPN (subprocess/management), Hysteria2 (native/subprocess), Amnezia (AWG) | `crates/vortex-core/src/backend.rs`, `crates/vortex-core/src/xray/`, `crates/vortex-core/src/backends/` |
-| **§ 3** | Config Import | Parsers for share links (`vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://`, `.conf`, `.ovpn`), subscriptions, clipboard, QR images (`rqrr`). Dedupe, name, tag, group. | `crates/vortex-core/src/parser.rs`, `crates/vortex-core/src/storage.rs` |
-| **§ 4** | Whole-system Tunnel | Transparent tunnel via TUN / policy routing, DNS leak prevention, IPv6 isolation, server IP bypass, clean teardown on SIGTERM/crash. | `crates/vortex-core/src/tunnel.rs`, `crates/vortex-core/src/routing.rs` |
-| **§ 5** | Safety & Firewall | `nftables` kill-switch table (`inet vortex_shield`), atomic apply/rollback, LAN allow, comprehensive leak tests (DNS, IPv4/IPv6, STUN/WebRTC), split tunneling. | `crates/vortex-core/src/shield.rs`, `crates/vortex-core/src/leak.rs`, `crates/vortex-core/src/routing.rs` |
-| **§ 6** | Reliability | Multi-layer probes (TCP, TLS, real HTTP, jitter/loss), auto-failover with hysteresis and backoff, parallel ping testing. | `crates/vortex-core/src/probe.rs`, `crates/vortex-core/src/ping.rs` |
-| **§ 7** | Storage & Security | Encrypted configs (`age`, XChaCha20-Poly1305, Argon2id, Keyring fallback), zeroize secrets, privilege drop, systemd hardening, secret redaction in logs. | `crates/vortex-core/src/crypto.rs`, `crates/vortex-core/src/storage.rs`, `crates/vortex-core/src/model.rs` |
-| **§ 8** | TUI (`ratatui`) | Omarchy color integration, dark teal/purple default, Dashboard, Servers, Routes, Logs, Settings views, Vim bindings + help (`?`), command palette (`:`). Strictly daemon client. | `crates/vortex/src/ui.rs`, `crates/vortex/src/keymap.rs` |
-| **§ 9** | Observability | Structured logs, metrics, `vortex doctor` diagnosing firewall, routes, DNS, permissions, cores. | `crates/vortex-core/src/history.rs`, `crates/vortex/src/main.rs` (`doctor`) |
-| **§ 10** | Quality & Packaging | Property tests, unit/integration tests, GitHub Actions CI, docs (`ARCHITECTURE.md`, `PROTOCOLS.md`, `SECURITY.md`), man pages, shell completions, Arch PKGBUILD. | `docs/`, `.github/workflows/ci.yml`, `PKGBUILD` |
+| **§ 2** | Protocol Backends (`trait Backend`) | Common trait (`start`, `stop`, `validate_config`, `query_traffic`). Modular backends: `SingBoxBackend`, `ThroneBridgeBackend`, `XrayBackend`, `WireGuardBackend`, `OpenVpnBackend`, `Hysteria2Backend`, `AmneziaBackend` | `crates/vortex-core/src/backend.rs`, `crates/vortex-core/src/xray/`, `crates/vortex-core/src/backends/` |
+| **§ 3** | Config Import | Parsers for share links (`vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://`, `tuic://`, `.conf`, `.ovpn`), lossless `CustomOutbound` & `CustomConfig` JSON (Xray/sing-box), subscriptions, clipboard, QR images (`rqrr`). | `crates/vortex-core/src/parser.rs`, `crates/vortex-core/src/storage.rs` |
+| **§ 4** | Whole-system Tunnel | Transparent tunnel via `vx0` TUN + Clash API `:9090` / local SOCKS5 bridge, DNS leak prevention, IPv6 isolation, server IP exclusion, clean teardown. | `crates/vortex-core/src/tunnel.rs`, `crates/vortex-core/src/backends/singbox.rs`, `crates/vortex-core/src/routing.rs` |
+| **§ 5** | Safety & Firewall | `nftables` kill-switch table (`table inet vortex`), atomic apply/rollback, LAN allow, leak test suite, split tunneling (`rules.toml`). | `crates/vortex-core/src/shield.rs`, `crates/vortex-core/src/leak.rs`, `crates/vortex-core/src/routing.rs` |
+| **§ 6** | Reliability | Multi-layer probes (TCP, TLS, real HTTP via Xray bridge, jitter/loss), auto-failover with hysteresis and backoff, parallel ping testing. | `crates/vortex-core/src/probe.rs`, `crates/vortex-core/src/ping.rs` |
+| **§ 7** | Storage & Security | Encrypted configs (`age`), zeroize secrets, file capability helpers (`cap_net_admin,cap_net_raw`), secret redaction in logs. | `crates/vortex-core/src/crypto.rs`, `crates/vortex-core/src/storage.rs`, `crates/vortex-core/src/model.rs` |
+| **§ 8** | TUI (`ratatui`) | Omarchy color integration, dark teal/purple default, Dashboard, Flows, Rules, Subs, Logs, Recon/Speed modals, Vim bindings (`?`). Routes operations through `vortexd` IPC when online. | `crates/vortex/src/ui/`, `crates/vortex/src/keymap.rs` |
+| **§ 9** | Observability | Structured logs, metrics, `vortex doctor` & `vortex check` diagnosing firewall, routes, DNS, permissions, Sing-Box + Xray dual-core readiness. | `crates/vortex-core/src/history.rs`, `crates/vortex/src/cli/diagnostics.rs` |
+| **§ 10** | Quality & Packaging | Unit/integration tests (`cargo test`), GitHub Actions CI, docs (`ARCHITECTURE.md`, `PROTOCOLS.md`, `SECURITY.md`), completions, installer & systemd/desktop packaging. | `docs/`, `.github/workflows/ci.yml`, `install.sh`, `packaging/` |
 
 ---
 
 ## 3. Step-by-Step Implementation Strategy
 
-### Step 1: Trait `Backend` Unification & Modular Backends
-- Ensure `vortex-core/src/backend.rs` contains the unified trait:
-  ```rust
-  pub trait Backend: Send + Sync {
-      fn name(&self) -> &'static str;
-      fn is_available(&self) -> bool;
-      fn version(&self) -> Option<String>;
-      fn validate_config(&self, config_content: &str) -> Result<()>;
-      fn start(&self, profile: &Profile, runtime_dir: &Path) -> Result<Session>;
-      fn stop(&self, session: &Session) -> Result<()>;
-      fn query_traffic(&self, session: &Session) -> Result<(u64, u64)>;
-  }
-  ```
-- Implement modular backends:
+### Step 1: Trait `Backend` Unification & Throne Dual-Core Bridge
+- Unified `Backend` trait + `resolve_backend` / `resolve_backend_for_session` in `crates/vortex-core/src/backend.rs`.
+- Modular backends:
+  - `SingBoxBackend` & `ThroneBridgeBackend` in `crates/vortex-core/src/backends/singbox.rs`
   - `XrayBackend` in `crates/vortex-core/src/xray/backend.rs`
-  - `WireGuardBackend` (supporting kernel WireGuard & `wg-quick`)
-  - `OpenVpnBackend` (subprocess & management interface)
-  - `Hysteria2Backend` (subprocess & sing-box/hy2 native execution)
-  - `AmneziaBackend` (AmneziaWG via `awg-quick` or core)
-- Ensure all backends are accessible and registered dynamically or dispatchable from `vortex-core`.
+  - `WireGuardBackend`, `AmneziaBackend`, `OpenVpnBackend`, `Hysteria2Backend`
 
 ### Step 2: System Tunnel, Routing, and NFTables Kill-Switch
-- Ensure `crates/vortex-core/src/shield.rs` uses atomic `table inet vortex_shield` with strict drop policy, loopback exemption, DHCP, optional RFC1918 LAN allow, and remote endpoint bypass.
-- Verify automatic teardown and stale rule recovery upon daemon startup and crash recovery (`cleanup_stale_rules`).
+- `crates/vortex-core/src/shield.rs` uses atomic `table inet vortex` with strict drop policy, loopback exemption, DHCP, optional RFC1918 LAN allow, and remote endpoint bypass, persisting state under `active_run_dir()` & `user_config_dir()`.
+- Automatic teardown and stale rule recovery (`cleanup_stale_rules`).
 
 ### Step 3: Storage & Security Hardening
 - Audit secret encryption with `age` / passphrase derived via Argon2id or secure tokens.
@@ -78,9 +64,10 @@ Vortex is a terminal VPN/proxy manager designed for Linux environments. The code
   - `docs/ARCHITECTURE.md` (with Mermaid diagrams)
   - `docs/PROTOCOLS.md` (protocol specifics, transport and security matrix)
   - `docs/SECURITY.md` (threat model, encryption at rest, capability drops)
-- Create Arch Linux `PKGBUILD`.
+- Create Arch / Omarchy installer (`install.sh`), systemd user unit (`packaging/vortexd.service`), and desktop bindings (`packaging/waybar/`, `packaging/hyprland/`).
 - Create GitHub Actions CI workflow (`.github/workflows/ci.yml`) testing fmt, clippy, test, x86_64 and aarch64 build targets.
-- Create shell completions and man pages.
+- Create shell completions (bash, zsh, fish).
+- Future packaging: Arch Linux `PKGBUILD` and man pages.
 
 ---
 

@@ -5,6 +5,17 @@ All notable changes to `vortex` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Throne-Style Dual-Core Bridge**:
+  - Unified `Backend` trait across modular drivers (`SingBoxBackend`, `ThroneBridgeBackend`, `XrayBackend`, `WireGuardBackend`, `AmneziaBackend`, `OpenVpnBackend`, `Hysteria2Backend`).
+  - `SingBoxBackend` acts as the TUN master router (`vx0`, Clash API `:9090`, routing rules) while bridging Xray protocols (`VLESS`, `REALITY`, `XHTTP`, `XDrive`, post-quantum `mlkem768x25519plus`, `CustomConfig`) over a local SOCKS5 sidecar (`ThroneBridgeBackend`).
+- **Lossless Parsing & Hardening**:
+  - Unified `parser.rs` supporting `Standard`, `CustomOutbound`, and `CustomConfig` payloads alongside full Xray/sing-box JSON preservation.
+  - Updated atomic `nftables` kill-switch to `table inet vortex` with crash-recovery cleanup and XDG/system runtime path handling.
+  - Modularized CLI subcommands and Ratatui TUI event/telemetry views.
+
 ## [0.3.0] - 2026-10-08
 
 ### Added

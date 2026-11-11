@@ -1,11 +1,9 @@
-# Configuration for cargo-deny
+# Configuration for cargo-deny (schema v2)
 
 [advisories]
 version = 2
-vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "workspace"
 yanked = "warn"
-notice = "warn"
 ignore = []
 
 [licenses]
@@ -18,19 +16,18 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "OpenSSL",
+    "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
     "CC0-1.0",
 ]
 
 [bans]
-version = 2
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
 
 [sources]
-version = 2
 unknown-registry = "warn"
 unknown-git = "warn"
 allow-git = []
